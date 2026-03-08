@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -115,12 +115,36 @@ class PollerMetrics:
         self.start_time: float = time.monotonic()
         self.poller_started_at: datetime = datetime.now(timezone.utc)
 
+        # ── Minute-bucket counters for time-window stats ────────────
+        self._tick_minute_buckets: Counter[int] = Counter()
+        self._candle_minute_buckets: Counter[int] = Counter()
+
+        # ── API health (populated by health-checker task) ───────────
+        self.api_healthy: bool = False
+        self.api_latency_ms: float = 0.0
+        self.api_requests_1h: int = 0
+        self.api_requests_12h: int = 0
+        self.api_requests_24h: int = 0
+        self.api_errors_1h: int = 0
+        self.api_avg_latency_ms: float = 0.0
+
+        # ── Infrastructure health ───────────────────────────────────
+        self.db_healthy: bool = False
+        self.redis_healthy: bool = False
+        self.db_latency_ms: float = 0.0
+        self.redis_latency_ms: float = 0.0
+
     # -- tick metrics ----------------------------------------------------
+
+    @staticmethod
+    def _current_minute() -> int:
+        return int(time.time()) // 60
 
     def record_tick(
         self, symbol: str, bid: float, ask: float,
     ) -> None:
         now = time.monotonic()
+        minute = self._current_minute()
         with self._lock:
             self.ticks_total += 1
             info = self.symbol_ticks[symbol]
@@ -129,6 +153,7 @@ class PollerMetrics:
             info.last_tick_ts = now
             info.count += 1
             self._tick_ts_window.append(now)
+            self._tick_minute_buckets[minute] += 1
 
     def record_ticks_flushed(self, count: int, elapsed_ms: float) -> None:
         with self._lock:
@@ -143,8 +168,10 @@ class PollerMetrics:
     # -- candle metrics --------------------------------------------------
 
     def record_candle_upsert(self, count: int = 1) -> None:
+        minute = self._current_minute()
         with self._lock:
             self.candles_total += count
+            self._candle_minute_buckets[minute] += count
 
     # -- redis metrics ---------------------------------------------------
 
@@ -249,3 +276,60 @@ class PollerMetrics:
     def total_errors(self) -> int:
         with self._lock:
             return sum(self.errors.values())
+
+    # -- time-window helpers ---------------------------------------------
+
+    def ticks_in_window(self, seconds: float) -> int:
+        """Count ticks received within the last *seconds* seconds."""
+        minutes = max(int(seconds) // 60, 1)
+        cutoff = self._current_minute() - minutes
+        with self._lock:
+            return sum(c for m, c in self._tick_minute_buckets.items() if m >= cutoff)
+
+    def candles_in_window(self, seconds: float) -> int:
+        """Count candles upserted within the last *seconds* seconds."""
+        minutes = max(int(seconds) // 60, 1)
+        cutoff = self._current_minute() - minutes
+        with self._lock:
+            return sum(c for m, c in self._candle_minute_buckets.items() if m >= cutoff)
+
+    def prune_minute_buckets(self) -> None:
+        """Remove minute buckets older than 7 days + 1 h buffer."""
+        cutoff = self._current_minute() - (7 * 24 * 60 + 60)
+        with self._lock:
+            for bucket in [self._tick_minute_buckets, self._candle_minute_buckets]:
+                stale = [m for m in bucket if m < cutoff]
+                for m in stale:
+                    del bucket[m]
+
+    # -- health-checker updates ------------------------------------------
+
+    def update_api_health(
+        self,
+        healthy: bool,
+        latency_ms: float,
+        requests_1h: int,
+        requests_12h: int,
+        requests_24h: int,
+        errors_1h: int,
+        avg_latency_ms: float,
+    ) -> None:
+        self.api_healthy = healthy
+        self.api_latency_ms = latency_ms
+        self.api_requests_1h = requests_1h
+        self.api_requests_12h = requests_12h
+        self.api_requests_24h = requests_24h
+        self.api_errors_1h = errors_1h
+        self.api_avg_latency_ms = avg_latency_ms
+
+    def update_infra_health(
+        self,
+        db_ok: bool,
+        redis_ok: bool,
+        db_latency_ms: float = 0.0,
+        redis_latency_ms: float = 0.0,
+    ) -> None:
+        self.db_healthy = db_ok
+        self.redis_healthy = redis_ok
+        self.db_latency_ms = db_latency_ms
+        self.redis_latency_ms = redis_latency_ms

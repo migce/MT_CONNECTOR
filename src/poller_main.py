@@ -39,7 +39,7 @@ from src.mt5.backfill import Backfiller
 from src.mt5.collector import Collector
 from src.mt5.connection import MT5Connection
 from src.redis_bus.backfill_manager import BackfillListener
-from src.redis_bus.pool import close_redis_pool
+from src.redis_bus.pool import close_redis_pool, get_redis_pool
 from src.redis_bus.publisher import RedisPublisher
 
 logger = structlog.get_logger(__name__)
@@ -91,6 +91,86 @@ async def _task_monitor_loop(tasks: dict[str, asyncio.Task]) -> None:
             await asyncio.sleep(2.0)
         except asyncio.CancelledError:
             break
+
+
+async def _health_checker_loop(api_port: int) -> None:
+    """Poll API /stats + DB/Redis every 10 s and update PollerMetrics."""
+    import httpx
+    from sqlalchemy import text as sa_text
+
+    from src.db.engine import get_engine as _get_engine
+
+    metrics = PollerMetrics()
+    api_url = f"http://127.0.0.1:{api_port}/api/v1/stats"
+
+    while True:
+        try:
+            # ── API health ──────────────────────────────────────────
+            api_ok = False
+            api_lat = 0.0
+            api_data: dict = {}
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    t0 = time.perf_counter()
+                    resp = await client.get(api_url)
+                    api_lat = (time.perf_counter() - t0) * 1000
+                    if resp.status_code == 200:
+                        api_ok = True
+                        api_data = resp.json()
+            except Exception:
+                pass
+
+            metrics.update_api_health(
+                healthy=api_ok,
+                latency_ms=round(api_lat, 1),
+                requests_1h=api_data.get("requests_1h", 0),
+                requests_12h=api_data.get("requests_12h", 0),
+                requests_24h=api_data.get("requests_24h", 0),
+                errors_1h=api_data.get("errors_1h", 0),
+                avg_latency_ms=api_data.get("avg_latency_ms_1h", 0.0),
+            )
+
+            # ── DB health ───────────────────────────────────────────
+            db_ok = False
+            db_lat = 0.0
+            try:
+                engine = _get_engine()
+                t0 = time.perf_counter()
+                async with engine.connect() as conn:
+                    await conn.execute(sa_text("SELECT 1"))
+                db_lat = (time.perf_counter() - t0) * 1000
+                db_ok = True
+            except Exception:
+                pass
+
+            # ── Redis health ────────────────────────────────────────
+            redis_ok = False
+            redis_lat = 0.0
+            try:
+                pool = await get_redis_pool()
+                t0 = time.perf_counter()
+                await pool.ping()
+                redis_lat = (time.perf_counter() - t0) * 1000
+                redis_ok = True
+            except Exception:
+                pass
+
+            metrics.update_infra_health(
+                db_ok=db_ok,
+                redis_ok=redis_ok,
+                db_latency_ms=round(db_lat, 1),
+                redis_latency_ms=round(redis_lat, 1),
+            )
+
+            # ── Prune old minute-buckets every cycle ────────────────
+            metrics.prune_minute_buckets()
+
+            await asyncio.sleep(10.0)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception("health_checker_error")
+            await asyncio.sleep(10.0)
 
 
 # Path for single-instance lock file
@@ -219,6 +299,13 @@ async def main(dashboard: bool = False) -> None:
         name="task_monitor",
     )
 
+    # --- Health checker (API / DB / Redis) ---
+    health_checker_task = asyncio.create_task(
+        _health_checker_loop(settings.api_port),
+        name="health_checker",
+    )
+    named_tasks["health_checker"] = health_checker_task
+
     # --- Dashboard (optional) ---
     dashboard_task: asyncio.Task | None = None
     if dashboard:
@@ -251,10 +338,11 @@ async def main(dashboard: bool = False) -> None:
     if dashboard_task:
         dashboard_task.cancel()
     monitor_task.cancel()
+    health_checker_task.cancel()
     heartbeat_task.cancel()
     gap_scan_task.cancel()
     backfill_listener_task.cancel()
-    cancel_tasks = [monitor_task, heartbeat_task, gap_scan_task, backfill_listener_task]
+    cancel_tasks = [monitor_task, health_checker_task, heartbeat_task, gap_scan_task, backfill_listener_task]
     if dashboard_task:
         cancel_tasks.insert(0, dashboard_task)
     await asyncio.gather(
