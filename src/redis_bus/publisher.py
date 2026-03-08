@@ -20,6 +20,7 @@ import redis.asyncio as aioredis
 import structlog
 
 from src.config import Settings, get_settings
+from src.metrics import PollerMetrics
 
 logger = structlog.get_logger(__name__)
 
@@ -37,6 +38,7 @@ class RedisPublisher:
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings or get_settings()
         self._redis: aioredis.Redis | None = None
+        self._metrics = PollerMetrics()
 
     async def connect(self) -> None:
         """Create the Redis connection."""
@@ -72,8 +74,10 @@ class RedisPublisher:
         payload = orjson.dumps(tick, default=_json_serializer)
         try:
             await self._redis.publish(channel, payload)
+            self._metrics.record_redis_publish()
         except Exception:
             logger.warning("redis_publish_tick_error", symbol=symbol, exc_info=True)
+            self._metrics.record_error("publish")
 
     async def publish_candle(
         self, symbol: str, timeframe: str, candle: dict[str, Any]
@@ -85,6 +89,7 @@ class RedisPublisher:
         payload = orjson.dumps(candle, default=_json_serializer)
         try:
             await self._redis.publish(channel, payload)
+            self._metrics.record_redis_publish()
         except Exception:
             logger.warning(
                 "redis_publish_candle_error",
@@ -92,3 +97,4 @@ class RedisPublisher:
                 timeframe=timeframe,
                 exc_info=True,
             )
+            self._metrics.record_error("publish")

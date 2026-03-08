@@ -19,6 +19,7 @@ from typing import Any, Callable, TypeVar
 import structlog
 
 from src.config import Settings, get_settings
+from src.metrics import PollerMetrics
 
 logger = structlog.get_logger(__name__)
 
@@ -58,6 +59,7 @@ class MT5Connection:
         self._settings = settings or get_settings()
         self._connected = False
         self._backoff = self.BACKOFF_BASE
+        self._metrics = PollerMetrics()
 
     # ------------------------------------------------------------------
     # Public API
@@ -73,6 +75,7 @@ class MT5Connection:
             ok = await run_in_mt5(self._try_connect)
             if ok:
                 self._connected = True
+                self._metrics.set_mt5_connected(True)
                 self._backoff = self.BACKOFF_BASE
                 logger.info(
                     "mt5_connected",
@@ -101,7 +104,9 @@ class MT5Connection:
 
         logger.warning("mt5_connection_lost")
         self._connected = False
+        self._metrics.set_mt5_connected(False)
         await self.connect()
+        self._metrics.record_reconnect()
         return True  # reconnected — caller should backfill
 
     async def select_symbols(self, symbols: list[str]) -> None:
@@ -117,6 +122,7 @@ class MT5Connection:
         """Cleanly close the MT5 connection."""
         await run_in_mt5(self._shutdown)
         self._connected = False
+        self._metrics.set_mt5_connected(False)
         logger.info("mt5_shutdown")
 
     @property

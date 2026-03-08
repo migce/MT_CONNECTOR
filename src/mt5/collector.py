@@ -22,6 +22,7 @@ import structlog
 
 from src.config import Settings, Timeframe, get_settings
 from src.db import repository as repo
+from src.metrics import PollerMetrics
 from src.mt5.connection import MT5Connection, run_in_mt5
 from src.redis_bus.publisher import RedisPublisher
 
@@ -54,6 +55,7 @@ class Collector:
         self._conn = connection
         self._pub = publisher
         self._settings = settings or get_settings()
+        self._metrics = PollerMetrics()
 
         # Per-symbol last-seen tick timestamp (ms)
         self._last_tick_msc: dict[str, int] = defaultdict(int)
@@ -122,16 +124,19 @@ class Collector:
                         "flags": int(tick.flags),
                     }
                     self._tick_buffer.append(tick_dict)
+                    self._metrics.record_tick(symbol, tick_dict["bid"], tick_dict["ask"])
 
                     # Publish to Redis (fire-and-forget)
                     await self._pub.publish_tick(symbol, tick_dict)
 
+                self._metrics.set_tick_buffer_depth(len(self._tick_buffer))
                 await asyncio.sleep(interval)
 
             except asyncio.CancelledError:
                 break
             except Exception:
                 logger.exception("tick_loop_error")
+                self._metrics.record_error("tick_loop")
                 await asyncio.sleep(1.0)
 
     # ------------------------------------------------------------------
@@ -155,6 +160,7 @@ class Collector:
 
                         rows = self._bars_to_dicts(bars, symbol, tf.value)
                         await repo.upsert_candles(rows)
+                        self._metrics.record_candle_upsert(len(rows))
 
                         # Publish the latest (current) bar
                         await self._pub.publish_candle(symbol, tf.value, rows[-1])
@@ -171,6 +177,7 @@ class Collector:
                 break
             except Exception:
                 logger.exception("candle_loop_error")
+                self._metrics.record_error("candle_loop")
                 await asyncio.sleep(2.0)
 
     # ------------------------------------------------------------------
@@ -186,6 +193,7 @@ class Collector:
                 break
             except Exception:
                 logger.exception("flush_loop_error")
+                self._metrics.record_error("flush")
 
     async def _flush_tick_buffer(self) -> None:
         if not self._tick_buffer:
@@ -196,7 +204,11 @@ class Collector:
         while self._tick_buffer:
             batch.append(self._tick_buffer.popleft())
 
+        self._metrics.set_tick_buffer_depth(0)
+        _t0 = time.monotonic()
         inserted = await repo.insert_ticks(batch)
+        _elapsed_ms = (time.monotonic() - _t0) * 1000
+        self._metrics.record_ticks_flushed(inserted, _elapsed_ms)
         logger.debug("ticks_flushed", count=inserted, buffered=len(batch))
 
         # Update sync state for tick data

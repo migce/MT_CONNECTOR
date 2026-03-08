@@ -42,6 +42,7 @@ import redis.asyncio as aioredis
 import structlog
 
 from src.config import Settings, get_settings
+from src.metrics import PollerMetrics
 
 logger = structlog.get_logger(__name__)
 
@@ -221,6 +222,7 @@ class BackfillListener:
         self._backfiller = backfiller
         self._settings = settings or get_settings()
         self._redis: aioredis.Redis | None = None
+        self._metrics = PollerMetrics()
 
     async def connect(self) -> None:
         self._redis = aioredis.Redis(
@@ -268,6 +270,8 @@ class BackfillListener:
                 await asyncio.sleep(1)
 
     async def _handle_request(self, req: dict[str, Any]) -> None:
+        import time as _time
+
         request_id = req["request_id"]
         symbol = req["symbol"]
         data_type = req["data_type"]
@@ -283,7 +287,10 @@ class BackfillListener:
             timeframe=timeframe,
         )
 
+        self._metrics.set_backfill_phase("on_demand", f"{symbol} {timeframe or 'ticks'}")
+
         response: dict[str, Any] = {"request_id": request_id, "status": "ok", "rows": 0, "error": None}
+        _t0 = _time.monotonic()
 
         try:
             if data_type == "candles" and timeframe:
@@ -301,6 +308,18 @@ class BackfillListener:
             logger.exception("backfill_on_demand_error", request_id=request_id)
             response["status"] = "error"
             response["error"] = str(exc)
+            self._metrics.record_error("backfill")
+
+        _elapsed = _time.monotonic() - _t0
+        self._metrics.record_on_demand(
+            symbol=symbol,
+            data_type=data_type,
+            timeframe=timeframe,
+            rows=response["rows"],
+            status=response["status"],
+            elapsed_sec=_elapsed,
+        )
+        self._metrics.set_backfill_phase("")
 
         # Clear in-flight marker
         inflight = _inflight_key(symbol, data_type, timeframe)

@@ -23,6 +23,7 @@ import structlog
 
 from src.config import Settings, Timeframe, get_settings
 from src.db import repository as repo
+from src.metrics import PollerMetrics
 from src.mt5.connection import MT5Connection, run_in_mt5
 
 logger = structlog.get_logger(__name__)
@@ -62,6 +63,7 @@ class Backfiller:
     ) -> None:
         self._conn = connection
         self._settings = settings or get_settings()
+        self._metrics = PollerMetrics()
 
     # ------------------------------------------------------------------
     # Initial backfill (called on startup)
@@ -70,6 +72,7 @@ class Backfiller:
     async def run_initial_backfill(self) -> None:
         """Backfill all symbols × timeframes from last sync point."""
         logger.info("backfill_start", backfill_days=self._settings.backfill_days)
+        self._metrics.set_backfill_phase("initial")
 
         now = datetime.now(timezone.utc)
         default_start = now - timedelta(days=self._settings.backfill_days)
@@ -77,11 +80,14 @@ class Backfiller:
         for symbol in self._settings.symbols:
             # --- Candle backfill ---
             for tf in self._settings.timeframes:
+                self._metrics.set_backfill_phase("initial", f"{symbol} {tf.value}")
                 await self._backfill_candles(symbol, tf, default_start, now)
 
             # --- Tick backfill ---
+            self._metrics.set_backfill_phase("initial", f"{symbol} ticks")
             await self._backfill_ticks(symbol, default_start, now)
 
+        self._metrics.set_backfill_phase("")
         logger.info("backfill_complete")
 
     # ------------------------------------------------------------------
@@ -96,6 +102,7 @@ class Backfiller:
         """
         logger.info("gap_scan_start")
         now = datetime.now(timezone.utc)
+        total_gaps = 0
 
         for symbol in self._settings.symbols:
             for tf in self._settings.timeframes:
@@ -124,12 +131,15 @@ class Backfiller:
                     first=str(market_gaps[0]),
                     last=str(market_gaps[-1]),
                 )
+                self._metrics.record_gap_scan(len(market_gaps))
+                total_gaps += len(market_gaps)
 
                 # Re-download the range that contains gaps
                 range_start = market_gaps[0]
                 range_end = market_gaps[-1] + timedelta(seconds=tf.seconds)
                 await self._backfill_candles(symbol, tf, range_start, range_end)
 
+        self._metrics.record_gap_scan(total_gaps)
         logger.info("gap_scan_complete")
 
     async def start_scheduled_gap_scan(self) -> None:
@@ -141,6 +151,7 @@ class Backfiller:
                 await self.run_gap_scan()
             except Exception:
                 logger.exception("gap_scan_error")
+                self._metrics.record_error("gap_scan")
 
     # ------------------------------------------------------------------
     # On-demand backfill (requested by API via Redis)
