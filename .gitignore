@@ -11,3 +11,4 @@ build/
 venv/
 logs/
 *.log
+nul

@@ -9,7 +9,7 @@ All write methods use UPSERT semantics:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
 
 import structlog
@@ -209,9 +209,9 @@ async def find_candle_gaps(
     sql = text("""
         SELECT gs AS missing_time
         FROM generate_series(
-            :dt_from ::timestamptz,
-            :dt_to   ::timestamptz,
-            :interval::interval
+            CAST(:dt_from AS timestamptz),
+            CAST(:dt_to   AS timestamptz),
+            CAST(:gap_interval AS interval)
         ) AS gs
         LEFT JOIN candles c
             ON c.symbol    = :symbol
@@ -224,7 +224,7 @@ async def find_candle_gaps(
     params = {
         "dt_from": dt_from,
         "dt_to": dt_to,
-        "interval": f"{interval_seconds} seconds",
+        "gap_interval": timedelta(seconds=interval_seconds),
         "symbol": symbol,
         "timeframe": timeframe,
     }
