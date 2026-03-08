@@ -31,6 +31,7 @@ from src.logging_config import setup_logging
 from src.mt5.backfill import Backfiller
 from src.mt5.collector import Collector
 from src.mt5.connection import MT5Connection
+from src.redis_bus.backfill_manager import BackfillListener
 from src.redis_bus.publisher import RedisPublisher
 
 logger = structlog.get_logger(__name__)
@@ -91,6 +92,16 @@ async def main() -> None:
 
     # --- Backfill ---
     backfiller = Backfiller(connection, settings)
+
+    # --- On-demand backfill listener (API → Poller via Redis) ---
+    # Start BEFORE initial backfill so API requests are served during startup
+    backfill_listener = BackfillListener(backfiller, settings)
+    await backfill_listener.connect()
+    backfill_listener_task = asyncio.create_task(
+        backfill_listener.run_forever(),
+        name="backfill_listener",
+    )
+
     await backfiller.run_initial_backfill()
 
     # --- Collector ---
@@ -136,11 +147,16 @@ async def main() -> None:
 
     heartbeat_task.cancel()
     gap_scan_task.cancel()
-    await asyncio.gather(heartbeat_task, gap_scan_task, return_exceptions=True)
+    backfill_listener_task.cancel()
+    await asyncio.gather(
+        heartbeat_task, gap_scan_task, backfill_listener_task,
+        return_exceptions=True,
+    )
 
     await collector.stop()
     await connection.shutdown()
     await publisher.close()
+    await backfill_listener.close()
     await dispose_engine()
 
     logger.info("poller_stopped")

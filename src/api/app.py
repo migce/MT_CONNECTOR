@@ -23,13 +23,23 @@ from src.config import get_settings
 from src.db.engine import dispose_engine, get_engine
 from src.db.init_timescale import init_timescaledb
 from src.logging_config import setup_logging
+from src.redis_bus.backfill_manager import BackfillRequester
 
 logger = structlog.get_logger(__name__)
+
+# Module-level singleton so route handlers can import it
+backfill_requester: BackfillRequester | None = None
+
+
+def get_backfill_requester() -> BackfillRequester | None:
+    """Return the global BackfillRequester (available after startup)."""
+    return backfill_requester
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """Application lifecycle: startup → yield → shutdown."""
+    global backfill_requester
     settings = get_settings()
     setup_logging(settings.log_level, settings.log_format)
     logger.info("api_starting", version="1.0.0")
@@ -43,9 +53,20 @@ async def _lifespan(app: FastAPI):
     except Exception:
         logger.warning("timescaledb_init_skipped", exc_info=True)
 
+    # Connect backfill requester (for on-demand MT5 downloads)
+    try:
+        backfill_requester = BackfillRequester(settings)
+        await backfill_requester.connect()
+    except Exception:
+        logger.warning("backfill_requester_connect_failed", exc_info=True)
+        backfill_requester = None
+
     yield
 
     # Shutdown
+    if backfill_requester is not None:
+        await backfill_requester.close()
+        backfill_requester = None
     await dispose_engine()
     logger.info("api_stopped")
 

@@ -11,6 +11,9 @@ Serves **non-standard timeframe candles** built on-the-fly from stored data:
 
 Standard timeframes (M1, M5, M15, H1, H4, D1) are redirected to the
 pre-computed candle table for maximum performance.
+
+On-demand backfill: if the source data (M1/H1 candles or ticks) does not
+cover the requested range, the system automatically fetches it from MT5.
 """
 
 from __future__ import annotations
@@ -21,6 +24,10 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 
 from src.api.schemas import CandleResponse
+from src.api.services.backfill_helper import (
+    maybe_backfill_candles,
+    maybe_backfill_ticks,
+)
 from src.config import (
     Timeframe,
     is_standard_timeframe,
@@ -109,7 +116,7 @@ async def get_custom_candles(
 
     # ------ Standard TF fast-path ------
     if is_standard_timeframe(tf_str):
-        rows = await repo.query_candles(
+        rows = await maybe_backfill_candles(
             symbol=symbol,
             timeframe=tf_str,
             dt_from=from_dt,
@@ -131,6 +138,13 @@ async def get_custom_candles(
                 status_code=400,
                 detail="Tick bar count must be >= 2.",
             )
+        # Ensure source ticks are available
+        await maybe_backfill_ticks(
+            symbol=symbol,
+            dt_from=from_dt,
+            dt_to=to_dt,
+            limit=1,  # just trigger backfill if needed
+        )
         rows = await repo.query_tick_bars(
             symbol=symbol,
             tick_count=ctf.tick_count,
@@ -154,6 +168,16 @@ async def get_custom_candles(
         )
 
     source_tf = _choose_source_tf(ctf.seconds)
+
+    # Ensure source candles (M1 or H1) are available for the range
+    await maybe_backfill_candles(
+        symbol=symbol,
+        timeframe=source_tf,
+        dt_from=from_dt,
+        dt_to=to_dt,
+        limit=1,  # just trigger backfill if needed
+    )
+
     rows = await repo.query_custom_tf_candles(
         symbol=symbol,
         bucket_seconds=ctf.seconds,

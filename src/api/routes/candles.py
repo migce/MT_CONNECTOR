@@ -2,6 +2,11 @@
 REST endpoint: ``/api/v1/candles/{symbol}``
 
 Query historical OHLCV candle data.
+
+If the requested ``from`` date is before the data we have stored,
+an on-demand backfill request is sent to the MT5 poller via Redis.
+The handler waits (up to 60 s) for the data to be downloaded and then
+returns the full result.
 """
 
 from __future__ import annotations
@@ -12,8 +17,8 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 
 from src.api.schemas import CandleResponse
+from src.api.services.backfill_helper import maybe_backfill_candles
 from src.config import Timeframe
-from src.db import repository as repo
 
 router = APIRouter(prefix="/api/v1", tags=["candles"])
 
@@ -24,7 +29,10 @@ router = APIRouter(prefix="/api/v1", tags=["candles"])
     summary="Get historical candles",
     description=(
         "Retrieve OHLCV candle bars for a given symbol and timeframe. "
-        "Results are ordered by time ascending."
+        "Results are ordered by time ascending. "
+        "If the requested range is not yet in the database, the system "
+        "automatically fetches it from MetaTrader 5 (may take a few seconds "
+        "on first request)."
     ),
 )
 async def get_candles(
@@ -60,7 +68,7 @@ async def get_candles(
                    f"Allowed: {[t.value for t in Timeframe]}",
         )
 
-    rows = await repo.query_candles(
+    rows = await maybe_backfill_candles(
         symbol=symbol.upper(),
         timeframe=timeframe.upper(),
         dt_from=from_dt,

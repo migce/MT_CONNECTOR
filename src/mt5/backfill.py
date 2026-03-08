@@ -143,6 +143,91 @@ class Backfiller:
                 logger.exception("gap_scan_error")
 
     # ------------------------------------------------------------------
+    # On-demand backfill (requested by API via Redis)
+    # ------------------------------------------------------------------
+
+    async def on_demand_candles(
+        self,
+        symbol: str,
+        timeframe: str,
+        dt_from: datetime,
+        dt_to: datetime,
+    ) -> int:
+        """
+        Download candles for an explicit range, **ignoring sync_state**.
+
+        Returns the number of rows inserted/updated.
+        """
+        try:
+            tf = Timeframe(timeframe)
+        except ValueError:
+            logger.warning("on_demand_invalid_tf", timeframe=timeframe)
+            return 0
+
+        logger.info(
+            "on_demand_candles_start",
+            symbol=symbol,
+            timeframe=timeframe,
+            range_from=str(dt_from),
+            range_to=str(dt_to),
+        )
+
+        total = 0
+        cursor = dt_from
+        while cursor < dt_to:
+            bars = await run_in_mt5(
+                self._copy_rates_range, symbol, tf.mt5_constant, cursor, dt_to,
+            )
+            if bars is None or len(bars) == 0:
+                break
+            rows = self._bars_to_dicts(bars, symbol, tf.value)
+            await repo.upsert_candles(rows)
+            total += len(rows)
+            cursor = rows[-1]["time"] + timedelta(seconds=tf.seconds)
+            if len(bars) < _MAX_BARS_PER_CALL:
+                break
+
+        logger.info("on_demand_candles_done", symbol=symbol, timeframe=timeframe, rows=total)
+        return total
+
+    async def on_demand_ticks(
+        self,
+        symbol: str,
+        dt_from: datetime,
+        dt_to: datetime,
+    ) -> int:
+        """
+        Download ticks for an explicit range, **ignoring sync_state**.
+
+        Returns the number of rows inserted.
+        """
+        logger.info(
+            "on_demand_ticks_start",
+            symbol=symbol,
+            range_from=str(dt_from),
+            range_to=str(dt_to),
+        )
+
+        total = 0
+        cursor = dt_from
+        while cursor < dt_to:
+            ticks = await run_in_mt5(
+                self._copy_ticks_range, symbol, cursor, dt_to,
+            )
+            if ticks is None or len(ticks) == 0:
+                break
+            rows = self._ticks_to_dicts(ticks, symbol)
+            inserted = await repo.insert_ticks(rows)
+            total += inserted
+            last_msc = int(ticks[-1]["time_msc"])
+            cursor = datetime.fromtimestamp(last_msc / 1000.0, tz=timezone.utc) + timedelta(milliseconds=1)
+            if len(ticks) < _MAX_TICKS_PER_CALL:
+                break
+
+        logger.info("on_demand_ticks_done", symbol=symbol, rows=total)
+        return total
+
+    # ------------------------------------------------------------------
     # Internal: candle backfill
     # ------------------------------------------------------------------
 
