@@ -199,7 +199,10 @@ class Settings(BaseSettings):
     db_port: int = Field(default=5432)
     db_name: str = Field(default="mt5_data")
     db_user: str = Field(default="mt5user")
-    db_password: str = Field(default="mt5password_change_me")
+    db_password: str = Field(
+        ...,
+        description="Database password. Must be set via DB_PASSWORD env var or .env file.",
+    )
     db_pool_min: int = Field(default=2)
     db_pool_max: int = Field(default=10)
 
@@ -221,6 +224,14 @@ class Settings(BaseSettings):
     api_port: int = Field(default=8000)
     api_workers: int = Field(default=2)
     ws_heartbeat_sec: int = Field(default=30)
+    cors_origins: str = Field(
+        default="*",
+        description=(
+            "Comma-separated allowed CORS origins. "
+            "Use '*' to allow all (no credentials). "
+            "Set explicit origins to enable credentials."
+        ),
+    )
 
     # --- Data Retention ---
     tick_retention_days: int = Field(default=90)

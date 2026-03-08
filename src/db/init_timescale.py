@@ -30,6 +30,9 @@ async def init_timescaledb() -> None:
     # through SQLAlchemy's execute easily.)
     statements = [s.strip() for s in sql.split(";") if s.strip() and not s.strip().startswith("--")]
 
+    # Known-safe idempotent patterns that can legitimately fail
+    _IDEMPOTENT_MARKERS = ("already exists", "IF NOT EXISTS", "duplicate key")
+
     async with engine.begin() as conn:
         for stmt in statements:
             # Skip pure comments
@@ -40,8 +43,12 @@ async def init_timescaledb() -> None:
             try:
                 await conn.execute(text(clean))
             except Exception as exc:
-                # Some statements are idempotent (IF NOT EXISTS) — log & continue
-                logger.warning("init_ddl_stmt_error", error=str(exc), stmt=clean[:120])
+                err_msg = str(exc).lower()
+                if any(marker.lower() in err_msg for marker in _IDEMPOTENT_MARKERS):
+                    logger.debug("init_ddl_idempotent_skip", stmt=clean[:120])
+                else:
+                    logger.error("init_ddl_stmt_fatal", error=str(exc), stmt=clean[:120])
+                    raise
 
     logger.info("timescaledb_schema_initialized", sql_file=str(SQL_FILE))
 

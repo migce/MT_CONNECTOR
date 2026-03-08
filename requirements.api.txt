@@ -6,20 +6,21 @@
 # ============================================================
 
 # --- Database ---
-asyncpg>=0.29.0
-SQLAlchemy[asyncio]>=2.0.25
+asyncpg>=0.29,<0.31
+SQLAlchemy[asyncio]>=2.0.25,<2.1
 
 # --- API ---
-fastapi>=0.109.0
-uvicorn[standard]>=0.27.0
-pydantic>=2.5.0
-pydantic-settings>=2.1.0
+fastapi>=0.109,<0.116
+uvicorn[standard]>=0.27,<0.35
+pydantic>=2.5,<2.10
+pydantic-settings>=2.1,<2.8
 
 # --- Redis ---
-redis[hiredis]>=5.0.0
+redis[hiredis]>=5.0,<6.0
 
 # --- Utilities ---
-structlog>=24.1.0
-orjson>=3.9.0
-numpy>=1.26.0
-python-dateutil>=2.8.0
+structlog>=24.1,<25.0
+orjson>=3.9,<4.0
+numpy>=1.26,<2.2
+python-dateutil>=2.8,<3.0
+tenacity>=8.2,<10.0

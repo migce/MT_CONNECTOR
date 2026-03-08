@@ -178,9 +178,9 @@ class BackfillRequester:
         pubsub = self._redis.pubsub()
         try:
             await pubsub.subscribe(channel)
-            deadline = asyncio.get_event_loop().time() + timeout
+            deadline = asyncio.get_running_loop().time() + timeout
             while True:
-                remaining = deadline - asyncio.get_event_loop().time()
+                remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     logger.warning("backfill_wait_timeout", request_id=request_id)
                     return None

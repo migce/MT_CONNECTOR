@@ -88,13 +88,27 @@ def create_app() -> FastAPI:
     )
 
     # ---- CORS ----
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # When CORS_ORIGINS env var is set, restrict to those origins;
+    # otherwise allow all (development mode, no credentials).
+    settings = get_settings()
+    cors_origins_raw = settings.cors_origins
+    if cors_origins_raw == "*":
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=False,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+    else:
+        origins = [o.strip() for o in cors_origins_raw.split(",") if o.strip()]
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 
     # ---- REST routes ----
     app.include_router(custom_candles.router)  # must precede candles (path overlap)

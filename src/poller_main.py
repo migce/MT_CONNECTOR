@@ -49,15 +49,24 @@ async def _heartbeat_loop(
     backfiller: Backfiller,
     interval_sec: int,
 ) -> None:
-    """Periodically check MT5 liveness; backfill on reconnect."""
+    """Periodically check MT5 liveness; gap-fill on reconnect."""
     metrics = PollerMetrics()
+    last_seen = time.time()
     while True:
         try:
             await asyncio.sleep(interval_sec)
             gap_occurred = await connection.ensure_connected()
+            now = time.time()
             if gap_occurred:
-                logger.warning("mt5_reconnected_backfilling")
-                await backfiller.run_initial_backfill()
+                gap_sec = now - last_seen
+                logger.warning(
+                    "mt5_reconnected_gap_backfill",
+                    gap_seconds=round(gap_sec, 1),
+                )
+                # Only run a gap-scan for the period we were disconnected
+                # instead of a full initial backfill
+                await backfiller.run_gap_scan()
+            last_seen = now
         except asyncio.CancelledError:
             break
         except Exception:

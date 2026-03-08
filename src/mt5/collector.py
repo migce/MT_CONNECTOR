@@ -24,6 +24,7 @@ from src.config import Settings, Timeframe, get_settings
 from src.db import repository as repo
 from src.metrics import PollerMetrics
 from src.mt5.connection import MT5Connection, run_in_mt5
+from src.mt5.converters import bars_to_dicts
 from src.redis_bus.publisher import RedisPublisher
 
 logger = structlog.get_logger(__name__)
@@ -150,26 +151,27 @@ class Collector:
 
         while self._running:
             try:
-                for symbol in symbols:
-                    for tf in timeframes:
-                        bars = await run_in_mt5(
-                            self._get_rates, symbol, tf.mt5_constant, 0, 2
-                        )
-                        if bars is None or len(bars) == 0:
-                            continue
+                # Collect all (symbol, tf) pairs then process concurrently
+                async def _poll_one(symbol: str, tf):
+                    bars = await run_in_mt5(
+                        self._get_rates, symbol, tf.mt5_constant, 0, 2
+                    )
+                    if bars is None or len(bars) == 0:
+                        return
 
-                        rows = self._bars_to_dicts(bars, symbol, tf.value)
-                        await repo.upsert_candles(rows)
-                        self._metrics.record_candle_upsert(len(rows))
+                    rows = bars_to_dicts(bars, symbol, tf.value)
+                    await repo.upsert_candles(rows)
+                    self._metrics.record_candle_upsert(len(rows))
+                    await self._pub.publish_candle(symbol, tf.value, rows[-1])
+                    last_time = rows[-1]["time"]
+                    await repo.update_sync_state(symbol, tf.value, last_time)
 
-                        # Publish the latest (current) bar
-                        await self._pub.publish_candle(symbol, tf.value, rows[-1])
-
-                        # Update sync state with the latest bar time
-                        last_time = rows[-1]["time"]
-                        await repo.update_sync_state(
-                            symbol, tf.value, last_time
-                        )
+                tasks = [
+                    _poll_one(symbol, tf)
+                    for symbol in symbols
+                    for tf in timeframes
+                ]
+                await asyncio.gather(*tasks, return_exceptions=True)
 
                 await asyncio.sleep(interval)
 
@@ -206,7 +208,14 @@ class Collector:
 
         self._metrics.set_tick_buffer_depth(0)
         _t0 = time.monotonic()
-        inserted = await repo.insert_ticks(batch)
+        try:
+            inserted = await repo.insert_ticks(batch)
+        except Exception:
+            # Re-enqueue so ticks are not lost on transient DB errors
+            self._tick_buffer.extendleft(reversed(batch))
+            self._metrics.set_tick_buffer_depth(len(self._tick_buffer))
+            logger.exception("tick_flush_db_error", lost=0, requeued=len(batch))
+            raise
         _elapsed_ms = (time.monotonic() - _t0) * 1000
         self._metrics.record_ticks_flushed(inserted, _elapsed_ms)
         logger.debug("ticks_flushed", count=inserted, buffered=len(batch))
@@ -240,28 +249,3 @@ class Collector:
     def _get_rates(symbol: str, tf_const: int, start_pos: int, count: int):
         import MetaTrader5 as mt5
         return mt5.copy_rates_from_pos(symbol, tf_const, start_pos, count)
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _bars_to_dicts(
-        bars: np.ndarray, symbol: str, timeframe: str
-    ) -> list[dict[str, Any]]:
-        """Convert numpy structured array from MT5 into list of dicts."""
-        result = []
-        for bar in bars:
-            result.append({
-                "time": datetime.fromtimestamp(int(bar["time"]), tz=timezone.utc),
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "open": float(bar["open"]),
-                "high": float(bar["high"]),
-                "low": float(bar["low"]),
-                "close": float(bar["close"]),
-                "tick_volume": int(bar["tick_volume"]),
-                "real_volume": int(bar["real_volume"]),
-                "spread": int(bar["spread"]),
-            })
-        return result

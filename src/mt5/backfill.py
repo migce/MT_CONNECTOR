@@ -18,13 +18,13 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import numpy as np
 import structlog
 
 from src.config import Settings, Timeframe, get_settings
 from src.db import repository as repo
 from src.metrics import PollerMetrics
 from src.mt5.connection import MT5Connection, run_in_mt5
+from src.mt5.converters import bars_to_dicts, ticks_to_dicts
 
 logger = structlog.get_logger(__name__)
 
@@ -191,7 +191,7 @@ class Backfiller:
             )
             if bars is None or len(bars) == 0:
                 break
-            rows = self._bars_to_dicts(bars, symbol, tf.value)
+            rows = bars_to_dicts(bars, symbol, tf.value)
             await repo.upsert_candles(rows)
             total += len(rows)
             cursor = rows[-1]["time"] + timedelta(seconds=tf.seconds)
@@ -227,7 +227,7 @@ class Backfiller:
             )
             if ticks is None or len(ticks) == 0:
                 break
-            rows = self._ticks_to_dicts(ticks, symbol)
+            rows = ticks_to_dicts(ticks, symbol)
             inserted = await repo.insert_ticks(rows)
             total += inserted
             last_msc = int(ticks[-1]["time_msc"])
@@ -274,7 +274,7 @@ class Backfiller:
             if bars is None or len(bars) == 0:
                 break
 
-            rows = self._bars_to_dicts(bars, symbol, tf.value)
+            rows = bars_to_dicts(bars, symbol, tf.value)
             await repo.upsert_candles(rows)
             total_inserted += len(rows)
 
@@ -329,7 +329,7 @@ class Backfiller:
             if ticks is None or len(ticks) == 0:
                 break
 
-            rows = self._ticks_to_dicts(ticks, symbol)
+            rows = ticks_to_dicts(ticks, symbol)
             inserted = await repo.insert_ticks(rows)
             total_inserted += inserted
 
@@ -362,41 +362,3 @@ class Backfiller:
     def _copy_ticks_range(symbol: str, dt_from: datetime, dt_to: datetime):
         import MetaTrader5 as mt5
         return mt5.copy_ticks_range(symbol, dt_from, dt_to, mt5.COPY_TICKS_ALL)
-
-    # ------------------------------------------------------------------
-    # Converters
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _bars_to_dicts(bars: np.ndarray, symbol: str, timeframe: str) -> list[dict[str, Any]]:
-        result = []
-        for bar in bars:
-            result.append({
-                "time": datetime.fromtimestamp(int(bar["time"]), tz=timezone.utc),
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "open": float(bar["open"]),
-                "high": float(bar["high"]),
-                "low": float(bar["low"]),
-                "close": float(bar["close"]),
-                "tick_volume": int(bar["tick_volume"]),
-                "real_volume": int(bar["real_volume"]),
-                "spread": int(bar["spread"]),
-            })
-        return result
-
-    @staticmethod
-    def _ticks_to_dicts(ticks: np.ndarray, symbol: str) -> list[dict[str, Any]]:
-        result = []
-        for t in ticks:
-            msc = int(t["time_msc"])
-            result.append({
-                "time_msc": datetime.fromtimestamp(msc / 1000.0, tz=timezone.utc),
-                "symbol": symbol,
-                "bid": float(t["bid"]),
-                "ask": float(t["ask"]),
-                "last": float(t["last"]),
-                "volume": int(t["volume"]),
-                "flags": int(t["flags"]),
-            })
-        return result

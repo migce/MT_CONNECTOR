@@ -15,10 +15,24 @@ from typing import Any, Sequence
 import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from src.db.engine import get_session_factory
 
 logger = structlog.get_logger(__name__)
+
+# --- Retry decorator for transient DB errors ---
+_db_retry = retry(
+    retry=retry_if_exception_type((OSError, ConnectionError, TimeoutError)),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=0.5, min=0.5, max=5),
+    reraise=True,
+)
 
 
 # ---------------------------------------------------------------
@@ -32,6 +46,7 @@ _INSERT_TICKS_SQL = text("""
 """)
 
 
+@_db_retry
 async def insert_ticks(rows: list[dict[str, Any]]) -> int:
     """Batch-insert tick rows.  Returns number of rows actually inserted."""
     if not rows:
@@ -66,6 +81,7 @@ _UPSERT_CANDLES_SQL = text("""
 """)
 
 
+@_db_retry
 async def upsert_candles(rows: list[dict[str, Any]]) -> int:
     """Batch-upsert candle rows.  Returns affected row count."""
     if not rows:
@@ -94,6 +110,7 @@ _UPSERT_SYNC_SQL = text("""
 """)
 
 
+@_db_retry
 async def update_sync_state(
     symbol: str,
     data_type: str,
@@ -133,6 +150,7 @@ async def get_sync_state(symbol: str, data_type: str) -> dict[str, Any] | None:
 # Query helpers (for API)
 # ---------------------------------------------------------------
 
+@_db_retry
 async def query_candles(
     symbol: str,
     timeframe: str,
@@ -164,6 +182,7 @@ async def query_candles(
         return [dict(r._mapping) for r in result.all()]
 
 
+@_db_retry
 async def query_ticks(
     symbol: str,
     dt_from: datetime | None = None,
@@ -193,6 +212,7 @@ async def query_ticks(
         return [dict(r._mapping) for r in result.all()]
 
 
+@_db_retry
 async def find_candle_gaps(
     symbol: str,
     timeframe: str,
@@ -219,6 +239,7 @@ async def find_candle_gaps(
            AND c.time      = gs
         WHERE c.time IS NULL
         ORDER BY gs
+        LIMIT 50000
     """)
 
     params = {

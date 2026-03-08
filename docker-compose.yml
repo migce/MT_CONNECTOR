@@ -15,11 +15,11 @@ services:
     container_name: mt5_timescaledb
     restart: unless-stopped
     ports:
-      - "${DB_PORT:-5432}:5432"
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
     environment:
       POSTGRES_DB: ${DB_NAME:-mt5_data}
       POSTGRES_USER: ${DB_USER:-mt5user}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-mt5password_change_me}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
     volumes:
       - timescale_data:/var/lib/postgresql/data
       - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
@@ -39,16 +39,17 @@ services:
     container_name: mt5_redis
     restart: unless-stopped
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     command: >
       redis-server
       --appendonly yes
       --maxmemory 256mb
       --maxmemory-policy allkeys-lru
+      --requirepass ${REDIS_PASSWORD:-}
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -73,6 +74,7 @@ services:
       DB_HOST: timescaledb
       DB_PORT: 5432
       REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     depends_on:
       timescaledb:
         condition: service_healthy

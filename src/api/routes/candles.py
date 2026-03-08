@@ -18,6 +18,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from src.api.schemas import CandleResponse
 from src.api.services.backfill_helper import maybe_backfill_candles
+from src.api.services.validation import backfill_limiter, validate_symbol
 from src.config import Timeframe
 
 router = APIRouter(prefix="/api/v1", tags=["candles"])
@@ -58,6 +59,9 @@ async def get_candles(
         description="Maximum number of candles to return.",
     ),
 ) -> list[CandleResponse]:
+    # Validate symbol exists in configuration
+    symbol = validate_symbol(symbol)
+
     # Validate timeframe
     try:
         Timeframe(timeframe.upper())
@@ -68,8 +72,11 @@ async def get_candles(
                    f"Allowed: {[t.value for t in Timeframe]}",
         )
 
+    # Rate-limit backfill triggers
+    await backfill_limiter.check(symbol)
+
     rows = await maybe_backfill_candles(
-        symbol=symbol.upper(),
+        symbol=symbol,
         timeframe=timeframe.upper(),
         dt_from=from_dt,
         dt_to=to_dt,

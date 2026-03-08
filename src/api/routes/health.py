@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 
+import redis.asyncio as aioredis
 from fastapi import APIRouter
 from sqlalchemy import text
 
@@ -20,6 +21,26 @@ router = APIRouter(prefix="/api/v1", tags=["health"])
 
 # Set once when the module is first imported (≈ app startup).
 _start_time: float = time.time()
+
+# Reusable Redis client for health checks (lazy singleton)
+_redis_client: aioredis.Redis | None = None
+
+
+def _get_redis_client() -> aioredis.Redis:
+    """Return a cached async Redis client instance."""
+    global _redis_client
+    if _redis_client is None:
+        settings = get_settings()
+        _redis_client = aioredis.Redis(
+            host=settings.redis_host,
+            port=settings.redis_port,
+            password=settings.redis_password,
+            db=settings.redis_db,
+            socket_connect_timeout=2,
+            retry_on_error=[ConnectionError, TimeoutError],
+            socket_keepalive=True,
+        )
+    return _redis_client
 
 
 @router.get(
@@ -40,20 +61,11 @@ async def health_check() -> HealthResponse:
     except Exception:
         pass
 
-    # Redis check
+    # Redis check (reuses persistent connection)
     redis_ok = False
     try:
-        import redis.asyncio as aioredis
-
-        r = aioredis.Redis(
-            host=settings.redis_host,
-            port=settings.redis_port,
-            password=settings.redis_password,
-            db=settings.redis_db,
-            socket_connect_timeout=2,
-        )
+        r = _get_redis_client()
         await r.ping()
-        await r.aclose()
         redis_ok = True
     except Exception:
         pass
