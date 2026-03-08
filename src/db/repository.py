@@ -421,3 +421,54 @@ async def query_tick_bars(
     async with factory() as session:
         result = await session.execute(sql, params)
         return [dict(r._mapping) for r in result.all()]
+
+
+# ---------------------------------------------------------------
+# Coverage statistics (for /api/v1/coverage)
+# ---------------------------------------------------------------
+
+async def query_candle_coverage() -> list[dict[str, Any]]:
+    """Per-symbol, per-timeframe: first bar, last bar, total count."""
+    sql = text("""
+        SELECT symbol, timeframe,
+               MIN(time) AS first_bar,
+               MAX(time) AS last_bar,
+               COUNT(*)  AS total
+        FROM candles
+        GROUP BY symbol, timeframe
+        ORDER BY symbol, timeframe
+    """)
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(sql)
+        return [dict(r._mapping) for r in result.all()]
+
+
+async def query_tick_coverage() -> list[dict[str, Any]]:
+    """Per-symbol: first tick, last tick, total count."""
+    sql = text("""
+        SELECT symbol,
+               MIN(time_msc) AS first_tick,
+               MAX(time_msc) AS last_tick,
+               COUNT(*)      AS total
+        FROM ticks
+        GROUP BY symbol
+        ORDER BY symbol
+    """)
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(sql)
+        return [dict(r._mapping) for r in result.all()]
+
+
+async def query_all_sync_states() -> list[dict[str, Any]]:
+    """Return all sync_state rows."""
+    sql = text("""
+        SELECT symbol, data_type, last_synced_at
+        FROM sync_state
+        ORDER BY symbol, data_type
+    """)
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(sql)
+        return [dict(r._mapping) for r in result.all()]

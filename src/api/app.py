@@ -17,7 +17,7 @@ import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.api.routes import candles, custom_candles, health, symbols, ticks
+from src.api.routes import candles, coverage, custom_candles, health, symbols, ticks
 from src.api.websocket import streams
 from src.config import get_settings
 from src.db.engine import dispose_engine, get_engine
@@ -102,6 +102,7 @@ def create_app() -> FastAPI:
     app.include_router(ticks.router)
     app.include_router(symbols.router)
     app.include_router(health.router)
+    app.include_router(coverage.router)
 
     # ---- WebSocket routes ----
     app.include_router(streams.router)
