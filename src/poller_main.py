@@ -22,6 +22,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import msvcrt
+import os
 import signal
 import sys
 import time
@@ -81,7 +83,40 @@ async def _task_monitor_loop(tasks: dict[str, asyncio.Task]) -> None:
             break
 
 
+# Path for single-instance lock file
+_LOCK_FILE = ".poller.lock"
+
+
+def _acquire_lock() -> object:
+    """Acquire an exclusive file lock. Exit immediately if another instance is running."""
+    try:
+        fh = open(_LOCK_FILE, "w")  # noqa: SIM115
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        fh.write(str(os.getpid()))
+        fh.flush()
+        return fh
+    except (OSError, PermissionError):
+        print(
+            "\n  ✗ Another poller instance is already running.\n"
+            "    Kill it first or delete .poller.lock\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _release_lock(fh: object) -> None:
+    """Release the lock file."""
+    try:
+        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[union-attr]
+        fh.close()  # type: ignore[union-attr]
+        os.remove(_LOCK_FILE)
+    except OSError:
+        pass
+
+
 async def main(dashboard: bool = False) -> None:
+    lock_fh = _acquire_lock()
+
     settings = get_settings()
     setup_logging(settings.log_level, settings.log_format)
 
@@ -223,6 +258,7 @@ async def main(dashboard: bool = False) -> None:
     await backfill_listener.close()
     await dispose_engine()
 
+    _release_lock(lock_fh)
     logger.info("poller_stopped")
 
 

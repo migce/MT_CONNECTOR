@@ -11,4 +11,5 @@ build/
 venv/
 logs/
 *.log
+.poller.lock
 nul
