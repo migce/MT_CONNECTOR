@@ -94,31 +94,40 @@ async def _task_monitor_loop(tasks: dict[str, asyncio.Task]) -> None:
 
 
 async def _health_checker_loop(api_port: int) -> None:
-    """Poll API /stats + DB/Redis every 10 s and update PollerMetrics."""
+    """Poll API /health + /stats, DB, Redis every 10 s and update PollerMetrics."""
     import httpx
     from sqlalchemy import text as sa_text
 
     from src.db.engine import get_engine as _get_engine
 
     metrics = PollerMetrics()
-    api_url = f"http://127.0.0.1:{api_port}/api/v1/stats"
+    api_base = f"http://127.0.0.1:{api_port}/api/v1"
 
     while True:
         try:
-            # ── API health ──────────────────────────────────────────
+            # ── API health (use /health — always present) ───────────
             api_ok = False
             api_lat = 0.0
-            api_data: dict = {}
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
                     t0 = time.perf_counter()
-                    resp = await client.get(api_url)
+                    resp = await client.get(f"{api_base}/health")
                     api_lat = (time.perf_counter() - t0) * 1000
                     if resp.status_code == 200:
                         api_ok = True
-                        api_data = resp.json()
             except Exception:
                 pass
+
+            # ── API request metrics (use /stats — may 404 on old image)
+            api_data: dict = {}
+            if api_ok:
+                try:
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        resp = await client.get(f"{api_base}/stats")
+                        if resp.status_code == 200:
+                            api_data = resp.json()
+                except Exception:
+                    pass
 
             metrics.update_api_health(
                 healthy=api_ok,
@@ -147,7 +156,7 @@ async def _health_checker_loop(api_port: int) -> None:
             redis_ok = False
             redis_lat = 0.0
             try:
-                pool = await get_redis_pool()
+                pool = get_redis_pool()
                 t0 = time.perf_counter()
                 await pool.ping()
                 redis_lat = (time.perf_counter() - t0) * 1000
