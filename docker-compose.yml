@@ -1,0 +1,98 @@
+# ============================================================
+# MT5 Connector — Docker Compose
+# ============================================================
+# Runs: TimescaleDB, Redis, and the FastAPI API server.
+# The MT5 Poller runs NATIVELY on Windows (not in Docker),
+# because MetaTrader 5 terminal requires Windows IPC.
+# ============================================================
+
+services:
+  # ----------------------------------------------------------
+  # TimescaleDB (PostgreSQL + time-series extensions)
+  # ----------------------------------------------------------
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: mt5_timescaledb
+    restart: unless-stopped
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    environment:
+      POSTGRES_DB: ${DB_NAME:-mt5_data}
+      POSTGRES_USER: ${DB_USER:-mt5user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-mt5password_change_me}
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-mt5user} -d ${DB_NAME:-mt5_data}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mt5net
+
+  # ----------------------------------------------------------
+  # Redis (Pub/Sub + caching)
+  # ----------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: mt5_redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mt5net
+
+  # ----------------------------------------------------------
+  # FastAPI API Server
+  # ----------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: mt5_api
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-9000}:9000"
+    env_file:
+      - .env
+    environment:
+      # Override DB/Redis hosts to use Docker service names
+      DB_HOST: timescaledb
+      DB_PORT: 5432
+      REDIS_HOST: redis
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - mt5net
+
+volumes:
+  timescale_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  mt5net:
+    driver: bridge

@@ -1,0 +1,25 @@
+# ============================================================
+# MT5 Connector — API Server Dependencies (Docker / Linux)
+# ============================================================
+# This file is used by the Dockerfile.  Does NOT include
+# MetaTrader5 (Windows-only).
+# ============================================================
+
+# --- Database ---
+asyncpg>=0.29.0
+SQLAlchemy[asyncio]>=2.0.25
+
+# --- API ---
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# --- Redis ---
+redis[hiredis]>=5.0.0
+
+# --- Utilities ---
+structlog>=24.1.0
+orjson>=3.9.0
+numpy>=1.26.0
+python-dateutil>=2.8.0
