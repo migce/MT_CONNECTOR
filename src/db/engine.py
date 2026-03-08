@@ -38,7 +38,12 @@ def get_engine(settings: Settings | None = None) -> AsyncEngine:
         pool_recycle=600,
         echo=False,
     )
-    logger.info("db_engine_created", dsn=settings.dsn.split("@")[-1])
+    logger.info(
+        "db_engine_created",
+        host=settings.db_host,
+        port=settings.db_port,
+        database=settings.db_name,
+    )
     return _engine
 
 

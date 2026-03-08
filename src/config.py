@@ -81,11 +81,10 @@ TF_AGGREGATION_MAP: dict[Timeframe, Timeframe] = {
 # ---------------------------------------------------------------------------
 
 _CUSTOM_TF_RE = re.compile(
-    r"^(?P<unit>[MHDWST])(?P<value>\d+)$", re.IGNORECASE,
+    r"^(?P<unit>[MHDWT])(?P<value>\d+)$", re.IGNORECASE,
 )
 
 _UNIT_MULTIPLIER = {
-    "S": 1,       # seconds
     "M": 60,      # minutes
     "H": 3600,    # hours
     "D": 86400,   # days
@@ -120,7 +119,7 @@ def parse_custom_timeframe(raw: str) -> CustomTimeframe:
     **Time-based** (aggregated from stored M1 candles via ``time_bucket``):
         ``M2``, ``M3``, ``M7``, ``M10``, ``M20``, ``M30``,
         ``H2``, ``H3``, ``H6``, ``H8``, ``H12``,
-        ``D2``, ``W1`` — anything that matches ``[MHDWS]\\d+``.
+        ``D2``, ``W1`` — anything that matches ``[MHDW]\\d+``.
 
     **Tick-based** (built on-the-fly from raw ticks):
         ``T100``, ``T250``, ``T500``, ``T1000`` — ``T\\d+``.
@@ -132,7 +131,7 @@ def parse_custom_timeframe(raw: str) -> CustomTimeframe:
     if not m:
         raise ValueError(
             f"Invalid custom timeframe '{raw}'. "
-            "Expected format: M<n>, H<n>, D<n>, W<n>, S<n> or T<n>."
+            "Expected format: M<n>, H<n>, D<n>, W<n> or T<n>."
         )
     unit = m.group("unit").upper()
     value = int(m.group("value"))

@@ -43,6 +43,7 @@ import structlog
 
 from src.config import Settings, get_settings
 from src.metrics import PollerMetrics
+from src.redis_bus.pool import get_redis_pool
 
 logger = structlog.get_logger(__name__)
 
@@ -102,23 +103,13 @@ class BackfillRequester:
         self._redis: aioredis.Redis | None = None
 
     async def connect(self) -> None:
-        self._redis = aioredis.Redis(
-            host=self._settings.redis_host,
-            port=self._settings.redis_port,
-            password=self._settings.redis_password,
-            db=self._settings.redis_db,
-            decode_responses=False,
-            retry_on_error=[ConnectionError, TimeoutError],
-            socket_connect_timeout=5,
-            socket_keepalive=True,
-        )
+        self._redis = get_redis_pool(self._settings)
         await self._redis.ping()
         logger.info("backfill_requester_connected")
 
     async def close(self) -> None:
-        if self._redis:
-            await self._redis.aclose()
-            self._redis = None
+        # Pool lifecycle is managed centrally.
+        self._redis = None
 
     async def request_and_wait(
         self,
@@ -225,23 +216,13 @@ class BackfillListener:
         self._metrics = PollerMetrics()
 
     async def connect(self) -> None:
-        self._redis = aioredis.Redis(
-            host=self._settings.redis_host,
-            port=self._settings.redis_port,
-            password=self._settings.redis_password,
-            db=self._settings.redis_db,
-            decode_responses=False,
-            retry_on_error=[ConnectionError, TimeoutError],
-            socket_connect_timeout=5,
-            socket_keepalive=True,
-        )
+        self._redis = get_redis_pool(self._settings)
         await self._redis.ping()
         logger.info("backfill_listener_connected")
 
     async def close(self) -> None:
-        if self._redis:
-            await self._redis.aclose()
-            self._redis = None
+        # Pool lifecycle is managed centrally.
+        self._redis = None
 
     async def run_forever(self) -> None:
         """

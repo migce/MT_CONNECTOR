@@ -24,22 +24,26 @@ from src.db.engine import dispose_engine, get_engine
 from src.db.init_timescale import init_timescaledb
 from src.logging_config import setup_logging
 from src.redis_bus.backfill_manager import BackfillRequester
+from src.redis_bus.pool import close_redis_pool
 
 logger = structlog.get_logger(__name__)
 
-# Module-level singleton so route handlers can import it
-backfill_requester: BackfillRequester | None = None
+# Weak reference to the app — set during lifespan, used by get_backfill_requester()
+_app_ref: FastAPI | None = None
 
 
 def get_backfill_requester() -> BackfillRequester | None:
-    """Return the global BackfillRequester (available after startup)."""
-    return backfill_requester
+    """Return the BackfillRequester stored on app.state (available after startup)."""
+    if _app_ref is not None:
+        return getattr(_app_ref.state, "backfill_requester", None)
+    return None
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """Application lifecycle: startup → yield → shutdown."""
-    global backfill_requester
+    global _app_ref
+    _app_ref = app
     settings = get_settings()
     setup_logging(settings.log_level, settings.log_format)
     logger.info("api_starting", version="1.0.0")
@@ -55,19 +59,23 @@ async def _lifespan(app: FastAPI):
 
     # Connect backfill requester (for on-demand MT5 downloads)
     try:
-        backfill_requester = BackfillRequester(settings)
-        await backfill_requester.connect()
+        requester = BackfillRequester(settings)
+        await requester.connect()
+        app.state.backfill_requester = requester
     except Exception:
         logger.warning("backfill_requester_connect_failed", exc_info=True)
-        backfill_requester = None
+        app.state.backfill_requester = None
 
     yield
 
     # Shutdown
-    if backfill_requester is not None:
-        await backfill_requester.close()
-        backfill_requester = None
+    requester = getattr(app.state, "backfill_requester", None)
+    if requester is not None:
+        await requester.close()
+        app.state.backfill_requester = None
+    await close_redis_pool()
     await dispose_engine()
+    _app_ref = None
     logger.info("api_stopped")
 
 

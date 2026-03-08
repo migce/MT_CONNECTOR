@@ -39,6 +39,7 @@ from src.mt5.backfill import Backfiller
 from src.mt5.collector import Collector
 from src.mt5.connection import MT5Connection
 from src.redis_bus.backfill_manager import BackfillListener
+from src.redis_bus.pool import close_redis_pool
 from src.redis_bus.publisher import RedisPublisher
 
 logger = structlog.get_logger(__name__)
@@ -265,6 +266,7 @@ async def main(dashboard: bool = False) -> None:
     await connection.shutdown()
     await publisher.close()
     await backfill_listener.close()
+    await close_redis_pool()
     await dispose_engine()
 
     _release_lock(lock_fh)

@@ -313,8 +313,9 @@ MT_Connector/
     │   ├── connection.py       # Connect + reconnect + heartbeat
     │   ├── collector.py        # Real-time tick/candle polling
     │   ├── backfill.py         # Historical download + gap fill
-    │   └── aggregator.py       # M1 → M5/H1/D1 aggregation
+    │   └── converters.py       # Shared bar/tick dict converters
     ├── redis_bus/              # Pub/Sub bridge
+    │   ├── pool.py             # Shared Redis connection pool
     │   ├── publisher.py        # Poller → Redis
     │   └── subscriber.py       # Redis → WebSocket
     └── api/                    # FastAPI application

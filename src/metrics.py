@@ -54,6 +54,15 @@ class PollerMetrics:
                 cls._instance._init()
             return cls._instance
 
+    @classmethod
+    def reset(cls) -> None:
+        """Destroy the singleton so the next call to ``PollerMetrics()`` re-initialises.
+
+        Primarily intended for tests.
+        """
+        with cls._lock_cls:
+            cls._instance = None
+
     # -- initialisation (called once) ------------------------------------
 
     def _init(self) -> None:

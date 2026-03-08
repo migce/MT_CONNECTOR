@@ -10,7 +10,7 @@ All write methods use UPSERT semantics:
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 import structlog
 from sqlalchemy import text
@@ -304,13 +304,13 @@ async def query_custom_tf_candles(
         Source timeframe to aggregate from.  Defaults to "M1".
         For large buckets (>= 1h) you can pass "H1" for speed.
     """
-    bucket = f"{bucket_seconds} seconds"
     clauses = ["c.symbol = :symbol", "c.timeframe = :source_tf"]
     params: dict[str, Any] = {
         "symbol": symbol,
         "source_tf": source_tf,
         "tf_label": tf_label,
         "limit": limit,
+        "bucket_seconds": bucket_seconds,
     }
 
     if dt_from:
@@ -321,10 +321,9 @@ async def query_custom_tf_candles(
         params["dt_to"] = dt_to
 
     where = " AND ".join(clauses)
-    # bucket_seconds is always a positive integer we control – safe to embed
     sql = text(f"""
         SELECT
-            time_bucket(interval '{bucket_seconds} seconds', c.time) AS time,
+            time_bucket(make_interval(secs => CAST(:bucket_seconds AS double precision)), c.time) AS time,
             c.symbol,
             :tf_label                                        AS timeframe,
             (ARRAY_AGG(c.open  ORDER BY c.time ASC))[1]      AS open,
@@ -336,7 +335,7 @@ async def query_custom_tf_candles(
             MAX(c.spread)                                    AS spread
         FROM candles c
         WHERE {where}
-        GROUP BY time_bucket(interval '{bucket_seconds} seconds', c.time), c.symbol
+        GROUP BY time_bucket(make_interval(secs => CAST(:bucket_seconds AS double precision)), c.time), c.symbol
         ORDER BY time ASC
         LIMIT :limit
     """)
@@ -358,7 +357,7 @@ async def query_tick_bars(
     dt_from: datetime | None = None,
     dt_to: datetime | None = None,
     limit: int = 1000,
-    price_field: str = "bid",
+    price_field: Literal["bid", "ask", "last", "mid"] = "bid",
     include_incomplete: bool = False,
 ) -> list[dict[str, Any]]:
     """

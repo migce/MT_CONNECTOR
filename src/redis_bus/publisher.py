@@ -21,6 +21,7 @@ import structlog
 
 from src.config import Settings, get_settings
 from src.metrics import PollerMetrics
+from src.redis_bus.pool import get_redis_pool
 
 logger = structlog.get_logger(__name__)
 
@@ -41,17 +42,8 @@ class RedisPublisher:
         self._metrics = PollerMetrics()
 
     async def connect(self) -> None:
-        """Create the Redis connection."""
-        self._redis = aioredis.Redis(
-            host=self._settings.redis_host,
-            port=self._settings.redis_port,
-            password=self._settings.redis_password,
-            db=self._settings.redis_db,
-            decode_responses=False,
-            retry_on_error=[ConnectionError, TimeoutError],
-            socket_connect_timeout=5,
-            socket_keepalive=True,
-        )
+        """Acquire a reference to the shared Redis pool."""
+        self._redis = get_redis_pool(self._settings)
         # Verify connectivity
         await self._redis.ping()
         logger.info(
@@ -61,10 +53,9 @@ class RedisPublisher:
         )
 
     async def close(self) -> None:
-        if self._redis is not None:
-            await self._redis.aclose()
-            self._redis = None
-            logger.info("redis_publisher_closed")
+        # Pool lifecycle is managed centrally; just drop the reference.
+        self._redis = None
+        logger.info("redis_publisher_closed")
 
     async def publish_tick(self, symbol: str, tick: dict[str, Any]) -> None:
         """Publish a tick event to ``tick:{symbol}``."""

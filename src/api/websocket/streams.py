@@ -17,14 +17,54 @@ from typing import Any
 import orjson
 import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from src.api.websocket.manager import ws_manager
-from src.config import get_settings
+from src.config import Timeframe, get_settings, is_standard_timeframe, parse_custom_timeframe
 from src.redis_bus.subscriber import RedisSubscriber
 
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(tags=["websocket"])
+
+
+# ---------------------------------------------------------------
+# Origin validation helper
+# ---------------------------------------------------------------
+
+def _check_origin(ws: WebSocket) -> bool:
+    """
+    Validate the WebSocket ``Origin`` header against configured
+    CORS origins.  Returns True if allowed, False otherwise.
+    """
+    settings = get_settings()
+    cors_raw = settings.cors_origins
+    if cors_raw == "*":
+        return True  # wildcard — accept all
+    allowed = {o.strip().rstrip("/") for o in cors_raw.split(",") if o.strip()}
+    origin = (ws.headers.get("origin") or "").rstrip("/")
+    if not origin:
+        return True  # no origin header (non-browser client)
+    return origin in allowed
+
+
+def _validate_ws_symbol(symbol: str) -> str | None:
+    """Return upper-cased symbol if it's in the configured list, else None."""
+    symbol = symbol.upper()
+    allowed = get_settings().symbols
+    return symbol if symbol in allowed else None
+
+
+def _validate_ws_timeframe(tf: str) -> bool:
+    """Return True if *tf* is a valid standard or custom timeframe."""
+    tf = tf.upper()
+    if is_standard_timeframe(tf):
+        return True
+    try:
+        parse_custom_timeframe(tf)
+        return True
+    except ValueError:
+        return False
 
 # ---------------------------------------------------------------
 # Shared per-channel Redis pump
@@ -95,8 +135,19 @@ async def _heartbeat(ws: WebSocket, interval: int) -> None:
 @router.websocket("/ws/ticks/{symbol}")
 async def ws_ticks(ws: WebSocket, symbol: str) -> None:
     """Stream raw ticks for *symbol* in real time."""
+    # Validate origin before accepting
+    if not _check_origin(ws):
+        await ws.close(code=4003, reason="Origin not allowed")
+        return
+
+    # Validate symbol
+    validated = _validate_ws_symbol(symbol)
+    if validated is None:
+        await ws.close(code=4004, reason=f"Unknown symbol: {symbol}")
+        return
+    symbol = validated
+
     await ws.accept()
-    symbol = symbol.upper()
     channel = f"tick:{symbol}"
 
     await ws_manager.subscribe(channel, ws)
@@ -131,9 +182,25 @@ async def ws_ticks(ws: WebSocket, symbol: str) -> None:
 @router.websocket("/ws/candles/{symbol}/{timeframe}")
 async def ws_candles(ws: WebSocket, symbol: str, timeframe: str) -> None:
     """Stream candle updates for *symbol* / *timeframe* in real time."""
-    await ws.accept()
-    symbol = symbol.upper()
+    # Validate origin before accepting
+    if not _check_origin(ws):
+        await ws.close(code=4003, reason="Origin not allowed")
+        return
+
+    # Validate symbol
+    validated = _validate_ws_symbol(symbol)
+    if validated is None:
+        await ws.close(code=4004, reason=f"Unknown symbol: {symbol}")
+        return
+    symbol = validated
+
+    # Validate timeframe
     timeframe = timeframe.upper()
+    if not _validate_ws_timeframe(timeframe):
+        await ws.close(code=4004, reason=f"Invalid timeframe: {timeframe}")
+        return
+
+    await ws.accept()
     channel = f"candle:{symbol}:{timeframe}"
 
     await ws_manager.subscribe(channel, ws)

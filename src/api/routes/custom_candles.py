@@ -19,7 +19,7 @@ cover the requested range, the system automatically fetches it from MT5.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -95,7 +95,7 @@ async def get_custom_candles(
         le=50000,
         description="Maximum number of candles to return.",
     ),
-    price: str = Query(
+    price: Literal["bid", "ask", "last", "mid"] = Query(
         default="bid",
         description=(
             "Price field for tick bars: ``bid`` (default), ``ask``, "

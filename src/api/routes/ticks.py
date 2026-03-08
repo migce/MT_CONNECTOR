@@ -47,7 +47,7 @@ async def get_ticks(
     limit: int = Query(
         default=5000,
         ge=1,
-        le=100000,
+        le=50000,
         description="Maximum number of ticks to return.",
     ),
 ) -> list[TickResponse]:

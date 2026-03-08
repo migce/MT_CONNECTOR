@@ -52,8 +52,6 @@ class TickResponse(BaseModel):
 class SymbolInfo(BaseModel):
     symbol: str
     description: str = ""
-    digits: int = 5
-    trade_mode: int = 0
 
     model_config = {"from_attributes": True}
 

@@ -33,6 +33,9 @@ logger = structlog.get_logger(__name__)
 _TICK_BUFFER_MAX = 5000
 # Flush interval (seconds)
 _TICK_FLUSH_INTERVAL = 1.0
+# Buffer capacity warning threshold (fraction of maxlen)
+_TICK_BUFFER_WARN_THRESHOLD = 0.8
+_TICK_BUFFER_MAXLEN = 100_000
 
 
 class Collector:
@@ -62,8 +65,9 @@ class Collector:
         self._last_tick_msc: dict[str, int] = defaultdict(int)
 
         # Tick write buffer: list of dicts ready for DB insert
-        self._tick_buffer: deque[dict[str, Any]] = deque(maxlen=100_000)
+        self._tick_buffer: deque[dict[str, Any]] = deque(maxlen=_TICK_BUFFER_MAXLEN)
         self._last_flush_ts: float = 0.0
+        self._consecutive_flush_errors: int = 0
 
         # Background tasks
         self._tasks: list[asyncio.Task] = []
@@ -127,6 +131,17 @@ class Collector:
                     self._tick_buffer.append(tick_dict)
                     self._metrics.record_tick(symbol, tick_dict["bid"], tick_dict["ask"])
 
+                    # Warn if buffer is approaching capacity
+                    buf_len = len(self._tick_buffer)
+                    if buf_len >= _TICK_BUFFER_MAXLEN * _TICK_BUFFER_WARN_THRESHOLD:
+                        logger.warning(
+                            "tick_buffer_near_capacity",
+                            depth=buf_len,
+                            max=_TICK_BUFFER_MAXLEN,
+                            pct=round(buf_len / _TICK_BUFFER_MAXLEN * 100, 1),
+                        )
+                        self._metrics.record_error("buffer_overflow_warn")
+
                     # Publish to Redis (fire-and-forget)
                     await self._pub.publish_tick(symbol, tick_dict)
 
@@ -171,7 +186,11 @@ class Collector:
                     for symbol in symbols
                     for tf in timeframes
                 ]
-                await asyncio.gather(*tasks, return_exceptions=True)
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for r in results:
+                    if isinstance(r, Exception):
+                        logger.exception("candle_poll_error", error=str(r), exc_info=r)
+                        self._metrics.record_error("candle_poll")
 
                 await asyncio.sleep(interval)
 
@@ -191,11 +210,19 @@ class Collector:
             try:
                 await asyncio.sleep(_TICK_FLUSH_INTERVAL)
                 await self._flush_tick_buffer()
+                self._consecutive_flush_errors = 0
             except asyncio.CancelledError:
                 break
             except Exception:
-                logger.exception("flush_loop_error")
+                self._consecutive_flush_errors += 1
+                backoff = min(2 ** self._consecutive_flush_errors, 30)
+                logger.exception(
+                    "flush_loop_error",
+                    consecutive_errors=self._consecutive_flush_errors,
+                    backoff_sec=backoff,
+                )
                 self._metrics.record_error("flush")
+                await asyncio.sleep(backoff)
 
     async def _flush_tick_buffer(self) -> None:
         if not self._tick_buffer:

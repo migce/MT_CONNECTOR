@@ -18,6 +18,7 @@ import redis.asyncio as aioredis
 import structlog
 
 from src.config import Settings, get_settings
+from src.redis_bus.pool import get_redis_pool
 
 logger = structlog.get_logger(__name__)
 
@@ -45,16 +46,7 @@ class RedisSubscriber:
         self._pubsub: aioredis.client.PubSub | None = None  # type: ignore[type-arg]
 
     async def connect(self) -> None:
-        self._redis = aioredis.Redis(
-            host=self._settings.redis_host,
-            port=self._settings.redis_port,
-            password=self._settings.redis_password,
-            db=self._settings.redis_db,
-            decode_responses=False,
-            retry_on_error=[ConnectionError, TimeoutError],
-            socket_connect_timeout=5,
-            socket_keepalive=True,
-        )
+        self._redis = get_redis_pool(self._settings)
         self._pubsub = self._redis.pubsub()
         logger.debug("redis_subscriber_connected")
 
@@ -107,7 +99,6 @@ class RedisSubscriber:
         if self._pubsub is not None:
             await self._pubsub.close()
             self._pubsub = None
-        if self._redis is not None:
-            await self._redis.aclose()
-            self._redis = None
+        # Pool lifecycle is managed centrally; just drop the reference.
+        self._redis = None
         logger.debug("redis_subscriber_closed")
