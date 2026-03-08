@@ -17,6 +17,7 @@ from typing import Any
 
 import structlog
 
+from src.config import Timeframe
 from src.db import repository as repo
 
 logger = structlog.get_logger(__name__)
@@ -25,6 +26,21 @@ logger = structlog.get_logger(__name__)
 # ``from``, we consider the range "uncovered" and trigger a backfill.
 _CANDLE_GAP_TOLERANCE_SEC = 120  # 2 minutes (covers M1 granularity)
 _TICK_GAP_TOLERANCE_SEC = 60     # 1 minute
+
+# Market is open ~5/7 of the week; add 50 % safety margin for gaps/weekends
+_MARKET_HOURS_FACTOR = 1.5
+
+
+def _estimate_from_for_limit(timeframe: str, limit: int) -> datetime:
+    """Estimate how far back we need to go to satisfy *limit* candles."""
+    try:
+        tf = Timeframe(timeframe)
+    except ValueError:
+        tf_sec = 3600  # fallback to H1
+    else:
+        tf_sec = tf.seconds
+    needed_seconds = int(tf_sec * limit * _MARKET_HOURS_FACTOR)
+    return datetime.now(timezone.utc) - timedelta(seconds=needed_seconds)
 
 
 async def maybe_backfill_candles(
@@ -40,7 +56,7 @@ async def maybe_backfill_candles(
     """
     rows = await repo.query_candles(symbol, timeframe, dt_from, dt_to, limit)
 
-    if not _needs_backfill_candles(rows, dt_from):
+    if not _needs_backfill_candles(rows, dt_from, limit, timeframe):
         return rows
 
     from src.api.app import get_backfill_requester
@@ -49,7 +65,11 @@ async def maybe_backfill_candles(
         return rows  # no requester available, return what we have
 
     # Determine the range to fetch
-    bf_from = dt_from
+    if dt_from is not None:
+        bf_from = dt_from
+    else:
+        # No explicit from — estimate based on limit & timeframe
+        bf_from = _estimate_from_for_limit(timeframe, limit)
     bf_to = dt_to or datetime.now(timezone.utc)
 
     logger.info(
@@ -88,7 +108,7 @@ async def maybe_backfill_ticks(
     """
     rows = await repo.query_ticks(symbol, dt_from, dt_to, limit)
 
-    if not _needs_backfill_ticks(rows, dt_from):
+    if not _needs_backfill_ticks(rows, dt_from, limit):
         return rows
 
     from src.api.app import get_backfill_requester
@@ -96,7 +116,12 @@ async def maybe_backfill_ticks(
     if requester is None:
         return rows
 
-    bf_from = dt_from
+    if dt_from is not None:
+        bf_from = dt_from
+    else:
+        # Estimate: assume ~4 ticks/second on average for major pairs
+        needed_seconds = max(limit // 4, 60)
+        bf_from = datetime.now(timezone.utc) - timedelta(seconds=needed_seconds)
     bf_to = dt_to or datetime.now(timezone.utc)
 
     logger.info(
@@ -128,10 +153,13 @@ async def maybe_backfill_ticks(
 def _needs_backfill_candles(
     rows: list[dict[str, Any]],
     dt_from: datetime | None,
+    limit: int = 1000,
+    timeframe: str = "M1",
 ) -> bool:
     """Return True if data appears to be missing for the requested range."""
+    # No explicit start but got fewer rows than requested → need more data
     if dt_from is None:
-        return False  # no explicit start → user is fine with whatever we have
+        return len(rows) < limit
 
     # Empty result for an explicit from → definitely missing
     if not rows:
@@ -154,9 +182,10 @@ def _needs_backfill_candles(
 def _needs_backfill_ticks(
     rows: list[dict[str, Any]],
     dt_from: datetime | None,
+    limit: int = 1000,
 ) -> bool:
     if dt_from is None:
-        return False
+        return len(rows) < limit
 
     if not rows:
         return True
