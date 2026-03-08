@@ -152,6 +152,18 @@ class BackfillRequester:
             if existing_id:
                 rid = existing_id.decode() if isinstance(existing_id, bytes) else existing_id
                 return await self._wait_for_response(rid, timeout)
+            # The winner already finished and the key was deleted.
+            # Retry the whole SET NX to become the new owner.
+            was_set = await self._redis.set(inflight, req_id, nx=True, ex=INFLIGHT_TTL)
+            if not was_set:
+                # Extremely unlikely third-party race — just fall through
+                # and wait for whoever won.
+                existing_id = await self._redis.get(inflight)
+                if existing_id:
+                    rid = existing_id.decode() if isinstance(existing_id, bytes) else existing_id
+                    return await self._wait_for_response(rid, timeout)
+                logger.warning("backfill_dedup_race_unresolved", symbol=symbol)
+                return None
 
         # Push request onto the queue
         payload = orjson.dumps(req, default=_serialize_dt)

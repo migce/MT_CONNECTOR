@@ -12,6 +12,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote_plus
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -257,7 +258,7 @@ class Settings(BaseSettings):
     def dsn(self) -> str:
         """Async PostgreSQL DSN for asyncpg."""
         return (
-            f"postgresql+asyncpg://{self.db_user}:{self.db_password}"
+            f"postgresql+asyncpg://{quote_plus(self.db_user)}:{quote_plus(self.db_password)}"
             f"@{self.db_host}:{self.db_port}/{self.db_name}"
         )
 
@@ -265,13 +266,13 @@ class Settings(BaseSettings):
     def dsn_sync(self) -> str:
         """Sync PostgreSQL DSN (for Alembic / admin scripts)."""
         return (
-            f"postgresql://{self.db_user}:{self.db_password}"
+            f"postgresql://{quote_plus(self.db_user)}:{quote_plus(self.db_password)}"
             f"@{self.db_host}:{self.db_port}/{self.db_name}"
         )
 
     @property
     def redis_url(self) -> str:
-        auth = f":{self.redis_password}@" if self.redis_password else ""
+        auth = f":{quote_plus(self.redis_password)}@" if self.redis_password else ""
         return f"redis://{auth}{self.redis_host}:{self.redis_port}/{self.redis_db}"
 
     # ----- Validators -----

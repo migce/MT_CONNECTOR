@@ -238,10 +238,29 @@ class Collector:
         try:
             inserted = await repo.insert_ticks(batch)
         except Exception:
-            # Re-enqueue so ticks are not lost on transient DB errors
-            self._tick_buffer.extendleft(reversed(batch))
+            # Re-enqueue so ticks are not lost on transient DB errors.
+            # New ticks may have arrived while we awaited insert_ticks;
+            # save them, prepend the failed batch, then re-add new ticks.
+            new_arrivals: list[dict[str, Any]] = []
+            while self._tick_buffer:
+                new_arrivals.append(self._tick_buffer.popleft())
+
+            dropped = 0
+            total_to_restore = len(batch) + len(new_arrivals)
+            if total_to_restore > self._TICK_BUFFER_MAXLEN:
+                # Drop oldest from batch to make room
+                dropped = total_to_restore - self._TICK_BUFFER_MAXLEN
+                batch = batch[dropped:]
+
+            self._tick_buffer.extend(batch)
+            self._tick_buffer.extend(new_arrivals)
             self._metrics.set_tick_buffer_depth(len(self._tick_buffer))
-            logger.exception("tick_flush_db_error", lost=0, requeued=len(batch))
+            logger.exception(
+                "tick_flush_db_error",
+                lost=dropped,
+                requeued=len(batch),
+                new_arrivals=len(new_arrivals),
+            )
             raise
         _elapsed_ms = (time.monotonic() - _t0) * 1000
         self._metrics.record_ticks_flushed(inserted, _elapsed_ms)

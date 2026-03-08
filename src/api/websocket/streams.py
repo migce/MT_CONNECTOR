@@ -79,18 +79,39 @@ async def _shared_redis_pump(channel: str) -> None:
     """
     Single Redis subscriber for *channel*.  Broadcasts every message
     to all WebSocket clients registered in ws_manager.
-    """
-    sub = RedisSubscriber()
-    await sub.connect()
-    await sub.subscribe(channel)
 
-    try:
-        async for _ch_name, data in sub.listen():
-            await ws_manager.broadcast(channel, data)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        await sub.close()
+    Automatically reconnects on Redis errors.
+    """
+    import structlog
+    _logger = structlog.get_logger("ws.pump")
+    retry_delay = 1.0
+    max_retry_delay = 30.0
+
+    while True:
+        sub = RedisSubscriber()
+        try:
+            await sub.connect()
+            await sub.subscribe(channel)
+            retry_delay = 1.0  # reset on successful connect
+
+            async for _ch_name, data in sub.listen():
+                await ws_manager.broadcast(channel, data)
+
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            _logger.warning(
+                "redis_pump_reconnect",
+                channel=channel,
+                retry_in=retry_delay,
+            )
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, max_retry_delay)
+        finally:
+            try:
+                await sub.close()
+            except Exception:
+                pass
 
 
 async def _ensure_pump(channel: str) -> None:

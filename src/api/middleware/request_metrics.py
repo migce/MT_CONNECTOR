@@ -3,32 +3,25 @@ API request metrics middleware.
 
 Counts every HTTP request (excluding WebSocket upgrades) and records
 response latency.  Metrics are served via ``/api/v1/stats``.
+
+Uses minute-bucketed counters for O(window_minutes) snapshot instead of
+scanning a full history deque.
 """
 
 from __future__ import annotations
 
 import time
 import threading
-from collections import deque
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from collections import Counter
+from dataclasses import dataclass
 
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import Response
 
 
-@dataclass
-class _RequestRecord:
-    ts: float  # time.monotonic()
-    latency_ms: float
-    status: int
-    method: str
-    path: str
-
-
 class ApiMetrics:
-    """Thread-safe request counter with sliding-window stats."""
+    """Thread-safe request counter with minute-bucket stats."""
 
     _instance: "ApiMetrics | None" = None
     _lock_cls = threading.Lock()
@@ -45,55 +38,80 @@ class ApiMetrics:
         with cls._lock_cls:
             cls._instance = None
 
+    # -- initialisation ---------------------------------------------------
+
     def _init(self) -> None:
         self._lock = threading.Lock()
         self.total_requests: int = 0
         self.total_errors: int = 0  # 5xx
-        # Keep timestamps for windowed counting (last 7 days max ~604800 entries)
-        # At 1 req/s that's ~600K entries ≈ 50 MB — acceptable.
-        # In practice API traffic is much lower.
-        self._history: deque[_RequestRecord] = deque(maxlen=700_000)
         self._start_time: float = time.monotonic()
 
+        # Minute-bucket counters (key = int(time.time()) // 60)
+        self._req_buckets: Counter[int] = Counter()
+        self._err_buckets: Counter[int] = Counter()
+        self._latency_sum_buckets: Counter[int] = Counter()  # sum of latency_ms
+        self._latency_cnt_buckets: Counter[int] = Counter()  # count for avg
+
+    @staticmethod
+    def _current_minute() -> int:
+        return int(time.time()) // 60
+
+    # -- record -----------------------------------------------------------
+
     def record(self, method: str, path: str, status: int, latency_ms: float) -> None:
-        now = time.monotonic()
-        rec = _RequestRecord(ts=now, latency_ms=latency_ms, status=status, method=method, path=path)
+        minute = self._current_minute()
         with self._lock:
             self.total_requests += 1
+            self._req_buckets[minute] += 1
+            self._latency_sum_buckets[minute] += latency_ms
+            self._latency_cnt_buckets[minute] += 1
             if status >= 500:
                 self.total_errors += 1
-            self._history.append(rec)
+                self._err_buckets[minute] += 1
 
-    def _count_since(self, seconds: float) -> int:
-        cutoff = time.monotonic() - seconds
-        with self._lock:
-            return sum(1 for r in self._history if r.ts >= cutoff)
+    # -- window helpers (called under lock) -------------------------------
 
-    def _avg_latency_since(self, seconds: float) -> float:
-        cutoff = time.monotonic() - seconds
-        with self._lock:
-            recent = [r.latency_ms for r in self._history if r.ts >= cutoff]
-        if not recent:
-            return 0.0
-        return sum(recent) / len(recent)
+    def _count_since(self, minutes: int) -> int:
+        cutoff = self._current_minute() - minutes
+        return sum(c for m, c in self._req_buckets.items() if m >= cutoff)
 
-    def _error_count_since(self, seconds: float) -> int:
-        cutoff = time.monotonic() - seconds
-        with self._lock:
-            return sum(1 for r in self._history if r.ts >= cutoff and r.status >= 500)
+    def _error_count_since(self, minutes: int) -> int:
+        cutoff = self._current_minute() - minutes
+        return sum(c for m, c in self._err_buckets.items() if m >= cutoff)
+
+    def _avg_latency_since(self, minutes: int) -> float:
+        cutoff = self._current_minute() - minutes
+        total_lat = sum(v for m, v in self._latency_sum_buckets.items() if m >= cutoff)
+        total_cnt = sum(v for m, v in self._latency_cnt_buckets.items() if m >= cutoff)
+        return (total_lat / total_cnt) if total_cnt else 0.0
+
+    # -- snapshot (single lock acquisition) -------------------------------
 
     def snapshot(self) -> dict:
         """Return stats snapshot for the /stats endpoint."""
-        return {
-            "total_requests": self.total_requests,
-            "total_errors": self.total_errors,
-            "uptime_sec": round(time.monotonic() - self._start_time, 1),
-            "requests_1h": self._count_since(3600),
-            "requests_12h": self._count_since(43200),
-            "requests_24h": self._count_since(86400),
-            "errors_1h": self._error_count_since(3600),
-            "avg_latency_ms_1h": round(self._avg_latency_since(3600), 2),
-        }
+        with self._lock:
+            return {
+                "total_requests": self.total_requests,
+                "total_errors": self.total_errors,
+                "uptime_sec": round(time.monotonic() - self._start_time, 1),
+                "requests_1h": self._count_since(60),
+                "requests_12h": self._count_since(720),
+                "requests_24h": self._count_since(1440),
+                "errors_1h": self._error_count_since(60),
+                "avg_latency_ms_1h": round(self._avg_latency_since(60), 2),
+            }
+
+    # -- housekeeping -----------------------------------------------------
+
+    def prune_old_buckets(self) -> None:
+        """Remove buckets older than 25 hours."""
+        cutoff = self._current_minute() - (25 * 60)
+        with self._lock:
+            for bucket in (self._req_buckets, self._err_buckets,
+                           self._latency_sum_buckets, self._latency_cnt_buckets):
+                stale = [m for m in bucket if m < cutoff]
+                for m in stale:
+                    del bucket[m]
 
 
 class RequestMetricsMiddleware(BaseHTTPMiddleware):

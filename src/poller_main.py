@@ -103,83 +103,82 @@ async def _health_checker_loop(api_port: int) -> None:
     metrics = PollerMetrics()
     api_base = f"http://127.0.0.1:{api_port}/api/v1"
 
-    while True:
-        try:
-            # ── API health (use /health — always present) ───────────
-            api_ok = False
-            api_lat = 0.0
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        while True:
             try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
+                # ── API health (use /health — always present) ───────────
+                api_ok = False
+                api_lat = 0.0
+                try:
                     t0 = time.perf_counter()
                     resp = await client.get(f"{api_base}/health")
                     api_lat = (time.perf_counter() - t0) * 1000
                     if resp.status_code == 200:
                         api_ok = True
-            except Exception:
-                pass
-
-            # ── API request metrics (use /stats — may 404 on old image)
-            api_data: dict = {}
-            if api_ok:
-                try:
-                    async with httpx.AsyncClient(timeout=5.0) as client:
-                        resp = await client.get(f"{api_base}/stats")
-                        if resp.status_code == 200:
-                            api_data = resp.json()
                 except Exception:
                     pass
 
-            metrics.update_api_health(
-                healthy=api_ok,
-                latency_ms=round(api_lat, 1),
-                requests_1h=api_data.get("requests_1h", 0),
-                requests_12h=api_data.get("requests_12h", 0),
-                requests_24h=api_data.get("requests_24h", 0),
-                errors_1h=api_data.get("errors_1h", 0),
-                avg_latency_ms=api_data.get("avg_latency_ms_1h", 0.0),
-            )
+                # ── API request metrics (use /stats — may 404 on old image)
+                api_data: dict = {}
+                if api_ok:
+                    try:
+                        resp = await client.get(f"{api_base}/stats")
+                        if resp.status_code == 200:
+                            api_data = resp.json()
+                    except Exception:
+                        pass
 
-            # ── DB health ───────────────────────────────────────────
-            db_ok = False
-            db_lat = 0.0
-            try:
-                engine = _get_engine()
-                t0 = time.perf_counter()
-                async with engine.connect() as conn:
-                    await conn.execute(sa_text("SELECT 1"))
-                db_lat = (time.perf_counter() - t0) * 1000
-                db_ok = True
+                metrics.update_api_health(
+                    healthy=api_ok,
+                    latency_ms=round(api_lat, 1),
+                    requests_1h=api_data.get("requests_1h", 0),
+                    requests_12h=api_data.get("requests_12h", 0),
+                    requests_24h=api_data.get("requests_24h", 0),
+                    errors_1h=api_data.get("errors_1h", 0),
+                    avg_latency_ms=api_data.get("avg_latency_ms_1h", 0.0),
+                )
+
+                # ── DB health ───────────────────────────────────────────
+                db_ok = False
+                db_lat = 0.0
+                try:
+                    engine = _get_engine()
+                    t0 = time.perf_counter()
+                    async with engine.connect() as conn:
+                        await conn.execute(sa_text("SELECT 1"))
+                    db_lat = (time.perf_counter() - t0) * 1000
+                    db_ok = True
+                except Exception:
+                    pass
+
+                # ── Redis health ────────────────────────────────────────
+                redis_ok = False
+                redis_lat = 0.0
+                try:
+                    pool = get_redis_pool()
+                    t0 = time.perf_counter()
+                    await pool.ping()
+                    redis_lat = (time.perf_counter() - t0) * 1000
+                    redis_ok = True
+                except Exception:
+                    pass
+
+                metrics.update_infra_health(
+                    db_ok=db_ok,
+                    redis_ok=redis_ok,
+                    db_latency_ms=round(db_lat, 1),
+                    redis_latency_ms=round(redis_lat, 1),
+                )
+
+                # ── Prune old minute-buckets every cycle ────────────────
+                metrics.prune_minute_buckets()
+
+                await asyncio.sleep(10.0)
+            except asyncio.CancelledError:
+                break
             except Exception:
-                pass
-
-            # ── Redis health ────────────────────────────────────────
-            redis_ok = False
-            redis_lat = 0.0
-            try:
-                pool = get_redis_pool()
-                t0 = time.perf_counter()
-                await pool.ping()
-                redis_lat = (time.perf_counter() - t0) * 1000
-                redis_ok = True
-            except Exception:
-                pass
-
-            metrics.update_infra_health(
-                db_ok=db_ok,
-                redis_ok=redis_ok,
-                db_latency_ms=round(db_lat, 1),
-                redis_latency_ms=round(redis_lat, 1),
-            )
-
-            # ── Prune old minute-buckets every cycle ────────────────
-            metrics.prune_minute_buckets()
-
-            await asyncio.sleep(10.0)
-        except asyncio.CancelledError:
-            break
-        except Exception:
-            logger.exception("health_checker_error")
-            await asyncio.sleep(10.0)
+                logger.exception("health_checker_error")
+                await asyncio.sleep(10.0)
 
 
 # Path for single-instance lock file

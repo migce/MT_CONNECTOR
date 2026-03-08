@@ -193,25 +193,44 @@ class MT5Client:
 
 class MT5ClientSync:
     """
-    Thin synchronous wrapper around :class:`MT5Client`.
+    Synchronous HTTP client using ``httpx.Client`` directly.
 
     Suitable for scripts and notebooks that don't run an event loop.
     """
 
     def __init__(self, base_url: str = "http://localhost:8000", timeout: float = 30.0) -> None:
-        self._client = MT5Client(base_url, timeout)
+        self._base = base_url.rstrip("/")
+        self._http = httpx.Client(base_url=self._base, timeout=timeout)
 
     def get_symbols(self):
-        return asyncio.run(self._client.get_symbols())
+        resp = self._http.get("/api/v1/symbols")
+        resp.raise_for_status()
+        return resp.json()
 
     def get_candles(self, symbol, timeframe="M1", from_dt=None, to_dt=None, limit=1000):
-        return asyncio.run(self._client.get_candles(symbol, timeframe, from_dt, to_dt, limit))
+        params: dict = {"timeframe": timeframe, "limit": limit}
+        if from_dt:
+            params["from"] = from_dt if isinstance(from_dt, str) else from_dt.isoformat()
+        if to_dt:
+            params["to"] = to_dt if isinstance(to_dt, str) else to_dt.isoformat()
+        resp = self._http.get(f"/api/v1/candles/{symbol}", params=params)
+        resp.raise_for_status()
+        return resp.json()
 
     def get_ticks(self, symbol, from_dt=None, to_dt=None, limit=5000):
-        return asyncio.run(self._client.get_ticks(symbol, from_dt, to_dt, limit))
+        params: dict = {"limit": limit}
+        if from_dt:
+            params["from"] = from_dt if isinstance(from_dt, str) else from_dt.isoformat()
+        if to_dt:
+            params["to"] = to_dt if isinstance(to_dt, str) else to_dt.isoformat()
+        resp = self._http.get(f"/api/v1/ticks/{symbol}", params=params)
+        resp.raise_for_status()
+        return resp.json()
 
     def health(self):
-        return asyncio.run(self._client.health())
+        resp = self._http.get("/api/v1/health")
+        resp.raise_for_status()
+        return resp.json()
 
     def close(self):
-        asyncio.run(self._client.close())
+        self._http.close()

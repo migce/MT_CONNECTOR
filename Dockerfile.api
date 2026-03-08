@@ -38,7 +38,7 @@ RUN groupadd -r appuser && useradd -r -g appuser appuser \
     && chown -R appuser:appuser /app
 USER appuser
 
-ENV API_WORKERS=2
+ENV API_WORKERS=1
 
 EXPOSE 9000
 

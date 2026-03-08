@@ -28,6 +28,7 @@ from src.api.services.backfill_helper import (
     maybe_backfill_candles,
     maybe_backfill_ticks,
 )
+from src.api.services.validation import backfill_limiter, validate_symbol
 from src.config import (
     Timeframe,
     is_standard_timeframe,
@@ -59,9 +60,9 @@ def _choose_source_tf(bucket_seconds: int) -> str:
     description=(
         "Build candles for **any** timeframe on-the-fly.\n\n"
         "**Time-based**: `M2`, `M3`, `M7`, `M10`, `M20`, `M30`, "
-        "`H2`, `H3`, `H6`, `H8`, `H12`, `D2`, `W1`, `S30`, … — "
+        "`H2`, `H3`, `H6`, `H8`, `H12`, `D2`, `W1`, … — "
         "any `{unit}{number}` where unit is `M` (minutes), `H` (hours), "
-        "`D` (days), `W` (weeks), `S` (seconds).\n\n"
+        "`D` (days), `W` (weeks).  Minimum bucket size is 60 s.\n\n"
         "**Tick bars**: `T100`, `T250`, `T500`, `T1000`, … — "
         "each bar contains exactly N ticks.\n\n"
         "Standard timeframes (M1, M5, M15, H1, H4, D1) are served from "
@@ -74,7 +75,7 @@ async def get_custom_candles(
         ...,
         description=(
             "Custom timeframe string.  "
-            "Time-based: M2, M3, H2, H6, H12, D2, W1, S30, …  "
+            "Time-based: M2, M3, H2, H6, H12, D2, W1, …  "
             "Tick bars: T100, T500, T1000, …"
         ),
         examples=["M2", "M3", "M10", "H2", "H6", "H12", "T100", "T500"],
@@ -111,8 +112,9 @@ async def get_custom_candles(
         ),
     ),
 ) -> list[CandleResponse]:
-    symbol = symbol.upper()
+    symbol = validate_symbol(symbol)
     tf_str = timeframe.strip().upper()
+    await backfill_limiter.check(symbol)
 
     # ------ Standard TF fast-path ------
     if is_standard_timeframe(tf_str):

@@ -163,7 +163,8 @@ class PollerMetrics:
             self.last_flush_ms = elapsed_ms
 
     def set_tick_buffer_depth(self, depth: int) -> None:
-        self.tick_buffer_depth = depth
+        with self._lock:
+            self.tick_buffer_depth = depth
 
     # -- candle metrics --------------------------------------------------
 
@@ -192,12 +193,14 @@ class PollerMetrics:
             self.reconnect_count += 1
 
     def set_mt5_connected(self, val: bool) -> None:
-        self.mt5_connected = val
+        with self._lock:
+            self.mt5_connected = val
 
     # -- task alive ------------------------------------------------------
 
     def set_task_alive(self, name: str, alive: bool) -> None:
-        self.task_alive[name] = alive
+        with self._lock:
+            self.task_alive[name] = alive
 
     # -- gap scan --------------------------------------------------------
 
@@ -232,8 +235,9 @@ class PollerMetrics:
     # -- backfill progress -----------------------------------------------
 
     def set_backfill_phase(self, phase: str, current: str = "") -> None:
-        self.backfill_phase = phase
-        self.backfill_current = current
+        with self._lock:
+            self.backfill_phase = phase
+            self.backfill_current = current
 
     # -- computed / snapshot helpers --------------------------------------
 
@@ -314,13 +318,14 @@ class PollerMetrics:
         errors_1h: int,
         avg_latency_ms: float,
     ) -> None:
-        self.api_healthy = healthy
-        self.api_latency_ms = latency_ms
-        self.api_requests_1h = requests_1h
-        self.api_requests_12h = requests_12h
-        self.api_requests_24h = requests_24h
-        self.api_errors_1h = errors_1h
-        self.api_avg_latency_ms = avg_latency_ms
+        with self._lock:
+            self.api_healthy = healthy
+            self.api_latency_ms = latency_ms
+            self.api_requests_1h = requests_1h
+            self.api_requests_12h = requests_12h
+            self.api_requests_24h = requests_24h
+            self.api_errors_1h = errors_1h
+            self.api_avg_latency_ms = avg_latency_ms
 
     def update_infra_health(
         self,
@@ -329,7 +334,8 @@ class PollerMetrics:
         db_latency_ms: float = 0.0,
         redis_latency_ms: float = 0.0,
     ) -> None:
-        self.db_healthy = db_ok
-        self.redis_healthy = redis_ok
-        self.db_latency_ms = db_latency_ms
-        self.redis_latency_ms = redis_latency_ms
+        with self._lock:
+            self.db_healthy = db_ok
+            self.redis_healthy = redis_ok
+            self.db_latency_ms = db_latency_ms
+            self.redis_latency_ms = redis_latency_ms
