@@ -156,6 +156,25 @@ def _latency_text(ms: float) -> Text:
     style = S_OK if ms < 50 else (S_WARN if ms < 200 else S_ERR)
     return Text(f"{ms:.0f} ms", style=style)
 
+def _uptime_text(up: float, down: float, pct: float) -> Text:
+    """Build a coloured uptime % + duration string."""
+    fmt = PollerMetrics._fmt_duration
+    if pct >= 99.9:
+        style = S_OK
+    elif pct >= 95.0:
+        style = S_WARN
+    else:
+        style = S_ERR
+    return Text(f"{pct:.1f}%  ({fmt(up)})", style=style)
+
+
+def _downtime_text(down: float) -> Text:
+    """Build a downtime duration string."""
+    fmt = PollerMetrics._fmt_duration
+    if down < 1:
+        return Text("0s", style=S_OK)
+    style = S_ERR if down > 60 else S_WARN
+    return Text(fmt(down), style=style)
 
 # ═══════════════════════════════════════════════════════════════════════
 # Panel 1 — MT5 Connection & Tasks
@@ -173,6 +192,11 @@ def _build_mt5_panel(m: PollerMetrics) -> Panel:
 
     # Uptime
     _kv_row(tbl, ICO_CLOCK, "Uptime", Text(m.uptime_str(), style=S_SAPH))
+
+    # Uptime / Downtime
+    mt5_up, mt5_dn, mt5_pct = m.mt5_uptime()
+    _kv_row(tbl, "↑", "Uptime", _uptime_text(mt5_up, mt5_dn, mt5_pct))
+    _kv_row(tbl, "↓", "Downtime", _downtime_text(mt5_dn))
 
     rc_style = S_WARN if m.reconnect_count else S_OK
     _kv_row(tbl, ICO_SCAN, "Reconnects", Text(str(m.reconnect_count), style=rc_style))
@@ -223,6 +247,11 @@ def _build_api_panel(m: PollerMetrics) -> Panel:
     tbl.add_row(Text.assemble(f" {ICO_API} API  ", dot, lbl), Text(""))
     _kv_row(tbl, ICO_CLOCK, "Latency", _latency_text(m.api_latency_ms))
     _kv_row(tbl, ICO_CLOCK, "Avg (1h)", _latency_text(m.api_avg_latency_ms))
+
+    # Uptime / Downtime
+    api_up, api_dn, api_pct = m.api_uptime()
+    _kv_row(tbl, "↑", "Uptime", _uptime_text(api_up, api_dn, api_pct))
+    _kv_row(tbl, "↓", "Downtime", _downtime_text(api_dn))
 
     tbl.add_row(Text("   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─", style=S_DIM), Text(""))
 
@@ -361,6 +390,9 @@ def _build_infra_panel(m: PollerMetrics) -> Panel:
     lbl = Text(" OK", style=S_OK) if m.db_healthy else Text(" Down", style=S_ERR)
     tbl.add_row(Text.assemble(f" {ICO_DB} TimescaleDB  ", dot, lbl), Text(""))
     _kv_row(tbl, ICO_CLOCK, "Latency", _latency_text(m.db_latency_ms))
+    db_up, db_dn, db_pct = m.db_uptime()
+    _kv_row(tbl, "↑", "Uptime", _uptime_text(db_up, db_dn, db_pct))
+    _kv_row(tbl, "↓", "Downtime", _downtime_text(db_dn))
 
     tbl.add_row(Text("   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─", style=S_DIM), Text(""))
 
@@ -369,6 +401,9 @@ def _build_infra_panel(m: PollerMetrics) -> Panel:
     lbl = Text(" OK", style=S_OK) if m.redis_healthy else Text(" Down", style=S_ERR)
     tbl.add_row(Text.assemble(f" {ICO_REDIS} Redis  ", dot, lbl), Text(""))
     _kv_row(tbl, ICO_CLOCK, "Latency", _latency_text(m.redis_latency_ms))
+    redis_up, redis_dn, redis_pct = m.redis_uptime()
+    _kv_row(tbl, "↑", "Uptime", _uptime_text(redis_up, redis_dn, redis_pct))
+    _kv_row(tbl, "↓", "Downtime", _downtime_text(redis_dn))
 
     tbl.add_row(Text("   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─", style=S_DIM), Text(""))
 
@@ -560,9 +595,9 @@ def _build_layout(m: PollerMetrics) -> Layout:
 
     layout.split_column(
         Layout(name="header", size=3),
-        Layout(name="row1", size=12),
+        Layout(name="row1", size=14),
         Layout(name="row2", size=14),
-        Layout(name="row3", size=14),
+        Layout(name="row3", size=18),
         Layout(name="prices", minimum_size=5, ratio=2),
         Layout(name="footer", size=1),
     )

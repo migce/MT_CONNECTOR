@@ -134,6 +134,29 @@ class PollerMetrics:
         self.db_latency_ms: float = 0.0
         self.redis_latency_ms: float = 0.0
 
+        # ── Uptime / downtime accumulators (seconds) ────────────────
+        _now = time.monotonic()
+        # MT5
+        self._mt5_up_sec: float = 0.0
+        self._mt5_down_sec: float = 0.0
+        self._mt5_last_check: float = _now
+        self._mt5_last_state: bool = False
+        # Database
+        self._db_up_sec: float = 0.0
+        self._db_down_sec: float = 0.0
+        self._db_last_check: float = _now
+        self._db_last_state: bool = False
+        # Redis
+        self._redis_up_sec: float = 0.0
+        self._redis_down_sec: float = 0.0
+        self._redis_last_check: float = _now
+        self._redis_last_state: bool = False
+        # API
+        self._api_up_sec: float = 0.0
+        self._api_down_sec: float = 0.0
+        self._api_last_check: float = _now
+        self._api_last_state: bool = False
+
     # -- tick metrics ----------------------------------------------------
 
     @staticmethod
@@ -193,7 +216,15 @@ class PollerMetrics:
             self.reconnect_count += 1
 
     def set_mt5_connected(self, val: bool) -> None:
+        now = time.monotonic()
         with self._lock:
+            elapsed = now - self._mt5_last_check
+            if self._mt5_last_state:
+                self._mt5_up_sec += elapsed
+            else:
+                self._mt5_down_sec += elapsed
+            self._mt5_last_check = now
+            self._mt5_last_state = val
             self.mt5_connected = val
 
     # -- task alive ------------------------------------------------------
@@ -353,7 +384,17 @@ class PollerMetrics:
         errors_1h: int,
         avg_latency_ms: float,
     ) -> None:
+        now = time.monotonic()
         with self._lock:
+            # accumulate uptime/downtime
+            elapsed = now - self._api_last_check
+            if self._api_last_state:
+                self._api_up_sec += elapsed
+            else:
+                self._api_down_sec += elapsed
+            self._api_last_check = now
+            self._api_last_state = healthy
+            # update fields
             self.api_healthy = healthy
             self.api_latency_ms = latency_ms
             self.api_requests_1h = requests_1h
@@ -369,8 +410,88 @@ class PollerMetrics:
         db_latency_ms: float = 0.0,
         redis_latency_ms: float = 0.0,
     ) -> None:
+        now = time.monotonic()
         with self._lock:
+            # DB uptime/downtime
+            elapsed_db = now - self._db_last_check
+            if self._db_last_state:
+                self._db_up_sec += elapsed_db
+            else:
+                self._db_down_sec += elapsed_db
+            self._db_last_check = now
+            self._db_last_state = db_ok
+            # Redis uptime/downtime
+            elapsed_redis = now - self._redis_last_check
+            if self._redis_last_state:
+                self._redis_up_sec += elapsed_redis
+            else:
+                self._redis_down_sec += elapsed_redis
+            self._redis_last_check = now
+            self._redis_last_state = redis_ok
+            # update fields
             self.db_healthy = db_ok
             self.redis_healthy = redis_ok
             self.db_latency_ms = db_latency_ms
             self.redis_latency_ms = redis_latency_ms
+
+    # -- uptime / downtime helpers --------------------------------------
+
+    @staticmethod
+    def _fmt_duration(secs: float) -> str:
+        """Format seconds into a human-friendly string (e.g. '2h 15m 03s')."""
+        s = int(secs)
+        if s < 60:
+            return f"{s}s"
+        h, rem = divmod(s, 3600)
+        m, s2 = divmod(rem, 60)
+        if h:
+            return f"{h}h {m:02d}m {s2:02d}s"
+        return f"{m}m {s2:02d}s"
+
+    def _service_uptime(
+        self,
+        up_sec: float,
+        down_sec: float,
+        last_check: float,
+        last_state: bool,
+    ) -> tuple[float, float, float]:
+        """Return (up_sec, down_sec, uptime_pct) including current interval."""
+        now = time.monotonic()
+        current_elapsed = now - last_check
+        up = up_sec + (current_elapsed if last_state else 0.0)
+        dn = down_sec + (current_elapsed if not last_state else 0.0)
+        total = up + dn
+        pct = (up / total * 100) if total > 0 else 0.0
+        return up, dn, pct
+
+    def mt5_uptime(self) -> tuple[float, float, float]:
+        """Return (up_sec, down_sec, uptime_pct) for MT5 connection."""
+        with self._lock:
+            return self._service_uptime(
+                self._mt5_up_sec, self._mt5_down_sec,
+                self._mt5_last_check, self._mt5_last_state,
+            )
+
+    def db_uptime(self) -> tuple[float, float, float]:
+        """Return (up_sec, down_sec, uptime_pct) for TimescaleDB."""
+        with self._lock:
+            return self._service_uptime(
+                self._db_up_sec, self._db_down_sec,
+                self._db_last_check, self._db_last_state,
+            )
+
+    def redis_uptime(self) -> tuple[float, float, float]:
+        """Return (up_sec, down_sec, uptime_pct) for Redis."""
+        with self._lock:
+            return self._service_uptime(
+                self._redis_up_sec, self._redis_down_sec,
+                self._redis_last_check, self._redis_last_state,
+            )
+
+    def api_uptime(self) -> tuple[float, float, float]:
+        """Return (up_sec, down_sec, uptime_pct) for the API server."""
+        with self._lock:
+            return self._service_uptime(
+                self._api_up_sec, self._api_down_sec,
+                self._api_last_check, self._api_last_state,
+            )
