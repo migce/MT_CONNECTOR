@@ -155,7 +155,21 @@ async def _heartbeat(ws: WebSocket, interval: int) -> None:
 
 @router.websocket("/ws/ticks/{symbol}")
 async def ws_ticks(ws: WebSocket, symbol: str) -> None:
-    """Stream raw ticks for *symbol* in real time."""
+    """
+    Stream raw ticks for *symbol* in real time.
+
+    Every bid/ask change is pushed as a JSON message (~50 ms resolution).
+    The server sends `{"event": "ping"}` heartbeats every 30 s.
+    Clients may send `{"action": "ping"}` and receive `{"event": "pong"}`.
+
+    **Connect:** `ws://<server-ip>:9000/ws/ticks/EURUSD`
+
+    **Message format:**
+    ```json
+    {"time_msc": "…", "symbol": "EURUSD", "bid": 1.0856,
+     "ask": 1.0858, "last": 0.0, "volume": 0, "flags": 6}
+    ```
+    """
     # Validate origin before accepting
     if not _check_origin(ws):
         await ws.close(code=4003, reason="Origin not allowed")
@@ -202,7 +216,23 @@ async def ws_ticks(ws: WebSocket, symbol: str) -> None:
 
 @router.websocket("/ws/candles/{symbol}/{timeframe}")
 async def ws_candles(ws: WebSocket, symbol: str, timeframe: str) -> None:
-    """Stream candle updates for *symbol* / *timeframe* in real time."""
+    """
+    Stream candle OHLCV updates for *symbol* / *timeframe* in real time.
+
+    The current (incomplete) bar updates with every tick; a new bar
+    appears when the candle closes. Heartbeats every 30 s.
+
+    **Connect:** `ws://<server-ip>:9000/ws/candles/EURUSD/M1`
+
+    Supported timeframes: M1, M5, M15, H1, H4, D1, and custom (M2, H6…).
+
+    **Message format:**
+    ```json
+    {"time": "…", "symbol": "EURUSD", "timeframe": "M1",
+     "open": 1.0856, "high": 1.0872, "low": 1.0843, "close": 1.0861,
+     "tick_volume": 85, "real_volume": 0, "spread": 1}
+    ```
+    """
     # Validate origin before accepting
     if not _check_origin(ws):
         await ws.close(code=4003, reason="Origin not allowed")

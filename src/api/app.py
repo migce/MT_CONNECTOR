@@ -80,19 +80,257 @@ async def _lifespan(app: FastAPI):
     logger.info("api_stopped")
 
 
+# ---------------------------------------------------------------------------
+# OpenAPI rich description (Markdown) — rendered in Swagger UI and ReDoc
+# ---------------------------------------------------------------------------
+
+_OPENAPI_DESCRIPTION = """\
+## Overview
+
+Production-grade **REST + WebSocket** API for MetaTrader 5 market data.
+
+* **Historical data** — candles (OHLCV) and raw ticks stored in TimescaleDB
+* **Real-time streaming** — live ticks and candle updates via WebSocket
+* **Custom timeframes** — build M2, M3, H6, H12, T100… on-the-fly
+* **Auto-backfill** — missing data is fetched from MT5 automatically
+
+---
+
+## Network Access
+
+The API listens on **`0.0.0.0:9000`** and is reachable from any machine on
+the local network. Replace `localhost` with the server IP when connecting
+from another computer.
+
+| Resource | URL |
+|---|---|
+| REST API | `http://<server-ip>:9000/api/v1/…` |
+| WebSocket ticks | `ws://<server-ip>:9000/ws/ticks/{symbol}` |
+| WebSocket candles | `ws://<server-ip>:9000/ws/candles/{symbol}/{timeframe}` |
+| This page | `http://<server-ip>:9000/docs` |
+
+> **Firewall**: make sure TCP port **9000** is open for inbound connections
+> in Windows Firewall.
+
+---
+
+## WebSocket — Real-Time Quotes
+
+WebSocket endpoints are **not interactive** in Swagger UI. Use a WebSocket
+client (browser JS, Python `websockets`, `websocat`, etc.).
+
+### `/ws/ticks/{symbol}` — live tick stream
+
+Every price change (bid/ask) is pushed in real time (~50 ms resolution).
+
+**JavaScript:**
+```js
+const ws = new WebSocket("ws://<server-ip>:9000/ws/ticks/EURUSD");
+ws.onmessage = (e) => {
+  const tick = JSON.parse(e.data);
+  if (tick.event === "ping") return; // heartbeat
+  console.log(`EURUSD bid=${tick.bid} ask=${tick.ask}`);
+};
+```
+
+**Python:**
+```python
+import asyncio, json, websockets
+
+async def stream():
+    uri = "ws://<server-ip>:9000/ws/ticks/EURUSD"
+    async for ws in websockets.connect(uri):
+        try:
+            async for msg in ws:
+                tick = json.loads(msg)
+                if tick.get("event") == "ping":
+                    continue
+                print(f"bid={tick['bid']}  ask={tick['ask']}")
+        except websockets.ConnectionClosed:
+            continue  # auto-reconnect
+
+asyncio.run(stream())
+```
+
+**Tick message:**
+```json
+{"time_msc": "…", "symbol": "EURUSD", "bid": 1.0856, "ask": 1.0858,
+ "last": 0.0, "volume": 0, "flags": 6}
+```
+
+### `/ws/candles/{symbol}/{timeframe}` — live candle updates
+
+The current (incomplete) bar updates with each new tick; a new bar appears
+when the candle closes.
+
+**JavaScript:**
+```js
+const ws = new WebSocket("ws://<server-ip>:9000/ws/candles/EURUSD/M1");
+ws.onmessage = (e) => {
+  const c = JSON.parse(e.data);
+  if (c.event === "ping") return;
+  console.log(`${c.timeframe} O=${c.open} H=${c.high} L=${c.low} C=${c.close}`);
+};
+```
+
+**Candle message:**
+```json
+{"time": "…", "symbol": "EURUSD", "timeframe": "M1",
+ "open": 1.0856, "high": 1.0872, "low": 1.0843, "close": 1.0861,
+ "tick_volume": 85, "real_volume": 0, "spread": 1}
+```
+
+Supported timeframes: `M1 M5 M15 H1 H4 D1` and custom (`M2`, `H6`, …).
+
+### Multiple symbols
+
+Open **one WebSocket per symbol/timeframe** combination:
+```js
+["EURUSD", "GBPUSD", "XAUUSD"].forEach(sym => {
+  const ws = new WebSocket(`ws://<server-ip>:9000/ws/ticks/${sym}`);
+  ws.onmessage = (e) => {
+    const t = JSON.parse(e.data);
+    if (t.event !== "ping")
+      console.log(`${t.symbol} bid=${t.bid} ask=${t.ask}`);
+  };
+});
+```
+
+### Heartbeat
+
+The server sends `{"event": "ping"}` every **30 s**. Clients may also send
+`{"action": "ping"}` and will receive `{"event": "pong"}`.
+
+---
+
+## Quick Start — `curl` Examples
+
+```bash
+# Health check
+curl http://<server-ip>:9000/api/v1/health
+
+# List symbols
+curl http://<server-ip>:9000/api/v1/symbols
+
+# H1 candles
+curl "http://<server-ip>:9000/api/v1/candles/EURUSD?timeframe=H1&limit=100"
+
+# Custom 2-minute candles
+curl "http://<server-ip>:9000/api/v1/candles/custom/EURUSD?timeframe=M2&limit=50"
+
+# 500-tick bars
+curl "http://<server-ip>:9000/api/v1/candles/custom/EURUSD?timeframe=T500&price=mid&limit=200"
+
+# Raw ticks
+curl "http://<server-ip>:9000/api/v1/ticks/EURUSD?limit=1000"
+
+# Data coverage
+curl http://<server-ip>:9000/api/v1/coverage
+
+# API stats
+curl http://<server-ip>:9000/api/v1/stats
+```
+
+---
+
+## Python Client SDK
+
+Built-in async and sync clients — see
+[`src/api/client.py`](https://github.com/migce/MT_CONNECTOR/blob/main/src/api/client.py).
+
+```python
+from src.api.client import MT5Client, MT5ClientSync
+
+# Async
+client = MT5Client("http://<server-ip>:9000")
+candles = await client.get_candles("EURUSD", "H1", limit=100)
+async for tick in client.stream_ticks("EURUSD"):
+    print(tick["bid"], tick["ask"])
+await client.close()
+
+# Sync
+client = MT5ClientSync("http://<server-ip>:9000")
+candles = client.get_candles("EURUSD", "H1", limit=100)
+client.close()
+```
+"""
+
+_OPENAPI_TAGS: list[dict] = [
+    {
+        "name": "candles",
+        "description": (
+            "Historical OHLCV candle data for standard timeframes "
+            "(M1, M5, M15, H1, H4, D1). Missing data is auto-backfilled "
+            "from MetaTrader 5."
+        ),
+    },
+    {
+        "name": "custom-candles",
+        "description": (
+            "Non-standard timeframe candles built on-the-fly: "
+            "**Time-based** (M2, M3, H2, H6, H12, D2, W1…) from stored candles, "
+            "**Tick bars** (T100, T500, T1000…) from raw ticks. "
+            "Standard TFs are auto-redirected to pre-computed data."
+        ),
+    },
+    {
+        "name": "ticks",
+        "description": (
+            "Raw historical tick data (bid, ask, last, volume, flags). "
+            "Missing data is auto-backfilled from MT5."
+        ),
+    },
+    {
+        "name": "symbols",
+        "description": "List of symbols currently tracked by the connector.",
+    },
+    {
+        "name": "health",
+        "description": (
+            "Liveness & readiness: MT5 connection status (relayed from "
+            "the Windows poller via Redis), TimescaleDB and Redis connectivity, "
+            "uptime, and active symbol count."
+        ),
+    },
+    {
+        "name": "coverage",
+        "description": (
+            "Data availability statistics per symbol × timeframe and ticks: "
+            "first/last bar, row counts, sync timestamps. Use this to "
+            "understand what historical data is loaded."
+        ),
+    },
+    {
+        "name": "stats",
+        "description": (
+            "API request metrics: total requests, errors, windowed counters "
+            "(1 h / 12 h / 24 h) and average response latency."
+        ),
+    },
+    {
+        "name": "websocket",
+        "description": (
+            "**Real-time streaming** via WebSocket.\n\n"
+            "- `/ws/ticks/{symbol}` — every bid/ask change\n"
+            "- `/ws/candles/{symbol}/{timeframe}` — live OHLCV updates\n\n"
+            "See the **WebSocket — Real-Time Quotes** section at the top "
+            "of this page for connection examples and message formats."
+        ),
+    },
+]
+
+
 def create_app() -> FastAPI:
     """Build and return the FastAPI ASGI application."""
 
     app = FastAPI(
         title="MT5 Connector API",
-        description=(
-            "Production-grade REST + WebSocket API for MetaTrader 5 "
-            "historical and real-time market data."
-        ),
+        description=_OPENAPI_DESCRIPTION,
         version="1.0.0",
         docs_url="/docs",
         redoc_url="/redoc",
         openapi_url="/openapi.json",
+        openapi_tags=_OPENAPI_TAGS,
         lifespan=_lifespan,
     )
 

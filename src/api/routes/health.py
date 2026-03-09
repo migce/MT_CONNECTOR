@@ -32,6 +32,15 @@ _start_time: float = time.time()
     "/health",
     response_model=HealthResponse,
     summary="Service health check",
+    description=(
+        "Reports connectivity of all subsystems:\n\n"
+        "- **mt5_connected** — `true` if the Windows poller is running and "
+        "connected to the MT5 terminal (status relayed via Redis with 30 s TTL)\n"
+        "- **db_connected** — TimescaleDB reachable\n"
+        "- **redis_connected** — Redis reachable\n"
+        "- **status** — `ok` when DB is up, `degraded` otherwise\n\n"
+        "Use this endpoint for liveness probes and monitoring dashboards."
+    ),
 )
 async def health_check() -> HealthResponse:
     settings = get_settings()
