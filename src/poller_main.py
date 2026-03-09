@@ -170,6 +170,24 @@ async def _health_checker_loop(api_port: int) -> None:
                     redis_latency_ms=round(redis_lat, 1),
                 )
 
+                # ── Publish poller status to Redis for API /health ─────
+                try:
+                    pool = get_redis_pool()
+                    import orjson as _orjson
+                    _status = {
+                        "mt5_connected": metrics.mt5_connected,
+                        "uptime": metrics.uptime_str(),
+                        "ticks_total": metrics.ticks_total,
+                        "candles_total": metrics.candles_total,
+                    }
+                    await pool.set(
+                        "poller:status",
+                        _orjson.dumps(_status),
+                        ex=30,  # expires in 30s — stale = poller down
+                    )
+                except Exception:
+                    pass
+
                 # ── Prune old minute-buckets every cycle ────────────────
                 metrics.prune_minute_buckets()
 
