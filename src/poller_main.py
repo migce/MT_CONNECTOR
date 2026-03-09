@@ -407,6 +407,18 @@ async def main(dashboard: bool = False) -> None:
         logger.error("redis_connect_failed", exc_info=True)
         sys.exit(1)
 
+    # --- Restore minute-bucket counters from Redis ---
+    try:
+        import orjson as _orjson
+        pool = get_redis_pool()
+        raw = await pool.get("poller:minute_buckets")
+        if raw:
+            bucket_data = _orjson.loads(raw)
+            restored = PollerMetrics().import_minute_buckets(bucket_data)
+            logger.info("minute_buckets_restored", entries=restored)
+    except Exception:
+        logger.warning("minute_buckets_restore_failed", exc_info=True)
+
     # --- MT5 ---
     connection = MT5Connection(settings)
     await connection.connect()
@@ -540,6 +552,20 @@ async def main(dashboard: bool = False) -> None:
         logger.info("daily_stats_final_flush_ok")
     except Exception:
         logger.warning("daily_stats_final_flush_failed", exc_info=True)
+
+    # --- Save minute-bucket counters to Redis for next startup ---
+    try:
+        import orjson as _orjson
+        pool = get_redis_pool()
+        bucket_data = PollerMetrics().export_minute_buckets()
+        await pool.set(
+            "poller:minute_buckets",
+            _orjson.dumps(bucket_data),
+            ex=8 * 86400,  # 8 days TTL (buckets cover max 7 days)
+        )
+        logger.info("minute_buckets_saved_to_redis")
+    except Exception:
+        logger.warning("minute_buckets_save_failed", exc_info=True)
 
     await collector.stop()
     await connection.shutdown()

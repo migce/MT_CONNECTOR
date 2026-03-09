@@ -306,6 +306,36 @@ class PollerMetrics:
                 for m in stale:
                     del bucket[m]
 
+    # -- minute-bucket persistence (save/restore via Redis) --------------
+
+    def export_minute_buckets(self) -> dict[str, dict[str, int]]:
+        """Return serialisable snapshot of minute-bucket counters."""
+        with self._lock:
+            return {
+                "ticks": {str(k): v for k, v in self._tick_minute_buckets.items()},
+                "candles": {str(k): v for k, v in self._candle_minute_buckets.items()},
+            }
+
+    def import_minute_buckets(self, data: dict[str, dict[str, int]]) -> int:
+        """Restore minute-bucket counters from a previously exported snapshot.
+
+        Returns total number of bucket entries restored.
+        """
+        cutoff = self._current_minute() - (7 * 24 * 60 + 60)
+        count = 0
+        with self._lock:
+            for key_str, val in (data.get("ticks") or {}).items():
+                m = int(key_str)
+                if m >= cutoff:
+                    self._tick_minute_buckets[m] += val
+                    count += 1
+            for key_str, val in (data.get("candles") or {}).items():
+                m = int(key_str)
+                if m >= cutoff:
+                    self._candle_minute_buckets[m] += val
+                    count += 1
+        return count
+
     # -- health-checker updates ------------------------------------------
 
     def update_api_health(
