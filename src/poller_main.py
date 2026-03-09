@@ -14,7 +14,8 @@ Usage::
     python -m src.poller_main
     python -m src.poller_main --dashboard
 
-The process exits gracefully on SIGINT (Ctrl+C) / SIGTERM.
+The process exits gracefully on Ctrl+X, SIGINT (Ctrl+C), or SIGTERM,
+flushing pending statistics to the database before shutdown.
 """
 
 from __future__ import annotations
@@ -207,13 +208,18 @@ class _PollerStatsFlusher:
     """Tracks delta between flushes and UPSERT-adds to daily_stats."""
 
     def __init__(self) -> None:
-        self._last_ticks = 0
-        self._last_flushed = 0
-        self._last_candles = 0
-        self._last_redis = 0
-        self._last_errors = 0
-        self._last_reconnects = 0
-        self._last_gaps = 0
+        # Snapshot current metric values so the first flush only captures
+        # *new* activity since the flusher was created (avoids re-adding
+        # the baseline that was already restored from DB on startup).
+        metrics = PollerMetrics()
+        with metrics._lock:
+            self._last_ticks = metrics.ticks_total
+            self._last_flushed = metrics.ticks_flushed_total
+            self._last_candles = metrics.candles_total
+            self._last_redis = metrics.redis_pub_count
+            self._last_errors = sum(metrics.errors.values())
+            self._last_reconnects = metrics.reconnect_count
+            self._last_gaps = metrics.gaps_found
         self._last_uptime_mono = time.monotonic()
 
     async def flush(self) -> None:
@@ -286,6 +292,31 @@ async def _stats_flusher_loop(flusher: _PollerStatsFlusher) -> None:
         except Exception:
             logger.exception("stats_flusher_error")
             await asyncio.sleep(60.0)
+
+
+# ---------------------------------------------------------------
+# Keyboard listener — Ctrl+X graceful shutdown (Windows)
+# ---------------------------------------------------------------
+
+async def _keyboard_listener(stop_event: asyncio.Event) -> None:
+    """Poll for Ctrl+X (``\\x18``) keypress to trigger graceful shutdown."""
+    while not stop_event.is_set():
+        try:
+            if msvcrt.kbhit():
+                key = msvcrt.getch()
+                if key == b"\x18":          # Ctrl+X
+                    logger.info("ctrl_x_shutdown_requested")
+                    stop_event.set()
+                    return
+                elif key == b"\x03":        # Ctrl+C (backup)
+                    logger.info("ctrl_c_shutdown_requested")
+                    stop_event.set()
+                    return
+            await asyncio.sleep(0.15)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(1.0)
 
 
 # Path for single-instance lock file
@@ -472,11 +503,18 @@ async def main(dashboard: bool = False) -> None:
             # Windows doesn't support add_signal_handler for all signals
             signal.signal(sig, lambda s, f: _signal_handler())
 
+    # --- Keyboard listener (Ctrl+X) ---
+    kb_task = asyncio.create_task(
+        _keyboard_listener(stop_event),
+        name="keyboard_listener",
+    )
+
     await stop_event.wait()
 
     # --- Cleanup ---
     logger.info("poller_shutting_down")
 
+    kb_task.cancel()
     if dashboard_task:
         dashboard_task.cancel()
     monitor_task.cancel()
@@ -486,7 +524,7 @@ async def main(dashboard: bool = False) -> None:
     gap_scan_task.cancel()
     backfill_listener_task.cancel()
     cancel_tasks = [
-        monitor_task, health_checker_task, stats_flusher_task,
+        kb_task, monitor_task, health_checker_task, stats_flusher_task,
         heartbeat_task, gap_scan_task, backfill_listener_task,
     ]
     if dashboard_task:

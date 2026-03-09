@@ -542,7 +542,7 @@ def _build_header(m: PollerMetrics) -> Panel:
 def _build_footer() -> Text:
     return Text.assemble(
         Text(f"  {ICO_TASK} ", style=Style(color=_SURFACE1)),
-        Text("Ctrl+C", style=Style(color=_OVERLAY, bold=True)),
+        Text("Ctrl+X", style=Style(color=_OVERLAY, bold=True)),
         Text(" to quit", style=Style(color=_OVERLAY)),
         Text("   │   ", style=Style(color=_SURFACE1)),
         Text("Refresh 1s", style=Style(color=_OVERLAY)),
