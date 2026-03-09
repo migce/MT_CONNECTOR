@@ -46,6 +46,10 @@ class ApiMetrics:
         self.total_errors: int = 0  # 5xx
         self._start_time: float = time.monotonic()
 
+        # Total latency accumulators (for daily persistence)
+        self.total_latency_sum_ms: float = 0.0
+        self.total_latency_count: int = 0
+
         # Minute-bucket counters (key = int(time.time()) // 60)
         self._req_buckets: Counter[int] = Counter()
         self._err_buckets: Counter[int] = Counter()
@@ -65,6 +69,8 @@ class ApiMetrics:
             self._req_buckets[minute] += 1
             self._latency_sum_buckets[minute] += latency_ms
             self._latency_cnt_buckets[minute] += 1
+            self.total_latency_sum_ms += latency_ms
+            self.total_latency_count += 1
             if status >= 500:
                 self.total_errors += 1
                 self._err_buckets[minute] += 1

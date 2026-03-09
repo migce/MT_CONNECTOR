@@ -199,6 +199,95 @@ async def _health_checker_loop(api_port: int) -> None:
                 await asyncio.sleep(10.0)
 
 
+# ---------------------------------------------------------------
+# Daily stats persistence — flush poller metrics to DB
+# ---------------------------------------------------------------
+
+class _PollerStatsFlusher:
+    """Tracks delta between flushes and UPSERT-adds to daily_stats."""
+
+    def __init__(self) -> None:
+        self._last_ticks = 0
+        self._last_flushed = 0
+        self._last_candles = 0
+        self._last_redis = 0
+        self._last_errors = 0
+        self._last_reconnects = 0
+        self._last_gaps = 0
+        self._last_uptime_mono = time.monotonic()
+
+    async def flush(self) -> None:
+        """Compute deltas and write to DB."""
+        from src.db import repository as repo
+
+        metrics = PollerMetrics()
+        now_mono = time.monotonic()
+
+        with metrics._lock:
+            cur_ticks = metrics.ticks_total
+            cur_flushed = metrics.ticks_flushed_total
+            cur_candles = metrics.candles_total
+            cur_redis = metrics.redis_pub_count
+            cur_errors = sum(metrics.errors.values())
+            cur_reconn = metrics.reconnect_count
+            cur_gaps = metrics.gaps_found
+
+        d_ticks = cur_ticks - self._last_ticks
+        d_flushed = cur_flushed - self._last_flushed
+        d_candles = cur_candles - self._last_candles
+        d_redis = cur_redis - self._last_redis
+        d_errors = cur_errors - self._last_errors
+        d_reconn = cur_reconn - self._last_reconnects
+        d_gaps = cur_gaps - self._last_gaps
+        d_uptime = now_mono - self._last_uptime_mono
+
+        # Update last-seen values
+        self._last_ticks = cur_ticks
+        self._last_flushed = cur_flushed
+        self._last_candles = cur_candles
+        self._last_redis = cur_redis
+        self._last_errors = cur_errors
+        self._last_reconnects = cur_reconn
+        self._last_gaps = cur_gaps
+        self._last_uptime_mono = now_mono
+
+        # Skip if nothing changed
+        if all(v == 0 for v in (d_ticks, d_flushed, d_candles, d_redis,
+                                d_errors, d_reconn, d_gaps)) and d_uptime < 1:
+            return
+
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc)
+
+        try:
+            await repo.upsert_daily_poller_stats(
+                today,
+                ticks_received=d_ticks,
+                ticks_flushed=d_flushed,
+                candles_upserted=d_candles,
+                redis_published=d_redis,
+                poller_errors=d_errors,
+                reconnects=d_reconn,
+                gaps_found=d_gaps,
+                poller_uptime_sec=round(d_uptime, 1),
+            )
+        except Exception:
+            logger.warning("daily_stats_flush_failed", exc_info=True)
+
+
+async def _stats_flusher_loop(flusher: _PollerStatsFlusher) -> None:
+    """Flush poller stats to daily_stats every 5 minutes."""
+    while True:
+        try:
+            await asyncio.sleep(300.0)  # 5 min
+            await flusher.flush()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception("stats_flusher_error")
+            await asyncio.sleep(60.0)
+
+
 # Path for single-instance lock file
 _LOCK_FILE = ".poller.lock"
 
@@ -259,6 +348,25 @@ async def main(dashboard: bool = False) -> None:
         await init_timescaledb()
     except Exception:
         logger.warning("timescaledb_init_skipped_will_retry", exc_info=True)
+
+    # --- Restore today's baseline counters from DB ---
+    try:
+        from src.db import repository as repo
+        baseline = await repo.load_today_poller_stats()
+        if baseline:
+            metrics = PollerMetrics()
+            with metrics._lock:
+                metrics.ticks_total = baseline["ticks_received"]
+                metrics.ticks_flushed_total = baseline["ticks_flushed"]
+                metrics.candles_total = baseline["candles_upserted"]
+                metrics.redis_pub_count = baseline["redis_published"]
+            logger.info(
+                "daily_baseline_restored",
+                ticks=baseline["ticks_received"],
+                candles=baseline["candles_upserted"],
+            )
+    except Exception:
+        logger.warning("daily_baseline_load_failed", exc_info=True)
 
     # --- Redis ---
     publisher = RedisPublisher(settings)
@@ -332,6 +440,14 @@ async def main(dashboard: bool = False) -> None:
     )
     named_tasks["health_checker"] = health_checker_task
 
+    # --- Daily stats flusher (persist metrics to DB every 5 min) ---
+    stats_flusher = _PollerStatsFlusher()
+    stats_flusher_task = asyncio.create_task(
+        _stats_flusher_loop(stats_flusher),
+        name="stats_flusher",
+    )
+    named_tasks["stats_flusher"] = stats_flusher_task
+
     # --- Dashboard (optional) ---
     dashboard_task: asyncio.Task | None = None
     if dashboard:
@@ -365,16 +481,27 @@ async def main(dashboard: bool = False) -> None:
         dashboard_task.cancel()
     monitor_task.cancel()
     health_checker_task.cancel()
+    stats_flusher_task.cancel()
     heartbeat_task.cancel()
     gap_scan_task.cancel()
     backfill_listener_task.cancel()
-    cancel_tasks = [monitor_task, health_checker_task, heartbeat_task, gap_scan_task, backfill_listener_task]
+    cancel_tasks = [
+        monitor_task, health_checker_task, stats_flusher_task,
+        heartbeat_task, gap_scan_task, backfill_listener_task,
+    ]
     if dashboard_task:
         cancel_tasks.insert(0, dashboard_task)
     await asyncio.gather(
         *cancel_tasks,
         return_exceptions=True,
     )
+
+    # --- Final daily stats flush before exit ---
+    try:
+        await stats_flusher.flush()
+        logger.info("daily_stats_final_flush_ok")
+    except Exception:
+        logger.warning("daily_stats_final_flush_failed", exc_info=True)
 
     await collector.stop()
     await connection.shutdown()

@@ -93,7 +93,36 @@ CREATE TABLE IF NOT EXISTS sync_state (
 );
 
 -- ============================================================
--- 4. RETENTION POLICY — auto-drop old raw ticks (configurable)
+-- 4. DAILY_STATS — aggregated daily metrics (poller + API)
+--    One row per calendar day.  Both components UPSERT-add
+--    their deltas independently, so restarts don't lose data.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS daily_stats (
+    date               DATE             NOT NULL PRIMARY KEY,
+
+    -- Poller metrics
+    ticks_received     BIGINT           NOT NULL DEFAULT 0,
+    ticks_flushed      BIGINT           NOT NULL DEFAULT 0,
+    candles_upserted   BIGINT           NOT NULL DEFAULT 0,
+    redis_published    BIGINT           NOT NULL DEFAULT 0,
+    poller_errors      INTEGER          NOT NULL DEFAULT 0,
+    reconnects         INTEGER          NOT NULL DEFAULT 0,
+    gaps_found         INTEGER          NOT NULL DEFAULT 0,
+    poller_uptime_sec  DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+
+    -- API metrics
+    api_requests       BIGINT           NOT NULL DEFAULT 0,
+    api_errors         BIGINT           NOT NULL DEFAULT 0,
+    api_latency_sum_ms DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    api_latency_count  BIGINT           NOT NULL DEFAULT 0,
+    api_uptime_sec     DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+
+    -- Meta
+    updated_at         TIMESTAMPTZ      NOT NULL DEFAULT NOW()
+);
+
+-- ============================================================
+-- 5. RETENTION POLICY — auto-drop old raw ticks (configurable)
 --    Default: 90 days.  Candles are kept indefinitely.
 -- ============================================================
 SELECT add_retention_policy('ticks', INTERVAL '90 days', if_not_exists => TRUE);

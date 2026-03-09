@@ -492,3 +492,144 @@ async def query_all_sync_states() -> list[dict[str, Any]]:
     async with factory() as session:
         result = await session.execute(sql)
         return [dict(r._mapping) for r in result.all()]
+
+
+# ---------------------------------------------------------------
+# Daily statistics persistence
+# ---------------------------------------------------------------
+
+async def upsert_daily_poller_stats(
+    date_val: datetime,
+    *,
+    ticks_received: int = 0,
+    ticks_flushed: int = 0,
+    candles_upserted: int = 0,
+    redis_published: int = 0,
+    poller_errors: int = 0,
+    reconnects: int = 0,
+    gaps_found: int = 0,
+    poller_uptime_sec: float = 0.0,
+) -> None:
+    """UPSERT-add poller metric deltas for the given date."""
+    sql = text("""
+        INSERT INTO daily_stats (
+            date, ticks_received, ticks_flushed, candles_upserted,
+            redis_published, poller_errors, reconnects, gaps_found,
+            poller_uptime_sec, updated_at
+        ) VALUES (
+            :dt, :ticks_r, :ticks_f, :candles, :redis_p,
+            :p_err, :reconn, :gaps, :uptime, NOW()
+        )
+        ON CONFLICT (date) DO UPDATE SET
+            ticks_received    = daily_stats.ticks_received    + EXCLUDED.ticks_received,
+            ticks_flushed     = daily_stats.ticks_flushed     + EXCLUDED.ticks_flushed,
+            candles_upserted  = daily_stats.candles_upserted  + EXCLUDED.candles_upserted,
+            redis_published   = daily_stats.redis_published   + EXCLUDED.redis_published,
+            poller_errors     = daily_stats.poller_errors      + EXCLUDED.poller_errors,
+            reconnects        = daily_stats.reconnects         + EXCLUDED.reconnects,
+            gaps_found        = daily_stats.gaps_found         + EXCLUDED.gaps_found,
+            poller_uptime_sec = daily_stats.poller_uptime_sec  + EXCLUDED.poller_uptime_sec,
+            updated_at        = NOW()
+    """)
+    factory = get_session_factory()
+    async with factory() as session:
+        await session.execute(sql, {
+            "dt": date_val.date() if isinstance(date_val, datetime) else date_val,
+            "ticks_r": ticks_received,
+            "ticks_f": ticks_flushed,
+            "candles": candles_upserted,
+            "redis_p": redis_published,
+            "p_err": poller_errors,
+            "reconn": reconnects,
+            "gaps": gaps_found,
+            "uptime": poller_uptime_sec,
+        })
+        await session.commit()
+
+
+async def upsert_daily_api_stats(
+    date_val: datetime,
+    *,
+    api_requests: int = 0,
+    api_errors: int = 0,
+    api_latency_sum_ms: float = 0.0,
+    api_latency_count: int = 0,
+    api_uptime_sec: float = 0.0,
+) -> None:
+    """UPSERT-add API metric deltas for the given date."""
+    sql = text("""
+        INSERT INTO daily_stats (
+            date, api_requests, api_errors, api_latency_sum_ms,
+            api_latency_count, api_uptime_sec, updated_at
+        ) VALUES (
+            :dt, :reqs, :errs, :lat_sum, :lat_cnt, :uptime, NOW()
+        )
+        ON CONFLICT (date) DO UPDATE SET
+            api_requests       = daily_stats.api_requests       + EXCLUDED.api_requests,
+            api_errors         = daily_stats.api_errors         + EXCLUDED.api_errors,
+            api_latency_sum_ms = daily_stats.api_latency_sum_ms + EXCLUDED.api_latency_sum_ms,
+            api_latency_count  = daily_stats.api_latency_count  + EXCLUDED.api_latency_count,
+            api_uptime_sec     = daily_stats.api_uptime_sec     + EXCLUDED.api_uptime_sec,
+            updated_at         = NOW()
+    """)
+    factory = get_session_factory()
+    async with factory() as session:
+        await session.execute(sql, {
+            "dt": date_val.date() if isinstance(date_val, datetime) else date_val,
+            "reqs": api_requests,
+            "errs": api_errors,
+            "lat_sum": api_latency_sum_ms,
+            "lat_cnt": api_latency_count,
+            "uptime": api_uptime_sec,
+        })
+        await session.commit()
+
+
+async def load_today_poller_stats() -> dict[str, Any] | None:
+    """Load today's daily_stats row (for baseline restoration on startup)."""
+    sql = text("""
+        SELECT ticks_received, ticks_flushed, candles_upserted,
+               redis_published, poller_errors, reconnects, gaps_found,
+               poller_uptime_sec
+        FROM daily_stats
+        WHERE date = CURRENT_DATE
+    """)
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(sql)
+        row = result.first()
+        return dict(row._mapping) if row else None
+
+
+async def query_daily_stats(
+    *,
+    from_date: datetime | None = None,
+    to_date: datetime | None = None,
+    limit: int = 30,
+) -> list[dict[str, Any]]:
+    """Return daily_stats rows ordered by date descending."""
+    clauses = []
+    params: dict[str, Any] = {"lim": limit}
+    if from_date is not None:
+        clauses.append("date >= :from_dt")
+        params["from_dt"] = from_date.date() if isinstance(from_date, datetime) else from_date
+    if to_date is not None:
+        clauses.append("date <= :to_dt")
+        params["to_dt"] = to_date.date() if isinstance(to_date, datetime) else to_date
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    sql = text(f"""
+        SELECT date, ticks_received, ticks_flushed, candles_upserted,
+               redis_published, poller_errors, reconnects, gaps_found,
+               poller_uptime_sec,
+               api_requests, api_errors, api_latency_sum_ms,
+               api_latency_count, api_uptime_sec, updated_at
+        FROM daily_stats
+        {where}
+        ORDER BY date DESC
+        LIMIT :lim
+    """)
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(sql, params)
+        return [dict(r._mapping) for r in result.all()]

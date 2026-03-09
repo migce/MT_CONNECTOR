@@ -11,6 +11,8 @@ Creates and configures the ASGI application with:
 
 from __future__ import annotations
 
+import asyncio
+import time
 from contextlib import asynccontextmanager
 
 import structlog
@@ -40,6 +42,77 @@ def get_backfill_requester() -> BackfillRequester | None:
     return None
 
 
+# ---------------------------------------------------------------
+# API daily stats flusher (runs as background asyncio task)
+# ---------------------------------------------------------------
+
+class _ApiStatsFlusher:
+    """Tracks delta between flushes and UPSERT-adds API stats to daily_stats."""
+
+    def __init__(self) -> None:
+        self._last_requests = 0
+        self._last_errors = 0
+        self._last_latency_sum = 0.0
+        self._last_latency_cnt = 0
+        self._last_uptime_mono = time.monotonic()
+
+    async def flush(self) -> None:
+        from src.api.middleware.request_metrics import ApiMetrics
+        from src.db import repository as repo
+
+        m = ApiMetrics()
+        now_mono = time.monotonic()
+
+        with m._lock:
+            cur_req = m.total_requests
+            cur_err = m.total_errors
+            cur_lat_sum = m.total_latency_sum_ms
+            cur_lat_cnt = m.total_latency_count
+
+        d_req = cur_req - self._last_requests
+        d_err = cur_err - self._last_errors
+        d_lat_sum = cur_lat_sum - self._last_latency_sum
+        d_lat_cnt = cur_lat_cnt - self._last_latency_cnt
+        d_uptime = now_mono - self._last_uptime_mono
+
+        self._last_requests = cur_req
+        self._last_errors = cur_err
+        self._last_latency_sum = cur_lat_sum
+        self._last_latency_cnt = cur_lat_cnt
+        self._last_uptime_mono = now_mono
+
+        if d_req == 0 and d_err == 0 and d_uptime < 1:
+            return
+
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc)
+
+        try:
+            await repo.upsert_daily_api_stats(
+                today,
+                api_requests=d_req,
+                api_errors=d_err,
+                api_latency_sum_ms=round(d_lat_sum, 2),
+                api_latency_count=d_lat_cnt,
+                api_uptime_sec=round(d_uptime, 1),
+            )
+        except Exception:
+            logger.warning("daily_api_stats_flush_failed", exc_info=True)
+
+
+async def _api_stats_flusher_loop(flusher: _ApiStatsFlusher) -> None:
+    """Background task: flush API stats to daily_stats every 5 min."""
+    while True:
+        try:
+            await asyncio.sleep(300.0)  # 5 min
+            await flusher.flush()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.warning("api_stats_flusher_error", exc_info=True)
+            await asyncio.sleep(60.0)
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """Application lifecycle: startup → yield → shutdown."""
@@ -67,9 +140,30 @@ async def _lifespan(app: FastAPI):
         logger.warning("backfill_requester_connect_failed", exc_info=True)
         app.state.backfill_requester = None
 
+    # Start API daily stats flusher
+    api_flusher = _ApiStatsFlusher()
+    flusher_task = asyncio.create_task(
+        _api_stats_flusher_loop(api_flusher),
+        name="api_stats_flusher",
+    )
+
     yield
 
     # Shutdown
+
+    # Final API stats flush
+    try:
+        await api_flusher.flush()
+        logger.info("daily_api_stats_final_flush_ok")
+    except Exception:
+        logger.warning("daily_api_stats_final_flush_failed", exc_info=True)
+
+    flusher_task.cancel()
+    try:
+        await flusher_task
+    except asyncio.CancelledError:
+        pass
+
     requester = getattr(app.state, "backfill_requester", None)
     if requester is not None:
         await requester.close()
@@ -229,6 +323,9 @@ curl http://<server-ip>:9000/api/v1/coverage
 
 # API stats
 curl http://<server-ip>:9000/api/v1/stats
+
+# Daily historical stats (last 30 days)
+curl http://<server-ip>:9000/api/v1/stats/daily
 ```
 
 ---

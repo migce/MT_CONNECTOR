@@ -106,6 +106,7 @@ OpenAPI docs:           http://192.168.1.4:9000/docs
 | `/api/v1/health` | GET | Service health check (MT5 + DB + Redis status) |
 | `/api/v1/coverage` | GET | Data coverage: first/last bar per symbol × timeframe |
 | `/api/v1/stats` | GET | API request statistics (1h/12h/24h windows) |
+| `/api/v1/stats/daily` | GET | **Historical daily statistics** (persisted, survives restarts) |
 
 #### GET /api/v1/candles/{symbol}
 
@@ -288,6 +289,43 @@ curl "http://192.168.1.4:9000/api/v1/stats"
   "errors_1h": 0,
   "avg_latency_ms_1h": 12.34
 }
+```
+
+#### GET /api/v1/stats/daily
+
+Historical daily statistics persisted to TimescaleDB. Counters accumulate
+throughout the day (flushed every 5 min) and survive poller/API restarts.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `from` | date | — | Start date (ISO 8601) |
+| `to` | date | — | End date (ISO 8601) |
+| `limit` | int | 30 | Max rows (1–365) |
+
+```bash
+curl "http://192.168.1.4:9000/api/v1/stats/daily?limit=7"
+```
+
+**Response:**
+```json
+[
+  {
+    "date": "2026-03-09",
+    "ticks_received": 5234567,
+    "ticks_flushed": 5234567,
+    "candles_upserted": 12345,
+    "redis_published": 5246912,
+    "poller_errors": 0,
+    "reconnects": 0,
+    "gaps_found": 2,
+    "poller_uptime_sec": 86400.0,
+    "api_requests": 3456,
+    "api_errors": 0,
+    "api_avg_latency_ms": 8.42,
+    "api_uptime_sec": 86400.0
+  }
+]
+```
 
 ### WebSocket Endpoints — Real-Time Quotes
 
