@@ -391,10 +391,19 @@ async def main(dashboard: bool = False) -> None:
                 metrics.ticks_flushed_total = baseline["ticks_flushed"]
                 metrics.candles_total = baseline["candles_upserted"]
                 metrics.redis_pub_count = baseline["redis_published"]
+                metrics.reconnect_count = baseline["reconnects"]
+                metrics.gaps_found = baseline["gaps_found"]
+                # Restore total errors as a single "previous" category
+                prev_errors = baseline["poller_errors"]
+                if prev_errors:
+                    metrics.errors["previous_session"] = prev_errors
             logger.info(
                 "daily_baseline_restored",
                 ticks=baseline["ticks_received"],
                 candles=baseline["candles_upserted"],
+                reconnects=baseline["reconnects"],
+                errors=baseline["poller_errors"],
+                gaps=baseline["gaps_found"],
             )
     except Exception:
         logger.warning("daily_baseline_load_failed", exc_info=True)
