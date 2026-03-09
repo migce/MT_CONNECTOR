@@ -601,6 +601,61 @@ async def load_today_poller_stats() -> dict[str, Any] | None:
         return dict(row._mapping) if row else None
 
 
+# ---------------------------------------------------------------
+# Service uptime log
+# ---------------------------------------------------------------
+
+async def insert_uptime_log(
+    rows: list[dict[str, Any]],
+) -> None:
+    """Batch-insert uptime/downtime snapshots.
+
+    Each dict must contain: ts, service, up_sec, down_sec.
+    """
+    if not rows:
+        return
+    sql = text("""
+        INSERT INTO service_uptime_log (ts, service, up_sec, down_sec)
+        VALUES (:ts, :service, :up_sec, :down_sec)
+    """)
+    factory = get_session_factory()
+    async with factory() as session:
+        await session.execute(sql, rows)
+        await session.commit()
+
+
+async def query_uptime_summary(
+    interval: str = "24 hours",
+) -> dict[str, tuple[float, float, float]]:
+    """Aggregate uptime for each service over the given interval.
+
+    *interval* must be a valid PostgreSQL interval literal
+    (e.g. ``'24 hours'``, ``'30 days'``).
+
+    Returns ``{service: (up_sec, down_sec, uptime_pct)}``.
+    """
+    sql = text(f"""
+        SELECT service,
+               COALESCE(SUM(up_sec), 0)   AS up_sec,
+               COALESCE(SUM(down_sec), 0) AS down_sec
+        FROM service_uptime_log
+        WHERE ts > NOW() - INTERVAL '{interval}'
+        GROUP BY service
+    """)
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(sql)
+        out: dict[str, tuple[float, float, float]] = {}
+        for row in result.all():
+            r = row._mapping
+            up = float(r["up_sec"])
+            dn = float(r["down_sec"])
+            total = up + dn
+            pct = (up / total * 100) if total > 0 else 0.0
+            out[r["service"]] = (up, dn, pct)
+        return out
+
+
 async def query_daily_stats(
     *,
     from_date: datetime | None = None,

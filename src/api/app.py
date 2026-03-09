@@ -607,6 +607,28 @@ Response:
 }
 ```
 
+### GET /api/v1/uptime
+Service uptime summary for the last 24 hours and 30 days.
+Data sourced from `service_uptime_log` hypertable (flushed every 5 min by the poller).
+
+Response:
+```json
+{
+  "period_24h": [
+    {"service": "api",   "up_sec": 86100.0, "down_sec": 300.0, "uptime_pct": 99.65},
+    {"service": "db",    "up_sec": 86400.0, "down_sec": 0.0,   "uptime_pct": 100.0},
+    {"service": "mt5",   "up_sec": 85800.0, "down_sec": 600.0, "uptime_pct": 99.31},
+    {"service": "redis", "up_sec": 86400.0, "down_sec": 0.0,   "uptime_pct": 100.0}
+  ],
+  "period_30d": [
+    {"service": "api",   "up_sec": 2590000.0, "down_sec": 2000.0, "uptime_pct": 99.92},
+    {"service": "db",    "up_sec": 2592000.0, "down_sec": 0.0,    "uptime_pct": 100.0},
+    {"service": "mt5",   "up_sec": 2580000.0, "down_sec": 12000.0,"uptime_pct": 99.54},
+    {"service": "redis", "up_sec": 2592000.0, "down_sec": 0.0,    "uptime_pct": 100.0}
+  ]
+}
+```
+
 ### GET /api/v1/coverage
 Data availability statistics per symbol, timeframe, and ticks.
 
@@ -735,6 +757,12 @@ GET /api/v1/candles/custom/EURUSD?timeframe=T500&price=mid&limit=200
 ```
 GET /api/v1/health
 # Verify: status="ok", mt5_connected=true, db_connected=true
+```
+
+### Check 24h/30d uptime history
+```
+GET /api/v1/uptime
+# Review period_24h and period_30d arrays for all services
 ```
 
 ### Discover available data range

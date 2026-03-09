@@ -122,7 +122,40 @@ CREATE TABLE IF NOT EXISTS daily_stats (
 );
 
 -- ============================================================
--- 5. RETENTION POLICY — auto-drop old raw ticks (configurable)
+-- 5. SERVICE_UPTIME_LOG — periodic uptime / downtime snapshots
+--    One row per service per flush interval (~5 min).
+--    Hypertable for automatic chunking & retention.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS service_uptime_log (
+    ts        TIMESTAMPTZ        NOT NULL,
+    service   TEXT               NOT NULL,   -- 'mt5' | 'db' | 'redis' | 'api'
+    up_sec    DOUBLE PRECISION   NOT NULL DEFAULT 0,
+    down_sec  DOUBLE PRECISION   NOT NULL DEFAULT 0
+);
+
+SELECT create_hypertable(
+    'service_uptime_log', 'ts',
+    chunk_time_interval => INTERVAL '1 day',
+    if_not_exists       => TRUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_uptime_service_ts
+    ON service_uptime_log (service, ts DESC);
+
+-- Compress after 7 days
+ALTER TABLE service_uptime_log SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'service',
+    timescaledb.compress_orderby = 'ts DESC'
+);
+
+SELECT add_compression_policy('service_uptime_log', INTERVAL '7 days', if_not_exists => TRUE);
+
+-- Auto-drop after 90 days
+SELECT add_retention_policy('service_uptime_log', INTERVAL '90 days', if_not_exists => TRUE);
+
+-- ============================================================
+-- 6. RETENTION POLICY — auto-drop old raw ticks (configurable)
 --    Default: 90 days.  Candles are kept indefinitely.
 -- ============================================================
 SELECT add_retention_policy('ticks', INTERVAL '90 days', if_not_exists => TRUE);

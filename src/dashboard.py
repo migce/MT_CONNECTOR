@@ -176,6 +176,34 @@ def _downtime_text(down: float) -> Text:
     style = S_ERR if down > 60 else S_WARN
     return Text(fmt(down), style=style)
 
+def _pct_colored(pct: float) -> Text:
+    """Single uptime percentage with colour."""
+    if pct >= 99.9:
+        style = S_OK
+    elif pct >= 95.0:
+        style = S_WARN
+    else:
+        style = S_ERR
+    return Text(f"{pct:.1f}%", style=style)
+
+def _history_row(
+    tbl: Table, service: str, m: PollerMetrics,
+) -> None:
+    """Add a row showing 24h and 30d uptime % for *service*."""
+    data_24h = m.uptime_24h.get(service)
+    data_30d = m.uptime_30d.get(service)
+    if data_24h is None and data_30d is None:
+        _kv_row(tbl, "◷", "24h│30d", Text("— │ —", style=S_DIM))
+        return
+    pct_24 = data_24h[2] if data_24h else 0.0
+    pct_30 = data_30d[2] if data_30d else 0.0
+    txt = Text.assemble(
+        _pct_colored(pct_24),
+        Text("  │  ", style=S_DIM),
+        _pct_colored(pct_30),
+    )
+    _kv_row(tbl, "◷", "24h│30d", txt)
+
 # ═══════════════════════════════════════════════════════════════════════
 # Panel 1 — MT5 Connection & Tasks
 # ═══════════════════════════════════════════════════════════════════════
@@ -197,6 +225,7 @@ def _build_mt5_panel(m: PollerMetrics) -> Panel:
     mt5_up, mt5_dn, mt5_pct = m.mt5_uptime()
     _kv_row(tbl, "↑", "Uptime", _uptime_text(mt5_up, mt5_dn, mt5_pct))
     _kv_row(tbl, "↓", "Downtime", _downtime_text(mt5_dn))
+    _history_row(tbl, "mt5", m)
 
     rc_style = S_WARN if m.reconnect_count else S_OK
     _kv_row(tbl, ICO_SCAN, "Reconnects", Text(str(m.reconnect_count), style=rc_style))
@@ -252,6 +281,7 @@ def _build_api_panel(m: PollerMetrics) -> Panel:
     api_up, api_dn, api_pct = m.api_uptime()
     _kv_row(tbl, "↑", "Uptime", _uptime_text(api_up, api_dn, api_pct))
     _kv_row(tbl, "↓", "Downtime", _downtime_text(api_dn))
+    _history_row(tbl, "api", m)
 
     tbl.add_row(Text("   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─", style=S_DIM), Text(""))
 
@@ -393,6 +423,7 @@ def _build_infra_panel(m: PollerMetrics) -> Panel:
     db_up, db_dn, db_pct = m.db_uptime()
     _kv_row(tbl, "↑", "Uptime", _uptime_text(db_up, db_dn, db_pct))
     _kv_row(tbl, "↓", "Downtime", _downtime_text(db_dn))
+    _history_row(tbl, "db", m)
 
     tbl.add_row(Text("   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─", style=S_DIM), Text(""))
 
@@ -404,6 +435,7 @@ def _build_infra_panel(m: PollerMetrics) -> Panel:
     redis_up, redis_dn, redis_pct = m.redis_uptime()
     _kv_row(tbl, "↑", "Uptime", _uptime_text(redis_up, redis_dn, redis_pct))
     _kv_row(tbl, "↓", "Downtime", _downtime_text(redis_dn))
+    _history_row(tbl, "redis", m)
 
     tbl.add_row(Text("   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─", style=S_DIM), Text(""))
 
@@ -595,9 +627,9 @@ def _build_layout(m: PollerMetrics) -> Layout:
 
     layout.split_column(
         Layout(name="header", size=3),
-        Layout(name="row1", size=14),
+        Layout(name="row1", size=15),
         Layout(name="row2", size=14),
-        Layout(name="row3", size=18),
+        Layout(name="row3", size=21),
         Layout(name="prices", minimum_size=5, ratio=2),
         Layout(name="footer", size=1),
     )

@@ -157,6 +157,11 @@ class PollerMetrics:
         self._api_last_check: float = _now
         self._api_last_state: bool = False
 
+        # ── Cached 24h / 30d uptime from DB ─────────────────────────
+        # Each: {service: (up_sec, down_sec, uptime_pct)}
+        self.uptime_24h: dict[str, tuple[float, float, float]] = {}
+        self.uptime_30d: dict[str, tuple[float, float, float]] = {}
+
     # -- tick metrics ----------------------------------------------------
 
     @staticmethod
@@ -495,3 +500,42 @@ class PollerMetrics:
                 self._api_up_sec, self._api_down_sec,
                 self._api_last_check, self._api_last_state,
             )
+
+    def update_cached_uptime(
+        self,
+        data_24h: dict[str, tuple[float, float, float]],
+        data_30d: dict[str, tuple[float, float, float]],
+    ) -> None:
+        """Replace cached 24h/30d uptime summaries (called from DB query loop)."""
+        with self._lock:
+            self.uptime_24h = data_24h
+            self.uptime_30d = data_30d
+
+    def uptime_snapshot(self) -> dict[str, tuple[float, float]]:
+        """Return current accumulated (up_sec, down_sec) per service.
+
+        Used by the uptime flusher to compute deltas.
+        """
+        with self._lock:
+            mt5 = self._service_uptime(
+                self._mt5_up_sec, self._mt5_down_sec,
+                self._mt5_last_check, self._mt5_last_state,
+            )
+            db = self._service_uptime(
+                self._db_up_sec, self._db_down_sec,
+                self._db_last_check, self._db_last_state,
+            )
+            redis_ = self._service_uptime(
+                self._redis_up_sec, self._redis_down_sec,
+                self._redis_last_check, self._redis_last_state,
+            )
+            api = self._service_uptime(
+                self._api_up_sec, self._api_down_sec,
+                self._api_last_check, self._api_last_state,
+            )
+        return {
+            "mt5": (mt5[0], mt5[1]),
+            "db": (db[0], db[1]),
+            "redis": (redis_[0], redis_[1]),
+            "api": (api[0], api[1]),
+        }

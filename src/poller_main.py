@@ -295,6 +295,77 @@ async def _stats_flusher_loop(flusher: _PollerStatsFlusher) -> None:
 
 
 # ---------------------------------------------------------------
+# Service uptime log — flush uptime deltas to DB
+# ---------------------------------------------------------------
+
+class _UptimeFlusher:
+    """Tracks uptime/downtime deltas and inserts to service_uptime_log."""
+
+    def __init__(self) -> None:
+        self._last = PollerMetrics().uptime_snapshot()
+
+    async def flush(self) -> None:
+        from src.db import repository as repo
+        from datetime import datetime, timezone
+
+        now_ts = datetime.now(timezone.utc)
+        current = PollerMetrics().uptime_snapshot()
+        rows: list[dict] = []
+
+        for svc in ("mt5", "db", "redis", "api"):
+            cur_up, cur_dn = current[svc]
+            prev_up, prev_dn = self._last.get(svc, (0.0, 0.0))
+            d_up = max(cur_up - prev_up, 0.0)
+            d_dn = max(cur_dn - prev_dn, 0.0)
+            if d_up > 0 or d_dn > 0:
+                rows.append({
+                    "ts": now_ts,
+                    "service": svc,
+                    "up_sec": round(d_up, 2),
+                    "down_sec": round(d_dn, 2),
+                })
+
+        self._last = current
+
+        if rows:
+            try:
+                await repo.insert_uptime_log(rows)
+            except Exception:
+                logger.warning("uptime_log_flush_failed", exc_info=True)
+
+
+async def _uptime_flusher_loop(flusher: _UptimeFlusher) -> None:
+    """Flush uptime deltas to service_uptime_log every 5 minutes."""
+    while True:
+        try:
+            await asyncio.sleep(300.0)  # 5 min
+            await flusher.flush()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception("uptime_flusher_error")
+            await asyncio.sleep(60.0)
+
+
+async def _uptime_summary_loop() -> None:
+    """Refresh cached 24h / 30d uptime summaries from DB every 60 s."""
+    from src.db import repository as repo
+
+    metrics = PollerMetrics()
+    while True:
+        try:
+            await asyncio.sleep(60.0)
+            data_24h = await repo.query_uptime_summary("24 hours")
+            data_30d = await repo.query_uptime_summary("30 days")
+            metrics.update_cached_uptime(data_24h, data_30d)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.warning("uptime_summary_query_failed", exc_info=True)
+            await asyncio.sleep(30.0)
+
+
+# ---------------------------------------------------------------
 # Keyboard listener — Ctrl+X graceful shutdown (Windows)
 # ---------------------------------------------------------------
 
@@ -500,6 +571,21 @@ async def main(dashboard: bool = False) -> None:
     )
     named_tasks["stats_flusher"] = stats_flusher_task
 
+    # --- Uptime log flusher (persist uptime deltas every 5 min) ---
+    uptime_flusher = _UptimeFlusher()
+    uptime_flusher_task = asyncio.create_task(
+        _uptime_flusher_loop(uptime_flusher),
+        name="uptime_flusher",
+    )
+    named_tasks["uptime_flusher"] = uptime_flusher_task
+
+    # --- Uptime summary cache (refresh 24h/30d from DB every 60s) ---
+    uptime_summary_task = asyncio.create_task(
+        _uptime_summary_loop(),
+        name="uptime_summary",
+    )
+    named_tasks["uptime_summary"] = uptime_summary_task
+
     # --- Dashboard (optional) ---
     dashboard_task: asyncio.Task | None = None
     if dashboard:
@@ -541,11 +627,14 @@ async def main(dashboard: bool = False) -> None:
     monitor_task.cancel()
     health_checker_task.cancel()
     stats_flusher_task.cancel()
+    uptime_flusher_task.cancel()
+    uptime_summary_task.cancel()
     heartbeat_task.cancel()
     gap_scan_task.cancel()
     backfill_listener_task.cancel()
     cancel_tasks = [
         kb_task, monitor_task, health_checker_task, stats_flusher_task,
+        uptime_flusher_task, uptime_summary_task,
         heartbeat_task, gap_scan_task, backfill_listener_task,
     ]
     if dashboard_task:
@@ -561,6 +650,13 @@ async def main(dashboard: bool = False) -> None:
         logger.info("daily_stats_final_flush_ok")
     except Exception:
         logger.warning("daily_stats_final_flush_failed", exc_info=True)
+
+    # --- Final uptime log flush before exit ---
+    try:
+        await uptime_flusher.flush()
+        logger.info("uptime_log_final_flush_ok")
+    except Exception:
+        logger.warning("uptime_log_final_flush_failed", exc_info=True)
 
     # --- Save minute-bucket counters to Redis for next startup ---
     try:

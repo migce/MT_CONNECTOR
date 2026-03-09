@@ -17,7 +17,7 @@ import redis.asyncio as aioredis
 from fastapi import APIRouter
 from sqlalchemy import text
 
-from src.api.schemas import HealthResponse
+from src.api.schemas import HealthResponse, ServiceUptimeEntry, UptimeResponse
 from src.config import get_settings
 from src.db.engine import get_engine
 from src.redis_bus.pool import get_redis_pool
@@ -83,4 +83,42 @@ async def health_check() -> HealthResponse:
         redis_connected=redis_ok,
         uptime_sec=round(time.time() - _start_time, 1),
         symbols_active=len(settings.symbols),
+    )
+
+
+@router.get(
+    "/uptime",
+    response_model=UptimeResponse,
+    summary="Service uptime summary (24 h / 30 d)",
+    description=(
+        "Returns cumulative uptime / downtime for every monitored service "
+        "(MT5, TimescaleDB, Redis, API) over the last **24 hours** and "
+        "**30 days**.\n\n"
+        "Data is sourced from the `service_uptime_log` hypertable which "
+        "the poller flushes every 5 minutes."
+    ),
+)
+async def uptime_summary() -> UptimeResponse:
+    from src.db import repository as repo
+
+    def _to_entries(d: dict[str, tuple[float, float, float]]) -> list[ServiceUptimeEntry]:
+        return [
+            ServiceUptimeEntry(
+                service=svc,
+                up_sec=round(up, 2),
+                down_sec=round(dn, 2),
+                uptime_pct=round(pct, 2),
+            )
+            for svc, (up, dn, pct) in sorted(d.items())
+        ]
+
+    try:
+        data_24h = await repo.query_uptime_summary("24 hours")
+        data_30d = await repo.query_uptime_summary("30 days")
+    except Exception:
+        data_24h, data_30d = {}, {}
+
+    return UptimeResponse(
+        period_24h=_to_entries(data_24h),
+        period_30d=_to_entries(data_30d),
     )

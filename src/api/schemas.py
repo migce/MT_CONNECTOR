@@ -102,6 +102,30 @@ class HealthResponse(BaseModel):
 
 
 # ---------------------------------------------------------------
+# Service uptime
+# ---------------------------------------------------------------
+
+class ServiceUptimeEntry(BaseModel):
+    """Uptime stats for a single service over a time window."""
+    service: str = Field(description="Service name: mt5, db, redis, api")
+    up_sec: float = Field(description="Total seconds the service was UP")
+    down_sec: float = Field(description="Total seconds the service was DOWN")
+    uptime_pct: float = Field(description="Uptime percentage (0-100)")
+
+
+class UptimeResponse(BaseModel):
+    """Uptime summaries for all services."""
+    period_24h: list[ServiceUptimeEntry] = Field(
+        default_factory=list,
+        description="Last 24 hours uptime per service",
+    )
+    period_30d: list[ServiceUptimeEntry] = Field(
+        default_factory=list,
+        description="Last 30 days uptime per service",
+    )
+
+
+# ---------------------------------------------------------------
 # WebSocket messages (used for documentation / client SDK)
 # ---------------------------------------------------------------
 
