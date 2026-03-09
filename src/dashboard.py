@@ -204,6 +204,19 @@ def _history_row(
     )
     _kv_row(tbl, "◷", "24h│30d", txt)
 
+def _history_inline(service: str, m: PollerMetrics) -> Text:
+    """Return inline 24h/30d uptime text (no _kv_row wrapper)."""
+    data_24h = m.uptime_24h.get(service)
+    data_30d = m.uptime_30d.get(service)
+    if data_24h is None and data_30d is None:
+        return Text("24h —  30d —", style=S_DIM)
+    pct_24 = data_24h[2] if data_24h else 0.0
+    pct_30 = data_30d[2] if data_30d else 0.0
+    return Text.assemble(
+        Text("24h ", style=S_DIM), _pct_colored(pct_24),
+        Text("  30d ", style=S_DIM), _pct_colored(pct_30),
+    )
+
 # ═══════════════════════════════════════════════════════════════════════
 # Panel 1 — MT5 Connection & Tasks
 # ═══════════════════════════════════════════════════════════════════════
@@ -211,41 +224,53 @@ def _history_row(
 def _build_mt5_panel(m: PollerMetrics) -> Panel:
     tbl = Table.grid(padding=(0, 1), expand=True)
     tbl.add_column(ratio=3)
-    tbl.add_column(ratio=1, justify="right")
+    tbl.add_column(ratio=2, justify="right")
 
-    # MT5 connection
+    # Row 1: MT5 status | poller uptime
     dot = _health_dot(m.mt5_connected)
     lbl = Text(" Connected", style=S_OK) if m.mt5_connected else Text(" Disconnected", style=S_ERR)
-    tbl.add_row(Text.assemble(f" {ICO_CONN} MT5  ", dot, lbl), Text(""))
+    tbl.add_row(
+        Text.assemble(f" {ICO_CONN} MT5  ", dot, lbl),
+        Text(f"up {m.uptime_str()}", style=S_SAPH),
+    )
 
-    # Uptime
-    _kv_row(tbl, ICO_CLOCK, "Uptime", Text(m.uptime_str(), style=S_SAPH))
-
-    # Uptime / Downtime
+    # Row 2: uptime% + downtime | reconnects
     mt5_up, mt5_dn, mt5_pct = m.mt5_uptime()
-    _kv_row(tbl, "↑", "Uptime", _uptime_text(mt5_up, mt5_dn, mt5_pct))
-    _kv_row(tbl, "↓", "Downtime", _downtime_text(mt5_dn))
+    tbl.add_row(
+        Text.assemble(
+            Text(" ↑ ", style=S_LABEL),
+            _pct_colored(mt5_pct),
+            Text("  ↓ ", style=S_DIM),
+            _downtime_text(mt5_dn),
+        ),
+        Text.assemble(
+            Text(f"{ICO_SCAN} ", style=S_LABEL),
+            Text(str(m.reconnect_count), style=S_WARN if m.reconnect_count else S_DIM),
+        ),
+    )
+
+    # Row 3: 24h | 30d
     _history_row(tbl, "mt5", m)
 
-    rc_style = S_WARN if m.reconnect_count else S_OK
-    _kv_row(tbl, ICO_SCAN, "Reconnects", Text(str(m.reconnect_count), style=rc_style))
+    # Row 4: Tasks — dot summary
+    alive_count = sum(1 for a in m.task_alive.values() if a)
+    total_count = len(m.task_alive)
+    dots: list[Text | str] = [Text(f" {ICO_TASK} Tasks ", style=S_LABEL)]
+    for _name, alive in sorted(m.task_alive.items()):
+        dots.append(Text("●", style=S_OK if alive else S_ERR))
+    tbl.add_row(
+        Text.assemble(*dots) if m.task_alive else Text(f" {ICO_TASK} Tasks", style=S_LABEL),
+        Text(f"{alive_count}/{total_count}", style=S_OK if alive_count == total_count else S_ERR),
+    )
+    failed = [n for n, a in sorted(m.task_alive.items()) if not a]
+    if failed:
+        tbl.add_row(Text(f"   ↓ {', '.join(failed)}", style=S_ERR), Text(""))
 
-    tbl.add_row(Text("   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─", style=S_DIM), Text(""))
-
-    # Tasks
-    for task_name, alive in sorted(m.task_alive.items()):
-        dot = _health_dot(alive)
-        tbl.add_row(
-            Text.assemble(f"  {ICO_TASK} ", Text(task_name, style=S_MUTED), " ", dot),
-            Text(""),
-        )
-
-    # Backfill phase
+    # Backfill phase (only if active)
     if m.backfill_phase:
-        tbl.add_row(Text(""), Text(""))
         tbl.add_row(
             Text.assemble(
-                f"  {ICO_BOLT} ",
+                f" {ICO_BOLT} ",
                 Text(m.backfill_phase, style=S_MAUVE),
                 Text(f" {m.backfill_current}", style=S_DIM),
             ),
@@ -268,29 +293,48 @@ def _build_mt5_panel(m: PollerMetrics) -> Panel:
 def _build_api_panel(m: PollerMetrics) -> Panel:
     tbl = Table.grid(padding=(0, 1), expand=True)
     tbl.add_column(ratio=3)
-    tbl.add_column(ratio=1, justify="right")
+    tbl.add_column(ratio=2, justify="right")
 
-    # API status
+    # Row 1: API status | latency + avg
     dot = _health_dot(m.api_healthy)
     lbl = Text(" Healthy", style=S_OK) if m.api_healthy else Text(" Unreachable", style=S_ERR)
-    tbl.add_row(Text.assemble(f" {ICO_API} API  ", dot, lbl), Text(""))
-    _kv_row(tbl, ICO_CLOCK, "Latency", _latency_text(m.api_latency_ms))
-    _kv_row(tbl, ICO_CLOCK, "Avg (1h)", _latency_text(m.api_avg_latency_ms))
+    tbl.add_row(
+        Text.assemble(f" {ICO_API} API  ", dot, lbl),
+        Text.assemble(
+            _latency_text(m.api_latency_ms),
+            Text("  avg ", style=S_DIM),
+            _latency_text(m.api_avg_latency_ms),
+        ),
+    )
 
-    # Uptime / Downtime
+    # Row 2: uptime% + downtime
     api_up, api_dn, api_pct = m.api_uptime()
-    _kv_row(tbl, "↑", "Uptime", _uptime_text(api_up, api_dn, api_pct))
-    _kv_row(tbl, "↓", "Downtime", _downtime_text(api_dn))
+    tbl.add_row(
+        Text.assemble(
+            Text(" ↑ ", style=S_LABEL),
+            _pct_colored(api_pct),
+            Text("  ↓ ", style=S_DIM),
+            _downtime_text(api_dn),
+        ),
+        Text(""),
+    )
+
+    # Row 3: 24h | 30d
     _history_row(tbl, "api", m)
 
     tbl.add_row(Text("   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─", style=S_DIM), Text(""))
 
-    # Request counts
-    _kv_row(tbl, ICO_ARROW, "Req 1h", _num(m.api_requests_1h))
-    _kv_row(tbl, ICO_ARROW, "Req 12h", _num(m.api_requests_12h))
-    _kv_row(tbl, ICO_ARROW, "Req 24h", _num(m.api_requests_24h))
+    # Row 5: Requests split across columns
+    tbl.add_row(
+        Text.assemble(
+            Text(f" {ICO_ARROW} ", style=S_LABEL),
+            Text("1h ", style=S_DIM), _num(m.api_requests_1h),
+            Text("  12h ", style=S_DIM), _num(m.api_requests_12h),
+        ),
+        Text.assemble(Text("24h ", style=S_DIM), _num(m.api_requests_24h)),
+    )
 
-    # Errors
+    # Row 6: Errors
     err_style = S_ERR if m.api_errors_1h > 0 else S_OK
     _kv_row(tbl, ICO_WARN, "Err 1h", Text(str(m.api_errors_1h), style=err_style))
 
@@ -314,36 +358,43 @@ def _build_tick_panel(m: PollerMetrics) -> Panel:
     tbl.add_column(ratio=3)
     tbl.add_column(ratio=2, justify="right")
 
-    _kv_row(tbl, ICO_DB, "Total", _num(m.ticks_total))
-    _kv_row(tbl, "↓", "Flushed", _num(m.ticks_flushed_total))
-    _kv_row(tbl, ICO_GAUGE, "Buffer", Text(
-        str(m.tick_buffer_depth),
-        style=S_PEACH if m.tick_buffer_depth > 100 else S_MUTED,
-    ))
+    # Row 1: Total | Flushed
+    tbl.add_row(
+        Text.assemble(Text(f" {ICO_DB} Total  ", style=S_LABEL), _num(m.ticks_total)),
+        Text.assemble(Text("flushed ", style=S_DIM), _num(m.ticks_flushed_total)),
+    )
+
+    # Row 2: Rate bar + peak | buffer
+    rate_color = S_OK if rate > 50 else (S_SAPH if rate > 10 else S_DIM)
+    tbl.add_row(
+        Text.assemble(
+            Text(f" {ICO_BOLT} ", style=S_LABEL),
+            Text(f"{rate:.1f}", style=rate_color),
+            Text(" t/s ", style=S_DIM),
+            _mini_bar(rate, max(m.peak_ticks_sec, 100), width=6),
+            Text(f"  ↑{m.peak_ticks_sec:.0f}", style=S_MAUVE),
+        ),
+        Text.assemble(
+            Text("buf ", style=S_DIM),
+            Text(str(m.tick_buffer_depth), style=S_PEACH if m.tick_buffer_depth > 100 else S_MUTED),
+        ),
+    )
 
     tbl.add_row(Text("   ─ ─ ─ ─ ─ ─ ─ ─ ─", style=S_DIM), Text(""))
 
-    # Time windows
+    # Time windows (compact: pairwise)
     t1h = m.ticks_in_window(3600)
     t12h = m.ticks_in_window(43200)
     t24h = m.ticks_in_window(86400)
     t7d = m.ticks_in_window(604800)
-    _kv_row(tbl, ICO_CLOCK, "1 h", _num(t1h))
-    _kv_row(tbl, ICO_CLOCK, "12 h", _num(t12h))
-    _kv_row(tbl, ICO_CLOCK, "24 h", _num(t24h))
-    _kv_row(tbl, ICO_CLOCK, "7 d", _num(t7d))
-
-    tbl.add_row(Text("   ─ ─ ─ ─ ─ ─ ─ ─ ─", style=S_DIM), Text(""))
-
-    # Tick rate with mini-bar
-    rate_color = S_OK if rate > 50 else (S_SAPH if rate > 10 else S_DIM)
-    rate_text = Text.assemble(
-        Text(f"{rate:.1f}", style=rate_color),
-        Text(" t/s ", style=S_DIM),
-        _mini_bar(rate, max(m.peak_ticks_sec, 100), width=6),
+    tbl.add_row(
+        Text.assemble(Text(f" {ICO_CLOCK} ", style=S_LABEL), Text("1h ", style=S_DIM), _num(t1h)),
+        Text.assemble(Text("12h ", style=S_DIM), _num(t12h)),
     )
-    _kv_row(tbl, ICO_BOLT, "Rate", rate_text)
-    _kv_row(tbl, "↑", "Peak", Text(f"{m.peak_ticks_sec:.1f} t/s", style=S_MAUVE))
+    tbl.add_row(
+        Text.assemble(Text(f" {ICO_CLOCK} ", style=S_LABEL), Text("24h ", style=S_DIM), _num(t24h)),
+        Text.assemble(Text("7d ", style=S_DIM), _num(t7d)),
+    )
 
     return Panel(
         tbl,
@@ -363,39 +414,57 @@ def _build_candle_panel(m: PollerMetrics) -> Panel:
     tbl.add_column(ratio=3)
     tbl.add_column(ratio=2, justify="right")
 
-    _kv_row(tbl, ICO_DB, "Total", _num(m.candles_total))
-    _kv_row(tbl, ICO_REDIS, "Pub", _num(m.redis_pub_count))
-    _kv_row(tbl, ICO_PKG, "Flushes", _num(m.flush_count))
+    # Row 1: Total + Pub | Flushes
+    tbl.add_row(
+        Text.assemble(
+            Text(f" {ICO_DB} Total ", style=S_LABEL), _num(m.candles_total),
+            Text(f"  {ICO_REDIS} Pub ", style=S_LABEL), _num(m.redis_pub_count),
+        ),
+        Text.assemble(Text("flushes ", style=S_DIM), _num(m.flush_count)),
+    )
 
+    # Row 2: Flush avg + last
     flush_color = S_WARN if m.avg_flush_ms() > 50 else S_OK
-    _kv_row(tbl, ICO_CLOCK, "Avg flush", Text(f"{m.avg_flush_ms():.1f} ms", style=flush_color))
-    _kv_row(tbl, ICO_CLOCK, "Last flush", Text(f"{m.last_flush_ms:.1f} ms", style=S_MUTED))
+    tbl.add_row(
+        Text.assemble(
+            Text(f" {ICO_CLOCK} Flush ", style=S_LABEL),
+            Text(f"{m.avg_flush_ms():.1f}ms", style=flush_color),
+            Text(" avg  ", style=S_DIM),
+            Text(f"{m.last_flush_ms:.1f}ms", style=S_MUTED),
+            Text(" last", style=S_DIM),
+        ),
+        Text(""),
+    )
+
+    # Row 3: Errors + gap scan + gaps (merged)
+    total_err = m.total_errors()
+    err_part = Text.assemble(Text("✓ ", style=S_OK), Text(str(total_err), style=S_OK)) if total_err == 0 \
+        else Text.assemble(Text("✗ ", style=S_ERR), Text(str(total_err), style=S_ERR))
+    gap_style = S_WARN if m.gaps_found else S_DIM
+    tbl.add_row(
+        Text.assemble(
+            Text(" ", style=S_LABEL), err_part,
+            Text(f"  {ICO_SCAN} ", style=S_DIM), _dt_short(m.last_gap_scan_time),
+            Text(f"  {ICO_WARN} ", style=S_DIM), Text(str(m.gaps_found), style=gap_style),
+        ),
+        Text(""),
+    )
 
     tbl.add_row(Text("   ─ ─ ─ ─ ─ ─ ─ ─ ─", style=S_DIM), Text(""))
 
-    # Time windows
+    # Time windows (compact: pairwise)
     c1h = m.candles_in_window(3600)
     c12h = m.candles_in_window(43200)
     c24h = m.candles_in_window(86400)
     c7d = m.candles_in_window(604800)
-    _kv_row(tbl, ICO_CLOCK, "1 h", _num(c1h))
-    _kv_row(tbl, ICO_CLOCK, "12 h", _num(c12h))
-    _kv_row(tbl, ICO_CLOCK, "24 h", _num(c24h))
-    _kv_row(tbl, ICO_CLOCK, "7 d", _num(c7d))
-
-    tbl.add_row(Text("   ─ ─ ─ ─ ─ ─ ─ ─ ─", style=S_DIM), Text(""))
-
-    # Error overview
-    total_err = m.total_errors()
-    if total_err == 0:
-        _kv_row(tbl, "✓", "Errors", Text("0", style=S_OK))
-    else:
-        _kv_row(tbl, ICO_WARN, "Errors", Text(str(total_err), style=S_ERR))
-
-    # Gap scan info
-    _kv_row(tbl, ICO_SCAN, "Last scan", _dt_short(m.last_gap_scan_time))
-    gap_style = S_WARN if m.gaps_found else S_DIM
-    _kv_row(tbl, ICO_WARN, "Gaps", Text(str(m.gaps_found), style=gap_style))
+    tbl.add_row(
+        Text.assemble(Text(f" {ICO_CLOCK} ", style=S_LABEL), Text("1h ", style=S_DIM), _num(c1h)),
+        Text.assemble(Text("12h ", style=S_DIM), _num(c12h)),
+    )
+    tbl.add_row(
+        Text.assemble(Text(f" {ICO_CLOCK} ", style=S_LABEL), Text("24h ", style=S_DIM), _num(c24h)),
+        Text.assemble(Text("7d ", style=S_DIM), _num(c7d)),
+    )
 
     return Panel(
         tbl,
@@ -413,50 +482,62 @@ def _build_candle_panel(m: PollerMetrics) -> Panel:
 def _build_infra_panel(m: PollerMetrics) -> Panel:
     tbl = Table.grid(padding=(0, 1), expand=True)
     tbl.add_column(ratio=3)
-    tbl.add_column(ratio=1, justify="right")
+    tbl.add_column(ratio=2, justify="right")
 
-    # DB
+    # ── TimescaleDB: status + latency | uptime + downtime
     dot = _health_dot(m.db_healthy)
     lbl = Text(" OK", style=S_OK) if m.db_healthy else Text(" Down", style=S_ERR)
-    tbl.add_row(Text.assemble(f" {ICO_DB} TimescaleDB  ", dot, lbl), Text(""))
-    _kv_row(tbl, ICO_CLOCK, "Latency", _latency_text(m.db_latency_ms))
     db_up, db_dn, db_pct = m.db_uptime()
-    _kv_row(tbl, "↑", "Uptime", _uptime_text(db_up, db_dn, db_pct))
-    _kv_row(tbl, "↓", "Downtime", _downtime_text(db_dn))
-    _history_row(tbl, "db", m)
+    tbl.add_row(
+        Text.assemble(f" {ICO_DB} TimescaleDB  ", dot, lbl),
+        Text.assemble(
+            _latency_text(m.db_latency_ms),
+            Text("  ↑", style=S_DIM), _pct_colored(db_pct),
+            Text("  ↓", style=S_DIM), _downtime_text(db_dn),
+        ),
+    )
+    tbl.add_row(
+        Text.assemble(Text("   ◷ ", style=S_LABEL), _history_inline("db", m)),
+        Text(""),
+    )
 
     tbl.add_row(Text("   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─", style=S_DIM), Text(""))
 
-    # Redis
+    # ── Redis: status + latency | uptime + downtime
     dot = _health_dot(m.redis_healthy)
     lbl = Text(" OK", style=S_OK) if m.redis_healthy else Text(" Down", style=S_ERR)
-    tbl.add_row(Text.assemble(f" {ICO_REDIS} Redis  ", dot, lbl), Text(""))
-    _kv_row(tbl, ICO_CLOCK, "Latency", _latency_text(m.redis_latency_ms))
     redis_up, redis_dn, redis_pct = m.redis_uptime()
-    _kv_row(tbl, "↑", "Uptime", _uptime_text(redis_up, redis_dn, redis_pct))
-    _kv_row(tbl, "↓", "Downtime", _downtime_text(redis_dn))
-    _history_row(tbl, "redis", m)
+    tbl.add_row(
+        Text.assemble(f" {ICO_REDIS} Redis  ", dot, lbl),
+        Text.assemble(
+            _latency_text(m.redis_latency_ms),
+            Text("  ↑", style=S_DIM), _pct_colored(redis_pct),
+            Text("  ↓", style=S_DIM), _downtime_text(redis_dn),
+        ),
+    )
+    tbl.add_row(
+        Text.assemble(Text("   ◷ ", style=S_LABEL), _history_inline("redis", m)),
+        Text(""),
+    )
 
     tbl.add_row(Text("   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─", style=S_DIM), Text(""))
 
-    # Error breakdown
-    categories = [
-        ("tick_loop",   "Tick Loop"),
-        ("candle_loop", "Candle Loop"),
-        ("flush",       "Flush"),
-        ("publish",     "Publish"),
-        ("heartbeat",   "Heartbeat"),
-        ("gap_scan",    "Gap Scan"),
-        ("backfill",    "Backfill"),
-    ]
-    for key, label in categories:
-        cnt = m.errors.get(key, 0)
-        style = S_ERR if cnt > 0 else S_DIM
-        icon = "✗" if cnt > 0 else "·"
+    # ── Errors (compact: summary + non-zero inline)
+    total_err = m.total_errors()
+    if total_err == 0:
         tbl.add_row(
-            Text(f"   {icon} {label}", style=S_LABEL),
-            Text(str(cnt), style=style),
+            Text.assemble(Text(" ✓ ", style=S_OK), Text("Errors", style=S_LABEL)),
+            Text("0", style=S_OK),
         )
+    else:
+        abbrev = [("tick_loop", "tick"), ("candle_loop", "candle"), ("flush", "flush"),
+                  ("publish", "pub"), ("heartbeat", "hbeat"), ("gap_scan", "gap"), ("backfill", "bfill")]
+        parts: list[Text | str] = [Text(f" ✗ Err {total_err}: ", style=S_ERR)]
+        for key, short in abbrev:
+            cnt = m.errors.get(key, 0)
+            if cnt > 0:
+                parts.append(Text(f"{short}({cnt}) ", style=S_ERR))
+        tbl.add_row(Text.assemble(*parts), Text(""))
 
     return Panel(
         tbl,
@@ -627,9 +708,9 @@ def _build_layout(m: PollerMetrics) -> Layout:
 
     layout.split_column(
         Layout(name="header", size=3),
-        Layout(name="row1", size=15),
-        Layout(name="row2", size=14),
-        Layout(name="row3", size=21),
+        Layout(name="row1", size=9),
+        Layout(name="row2", size=8),
+        Layout(name="row3", size=10),
         Layout(name="prices", minimum_size=5, ratio=2),
         Layout(name="footer", size=1),
     )
