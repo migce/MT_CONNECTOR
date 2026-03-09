@@ -78,7 +78,22 @@ nssm status MT5Poller
 
 ## API Reference
 
-Full OpenAPI documentation available at `http://localhost:9000/docs` when the API server is running.
+Full OpenAPI documentation available at `http://<server-ip>:9000/docs` when the API server is running.
+
+### Network Access
+
+The API listens on `0.0.0.0:9000` — accessible from any machine on the local network.
+Replace `localhost` with the server's IP (e.g. `192.168.1.4`) when connecting from another computer.
+
+```
+Server (Windows host):  192.168.1.4
+REST API:               http://192.168.1.4:9000/api/v1/...
+WebSocket ticks:        ws://192.168.1.4:9000/ws/ticks/{symbol}
+WebSocket candles:      ws://192.168.1.4:9000/ws/candles/{symbol}/{timeframe}
+OpenAPI docs:           http://192.168.1.4:9000/docs
+```
+
+> **Firewall**: ensure TCP port 9000 is open for inbound connections in Windows Firewall.
 
 ### REST Endpoints
 
@@ -88,7 +103,9 @@ Full OpenAPI documentation available at `http://localhost:9000/docs` when the AP
 | `/api/v1/candles/{symbol}` | GET | Historical OHLCV candles (standard TFs) |
 | `/api/v1/candles/custom/{symbol}` | GET | **Custom timeframe candles** (M2, H6, T100…) |
 | `/api/v1/ticks/{symbol}` | GET | Historical raw ticks |
-| `/api/v1/health` | GET | Service health check |
+| `/api/v1/health` | GET | Service health check (MT5 + DB + Redis status) |
+| `/api/v1/coverage` | GET | Data coverage: first/last bar per symbol × timeframe |
+| `/api/v1/stats` | GET | API request statistics (1h/12h/24h windows) |
 
 #### GET /api/v1/candles/{symbol}
 
@@ -188,21 +205,136 @@ curl "http://localhost:9000/api/v1/candles/custom/EURUSD?timeframe=T100&from=202
 | `to` | datetime | — | End time (ISO 8601) |
 | `limit` | int | 5000 | Max rows (1–100000) |
 
-### WebSocket Endpoints
+#### GET /api/v1/health
 
-#### /ws/ticks/{symbol}
+Returns MT5 connection status (relayed from poller via Redis), DB, Redis connectivity, and uptime.
 
-Real-time tick stream. Connect via WebSocket:
+```bash
+curl "http://192.168.1.4:9000/api/v1/health"
+```
 
+**Response:**
+```json
+{
+  "status": "ok",
+  "mt5_connected": true,
+  "db_connected": true,
+  "redis_connected": true,
+  "uptime_sec": 3600.5,
+  "symbols_active": 10,
+  "version": "1.0.0"
+}
+```
+
+| Field | Description |
+|---|---|
+| `status` | `ok` or `degraded` (DB unreachable) |
+| `mt5_connected` | `true` if the Windows poller is running and connected to MT5 terminal |
+| `symbols_active` | Number of symbols being tracked |
+
+#### GET /api/v1/coverage
+
+Data availability per symbol: first/last bar, row counts, sync timestamps.
+
+```bash
+curl "http://192.168.1.4:9000/api/v1/coverage"
+```
+
+**Response (abridged):**
+```json
+{
+  "total_candle_rows": 394131,
+  "total_tick_rows": 28562253,
+  "symbols": [
+    {
+      "symbol": "EURUSD",
+      "candles": [
+        {
+          "timeframe": "M1",
+          "first_bar": "2026-02-06T00:00:00Z",
+          "last_bar": "2026-03-07T23:59:00Z",
+          "total_bars": 28800,
+          "last_synced_at": "2026-03-07T23:59:00Z"
+        }
+      ],
+      "ticks": {
+        "first_tick": "2026-02-06T00:00:00.123Z",
+        "last_tick": "2026-03-07T23:59:59.987Z",
+        "total_ticks": 2856225,
+        "last_synced_at": "2026-03-07T23:59:59.987Z"
+      }
+    }
+  ]
+}
+```
+
+#### GET /api/v1/stats
+
+API request metrics for monitoring.
+
+```bash
+curl "http://192.168.1.4:9000/api/v1/stats"
+```
+
+**Response:**
+```json
+{
+  "total_requests": 1523,
+  "total_errors": 0,
+  "uptime_sec": 3600.1,
+  "requests_1h": 245,
+  "requests_12h": 1200,
+  "requests_24h": 1523,
+  "errors_1h": 0,
+  "avg_latency_ms_1h": 12.34
+}
+
+### WebSocket Endpoints — Real-Time Quotes
+
+Connect from **any machine** on the network to receive live market data. WebSocket connections are long-lived — the server pushes every tick/candle update as soon as it arrives from MT5.
+
+#### /ws/ticks/{symbol} — Live Tick Stream
+
+Every price change (bid/ask update) is delivered in real time (~50 ms polling resolution).
+
+**JavaScript (browser or Node.js):**
 ```javascript
-const ws = new WebSocket("ws://localhost:9000/ws/ticks/EURUSD");
+const ws = new WebSocket("ws://192.168.1.4:9000/ws/ticks/EURUSD");
+
+ws.onopen = () => console.log("Connected to EURUSD tick stream");
+
 ws.onmessage = (event) => {
   const tick = JSON.parse(event.data);
-  console.log(tick.bid, tick.ask);
+  if (tick.event === "ping") return; // server heartbeat — ignore
+  console.log(`EURUSD  bid=${tick.bid}  ask=${tick.ask}  time=${tick.time_msc}`);
+};
+
+ws.onclose = () => {
+  console.log("Disconnected, reconnecting in 3s...");
+  setTimeout(() => { /* reconnect logic */ }, 3000);
 };
 ```
 
-**Message format:**
+**Python (websockets library):**
+```python
+import asyncio, json, websockets
+
+async def stream_ticks():
+    uri = "ws://192.168.1.4:9000/ws/ticks/EURUSD"
+    async for ws in websockets.connect(uri):
+        try:
+            async for msg in ws:
+                tick = json.loads(msg)
+                if tick.get("event") == "ping":
+                    continue
+                print(f"bid={tick['bid']}  ask={tick['ask']}")
+        except websockets.ConnectionClosed:
+            continue  # auto-reconnect
+
+asyncio.run(stream_ticks())
+```
+
+**Tick message format:**
 ```json
 {
   "time_msc": "2026-03-08T12:34:56.789Z",
@@ -215,26 +347,99 @@ ws.onmessage = (event) => {
 }
 ```
 
-#### /ws/candles/{symbol}/{timeframe}
+The server sends `{"event": "ping"}` heartbeats every 30 seconds to keep the connection alive.
 
-Real-time candle updates (current bar updates + new bar events):
+#### /ws/candles/{symbol}/{timeframe} — Live Candle Updates
 
+Receive candle OHLCV updates in real time. The current (incomplete) bar updates with each new tick; a new bar object appears when the candle closes.
+
+**JavaScript:**
 ```javascript
-const ws = new WebSocket("ws://localhost:9000/ws/candles/EURUSD/M1");
+const ws = new WebSocket("ws://192.168.1.4:9000/ws/candles/EURUSD/M1");
+
 ws.onmessage = (event) => {
   const candle = JSON.parse(event.data);
-  console.log(candle.open, candle.high, candle.low, candle.close);
+  if (candle.event === "ping") return;
+  console.log(
+    `${candle.timeframe} ${candle.time}  O=${candle.open} H=${candle.high} L=${candle.low} C=${candle.close}`
+  );
 };
+```
+
+**Python:**
+```python
+import asyncio, json, websockets
+
+async def stream_candles():
+    uri = "ws://192.168.1.4:9000/ws/candles/EURUSD/M1"
+    async for ws in websockets.connect(uri):
+        try:
+            async for msg in ws:
+                candle = json.loads(msg)
+                if candle.get("event") == "ping":
+                    continue
+                print(f"{candle['timeframe']} O={candle['open']} H={candle['high']} "
+                      f"L={candle['low']} C={candle['close']}")
+        except websockets.ConnectionClosed:
+            continue
+
+asyncio.run(stream_candles())
+```
+
+**Candle message format:**
+```json
+{
+  "time": "2026-03-08T12:34:00Z",
+  "symbol": "EURUSD",
+  "timeframe": "M1",
+  "open": 1.0856,
+  "high": 1.0872,
+  "low": 1.0843,
+  "close": 1.0861,
+  "tick_volume": 85,
+  "real_volume": 0,
+  "spread": 1
+}
+```
+
+Supported timeframes for candle streaming: `M1`, `M5`, `M15`, `H1`, `H4`, `D1`, and any custom TF (e.g. `M2`, `H6`).
+
+#### Multiple Symbols
+
+Open one WebSocket per symbol/timeframe combination:
+
+```javascript
+const symbols = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"];
+
+symbols.forEach(sym => {
+  const ws = new WebSocket(`ws://192.168.1.4:9000/ws/ticks/${sym}`);
+  ws.onmessage = (e) => {
+    const t = JSON.parse(e.data);
+    if (t.event !== "ping")
+      console.log(`${t.symbol}  bid=${t.bid}  ask=${t.ask}`);
+  };
+});
 ```
 
 ## Python Client SDK
 
+A built-in client library for consuming the API from Python scripts, notebooks, or other services.
+
+### Async Client
+
 ```python
 from src.api.client import MT5Client
 
-# Async usage
 async def main():
-    client = MT5Client("http://localhost:9000")
+    # Connect from any machine — use the server's IP
+    client = MT5Client("http://192.168.1.4:9000")
+
+    # Check connectivity
+    health = await client.health()
+    print(health)  # {"status": "ok", "mt5_connected": true, ...}
+
+    # List tracked symbols
+    symbols = await client.get_symbols()
 
     # Historical candles
     candles = await client.get_candles("EURUSD", "H1", limit=100)
@@ -242,21 +447,66 @@ async def main():
     # Historical ticks
     ticks = await client.get_ticks("EURUSD", limit=500)
 
-    # Real-time tick stream
+    # Real-time tick stream (runs forever)
     async for tick in client.stream_ticks("EURUSD"):
         print(f"EURUSD bid={tick['bid']} ask={tick['ask']}")
+
+    # Real-time candle stream
+    async for candle in client.stream_candles("EURUSD", "M1"):
+        print(f"O={candle['open']} H={candle['high']} L={candle['low']} C={candle['close']}")
 
     await client.close()
 ```
 
+### Sync Client (scripts / notebooks)
+
 ```python
 from src.api.client import MT5ClientSync
 
-# Synchronous usage (scripts, notebooks)
-client = MT5ClientSync("http://localhost:9000")
+client = MT5ClientSync("http://192.168.1.4:9000")
+
+# Get 100 H1 candles
 candles = client.get_candles("EURUSD", "H1", limit=100)
 print(f"Got {len(candles)} candles")
+
+# Get latest ticks
+ticks = client.get_ticks("EURUSD", limit=500)
+
+# Check health
+print(client.health())
+
 client.close()
+```
+
+### Using with `requests` / `httpx` directly
+
+No SDK needed — the API is standard REST:
+
+```python
+import requests
+
+BASE = "http://192.168.1.4:9000/api/v1"
+
+# Health check
+r = requests.get(f"{BASE}/health")
+print(r.json())
+
+# Get M5 candles for XAUUSD
+r = requests.get(f"{BASE}/candles/XAUUSD", params={
+    "timeframe": "M5",
+    "from": "2026-03-01T00:00:00Z",
+    "limit": 500,
+})
+candles = r.json()
+
+# Get tick data
+r = requests.get(f"{BASE}/ticks/EURUSD", params={"limit": 1000})
+ticks = r.json()
+
+# Data coverage
+r = requests.get(f"{BASE}/coverage")
+coverage = r.json()
+print(f"Total candles: {coverage['total_candle_rows']}, ticks: {coverage['total_tick_rows']}")
 ```
 
 ## Database Schema
@@ -322,15 +572,22 @@ MT_Connector/
         ├── app.py              # App factory
         ├── client.py           # Python client SDK
         ├── schemas.py          # Pydantic models
+        ├── middleware/
+        │   └── request_metrics.py  # Per-request stats
+        ├── services/
+        │   ├── validation.py       # Symbol validation + rate limiter
+        │   └── backfill_helper.py  # On-demand backfill logic
         ├── routes/
         │   ├── candles.py
-        │   ├── custom_candles.py  # Non-standard TFs + tick bars
+        │   ├── custom_candles.py   # Non-standard TFs + tick bars
         │   ├── ticks.py
         │   ├── symbols.py
-        │   └── health.py
+        │   ├── health.py
+        │   ├── coverage.py         # Data coverage stats
+        │   └── stats.py            # API request metrics
         └── websocket/
             ├── manager.py      # WS connection manager
-            └── streams.py      # WS endpoints
+            └── streams.py      # WS endpoints (ticks + candles)
 ```
 
 ## Environment Variables
