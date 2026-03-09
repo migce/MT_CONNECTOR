@@ -1,0 +1,279 @@
+# MT5 Connector API
+
+> Production-grade REST + WebSocket API for MetaTrader 5 market data.
+> Base URL: http://<server-ip>:9000
+> OpenAPI spec: http://<server-ip>:9000/openapi.json
+> Interactive docs: http://<server-ip>:9000/docs
+
+## Authentication
+
+None required. The API is designed for local network / private use.
+
+## Pagination
+
+All list endpoints (candles, ticks) return a paginated envelope:
+
+```json
+{
+  "data": [...],
+  "count": 1000,
+  "has_more": true,
+  "next_from": "2026-03-08T12:00:00+00:00"
+}
+```
+
+To fetch all pages: repeat the request with `from=<next_from>` until `has_more` is `false`.
+
+## Endpoints
+
+### GET /api/v1/symbols
+List all tracked symbols.
+Response: `[{"symbol": "EURUSD", "description": "Euro vs US Dollar"}, ...]`
+
+### GET /api/v1/candles/{symbol}
+Historical OHLCV candle bars. Missing data is auto-backfilled from MT5.
+
+Parameters:
+- symbol (path, required): Instrument name, e.g. EURUSD, XAUUSD
+- timeframe (query, default "M1"): M1, M5, M15, H1, H4, D1
+- from (query, optional): Start datetime, ISO 8601, inclusive
+- to (query, optional): End datetime, ISO 8601, inclusive
+- limit (query, default 1000, max 50000): Max candles per page
+
+Response: PaginatedResponse with CandleResponse items
+```json
+{
+  "data": [
+    {
+      "time": "2026-03-01T00:00:00Z",
+      "symbol": "EURUSD",
+      "timeframe": "H1",
+      "open": 1.0856,
+      "high": 1.0872,
+      "low": 1.0843,
+      "close": 1.0861,
+      "tick_volume": 4523,
+      "real_volume": 0,
+      "spread": 1
+    }
+  ],
+  "count": 1,
+  "has_more": false,
+  "next_from": null
+}
+```
+
+### GET /api/v1/candles/custom/{symbol}
+Build candles for any timeframe on-the-fly.
+
+Parameters:
+- symbol (path, required): Instrument name
+- timeframe (query, required): Custom TF string
+  - Time-based: M2, M3, M7, M10, M20, M30, H2, H3, H6, H8, H12, D2, W1, ...
+  - Tick bars: T100, T250, T500, T1000, ...
+  - Standard TFs (M1, M5, M15, H1, H4, D1) auto-redirect to pre-computed data
+- from (query, optional): Start datetime, ISO 8601
+- to (query, optional): End datetime, ISO 8601
+- limit (query, default 1000, max 50000): Max candles per page
+- price (query, default "bid"): Price field for tick bars: bid, ask, last, mid
+- include_incomplete (query, default false): Include partial last tick bar
+
+Response: PaginatedResponse with CandleResponse items (same schema as standard candles)
+
+### GET /api/v1/ticks/{symbol}
+Raw historical tick data. Missing data is auto-backfilled from MT5.
+
+Parameters:
+- symbol (path, required): Instrument name
+- from (query, optional): Start datetime, ISO 8601, inclusive
+- to (query, optional): End datetime, ISO 8601, inclusive
+- limit (query, default 5000, max 50000): Max ticks per page
+
+Response: PaginatedResponse with TickResponse items
+```json
+{
+  "data": [
+    {
+      "time_msc": "2026-03-08T12:34:56.789Z",
+      "symbol": "EURUSD",
+      "bid": 1.0856,
+      "ask": 1.0858,
+      "last": 0.0,
+      "volume": 0,
+      "flags": 6
+    }
+  ],
+  "count": 1,
+  "has_more": false,
+  "next_from": null
+}
+```
+
+### GET /api/v1/health
+Service health check.
+
+Response:
+```json
+{
+  "status": "ok",
+  "mt5_connected": true,
+  "db_connected": true,
+  "redis_connected": true,
+  "uptime_sec": 3600.5,
+  "symbols_active": 10,
+  "version": "1.0.0"
+}
+```
+
+### GET /api/v1/coverage
+Data availability statistics per symbol, timeframe, and ticks.
+
+Response:
+```json
+{
+  "total_candle_rows": 394131,
+  "total_tick_rows": 28562253,
+  "symbols": [
+    {
+      "symbol": "EURUSD",
+      "candles": [
+        {
+          "timeframe": "M1",
+          "first_bar": "2026-02-06T00:00:00Z",
+          "last_bar": "2026-03-07T23:59:00Z",
+          "total_bars": 28800,
+          "last_synced_at": "2026-03-07T23:59:00Z"
+        }
+      ],
+      "ticks": {
+        "first_tick": "2026-02-06T00:00:00.123Z",
+        "last_tick": "2026-03-07T23:59:59.987Z",
+        "total_ticks": 2856225,
+        "last_synced_at": "2026-03-07T23:59:59.987Z"
+      }
+    }
+  ]
+}
+```
+
+### GET /api/v1/stats
+API request metrics (live counters, reset on restart).
+
+Response:
+```json
+{
+  "total_requests": 1523,
+  "total_errors": 0,
+  "uptime_sec": 3600.1,
+  "requests_1h": 245,
+  "requests_12h": 1200,
+  "requests_24h": 1523,
+  "errors_1h": 0,
+  "avg_latency_ms_1h": 12.34
+}
+```
+
+### GET /api/v1/stats/daily
+Historical daily statistics persisted to DB. Survives restarts.
+
+Parameters:
+- from (query, optional): Start date, ISO 8601
+- to (query, optional): End date, ISO 8601
+- limit (query, default 30, max 365): Max rows
+
+Response:
+```json
+[
+  {
+    "date": "2026-03-09",
+    "ticks_received": 5234567,
+    "ticks_flushed": 5234567,
+    "candles_upserted": 12345,
+    "redis_published": 5246912,
+    "poller_errors": 0,
+    "reconnects": 0,
+    "gaps_found": 2,
+    "poller_uptime_sec": 86400.0,
+    "api_requests": 3456,
+    "api_errors": 0,
+    "api_avg_latency_ms": 8.42,
+    "api_uptime_sec": 86400.0
+  }
+]
+```
+
+## WebSocket Endpoints
+
+### ws://<server-ip>:9000/ws/ticks/{symbol}
+Real-time tick stream. Every bid/ask change is pushed (~50ms resolution).
+
+Message format:
+```json
+{"time_msc": "...", "symbol": "EURUSD", "bid": 1.0856, "ask": 1.0858, "last": 0.0, "volume": 0, "flags": 6}
+```
+
+### ws://<server-ip>:9000/ws/candles/{symbol}/{timeframe}
+Real-time candle updates. Current bar updates with each tick; new bar on candle close.
+
+Timeframes: M1, M5, M15, H1, H4, D1, and custom (M2, H6, ...).
+
+Message format:
+```json
+{"time": "...", "symbol": "EURUSD", "timeframe": "M1", "open": 1.0856, "high": 1.0872, "low": 1.0843, "close": 1.0861, "tick_volume": 85, "real_volume": 0, "spread": 1}
+```
+
+### Heartbeat
+Server sends `{"event": "ping"}` every 30s. Client may send `{"action": "ping"}` to receive `{"event": "pong"}`.
+
+## Common Patterns for AI Agents
+
+### Fetch latest 100 H1 candles
+```
+GET /api/v1/candles/EURUSD?timeframe=H1&limit=100
+```
+
+### Fetch all M1 candles for a specific day
+```
+GET /api/v1/candles/EURUSD?timeframe=M1&from=2026-03-08T00:00:00Z&to=2026-03-08T23:59:59Z&limit=50000
+```
+
+### Fetch 500-tick bars with mid price
+```
+GET /api/v1/candles/custom/EURUSD?timeframe=T500&price=mid&limit=200
+```
+
+### Paginate through large dataset
+```
+# Step 1: GET /api/v1/ticks/EURUSD?from=2026-03-08T00:00:00Z&limit=5000
+# Step 2: If has_more=true, GET /api/v1/ticks/EURUSD?from=<next_from>&limit=5000
+# Repeat until has_more=false
+```
+
+### Check if service is healthy before querying
+```
+GET /api/v1/health
+# Verify: status="ok", mt5_connected=true, db_connected=true
+```
+
+### Discover available data range
+```
+GET /api/v1/coverage
+# Check symbols[].candles[].first_bar / last_bar for available date range
+```
+
+## Error Handling
+
+- 400: Invalid parameters (bad timeframe, symbol not found, etc.)
+- 404: Not found
+- 429: Rate limit exceeded (backfill throttle)
+- 500: Internal server error
+
+Error response format:
+```json
+{"detail": "Invalid timeframe 'X'. Allowed: ['M1', 'M5', 'M15', 'H1', 'H4', 'D1']"}
+```
+
+## Rate Limits
+
+Backfill triggers are rate-limited per symbol to prevent MT5 overload.
+Normal queries against cached data have no rate limit.

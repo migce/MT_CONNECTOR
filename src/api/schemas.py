@@ -5,9 +5,40 @@ Pydantic schemas for the API layer — request parameters and response models.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Generic, Optional, TypeVar
 
 from pydantic import BaseModel, Field
+
+T = TypeVar("T")
+
+
+# ---------------------------------------------------------------
+# Paginated response wrapper
+# ---------------------------------------------------------------
+
+class PaginatedResponse(BaseModel, Generic[T]):
+    """
+    Generic wrapper for paginated list endpoints.
+
+    - **data** — list of items for the current page
+    - **count** — number of items in ``data`` (convenience)
+    - **has_more** — ``true`` if additional rows exist beyond the requested limit
+    - **next_from** — ISO-8601 timestamp to pass as ``from`` for the next page
+      (``null`` when ``has_more`` is ``false``)
+    """
+
+    data: list[T]
+    count: int = Field(description="Number of items in `data`.")
+    has_more: bool = Field(
+        description="True if more rows exist beyond the requested limit.",
+    )
+    next_from: Optional[str] = Field(
+        default=None,
+        description=(
+            "ISO-8601 timestamp to use as the `from` parameter "
+            "for fetching the next page. Null when has_more is false."
+        ),
+    )
 
 
 # ---------------------------------------------------------------

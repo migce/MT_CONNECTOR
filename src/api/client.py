@@ -86,20 +86,43 @@ class MT5Client:
         self,
         symbol: str,
         timeframe: str = "M1",
-        from_dt: Optional[datetime] = None,
-        to_dt: Optional[datetime] = None,
+        from_dt: Optional[datetime | str] = None,
+        to_dt: Optional[datetime | str] = None,
         limit: int = 1000,
-    ) -> list[dict[str, Any]]:
-        """GET /api/v1/candles/{symbol}"""
+    ) -> dict[str, Any]:
+        """GET /api/v1/candles/{symbol} — returns paginated response dict.
+
+        Keys: ``data`` (list), ``count``, ``has_more``, ``next_from``.
+        """
         params: dict[str, Any] = {
             "timeframe": timeframe,
             "limit": limit,
         }
         if from_dt:
-            params["from"] = from_dt.isoformat()
+            params["from"] = from_dt if isinstance(from_dt, str) else from_dt.isoformat()
         if to_dt:
-            params["to"] = to_dt.isoformat()
+            params["to"] = to_dt if isinstance(to_dt, str) else to_dt.isoformat()
         return await self._get(f"/api/v1/candles/{symbol}", params)
+
+    async def get_all_candles(
+        self,
+        symbol: str,
+        timeframe: str = "M1",
+        from_dt: Optional[datetime | str] = None,
+        to_dt: Optional[datetime | str] = None,
+        limit: int = 1000,
+        max_pages: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Auto-paginate through all candle pages and return a flat list."""
+        all_rows: list[dict[str, Any]] = []
+        cursor = from_dt
+        for _ in range(max_pages):
+            page = await self.get_candles(symbol, timeframe, cursor, to_dt, limit)
+            all_rows.extend(page["data"])
+            if not page["has_more"]:
+                break
+            cursor = page["next_from"]
+        return all_rows
 
     # ---------------------------------------------------------------
     # Ticks
@@ -108,17 +131,39 @@ class MT5Client:
     async def get_ticks(
         self,
         symbol: str,
-        from_dt: Optional[datetime] = None,
-        to_dt: Optional[datetime] = None,
+        from_dt: Optional[datetime | str] = None,
+        to_dt: Optional[datetime | str] = None,
         limit: int = 5000,
-    ) -> list[dict[str, Any]]:
-        """GET /api/v1/ticks/{symbol}"""
+    ) -> dict[str, Any]:
+        """GET /api/v1/ticks/{symbol} — returns paginated response dict.
+
+        Keys: ``data`` (list), ``count``, ``has_more``, ``next_from``.
+        """
         params: dict[str, Any] = {"limit": limit}
         if from_dt:
-            params["from"] = from_dt.isoformat()
+            params["from"] = from_dt if isinstance(from_dt, str) else from_dt.isoformat()
         if to_dt:
-            params["to"] = to_dt.isoformat()
+            params["to"] = to_dt if isinstance(to_dt, str) else to_dt.isoformat()
         return await self._get(f"/api/v1/ticks/{symbol}", params)
+
+    async def get_all_ticks(
+        self,
+        symbol: str,
+        from_dt: Optional[datetime | str] = None,
+        to_dt: Optional[datetime | str] = None,
+        limit: int = 5000,
+        max_pages: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Auto-paginate through all tick pages and return a flat list."""
+        all_rows: list[dict[str, Any]] = []
+        cursor = from_dt
+        for _ in range(max_pages):
+            page = await self.get_ticks(symbol, cursor, to_dt, limit)
+            all_rows.extend(page["data"])
+            if not page["has_more"]:
+                break
+            cursor = page["next_from"]
+        return all_rows
 
     # ---------------------------------------------------------------
     # Health
@@ -217,6 +262,18 @@ class MT5ClientSync:
         resp.raise_for_status()
         return resp.json()
 
+    def get_all_candles(self, symbol, timeframe="M1", from_dt=None, to_dt=None, limit=1000, max_pages=100):
+        """Auto-paginate through all candle pages and return a flat list."""
+        all_rows = []
+        cursor = from_dt
+        for _ in range(max_pages):
+            page = self.get_candles(symbol, timeframe, cursor, to_dt, limit)
+            all_rows.extend(page["data"])
+            if not page["has_more"]:
+                break
+            cursor = page["next_from"]
+        return all_rows
+
     def get_ticks(self, symbol, from_dt=None, to_dt=None, limit=5000):
         params: dict = {"limit": limit}
         if from_dt:
@@ -226,6 +283,18 @@ class MT5ClientSync:
         resp = self._http.get(f"/api/v1/ticks/{symbol}", params=params)
         resp.raise_for_status()
         return resp.json()
+
+    def get_all_ticks(self, symbol, from_dt=None, to_dt=None, limit=5000, max_pages=100):
+        """Auto-paginate through all tick pages and return a flat list."""
+        all_rows = []
+        cursor = from_dt
+        for _ in range(max_pages):
+            page = self.get_ticks(symbol, cursor, to_dt, limit)
+            all_rows.extend(page["data"])
+            if not page["has_more"]:
+                break
+            cursor = page["next_from"]
+        return all_rows
 
     def health(self):
         resp = self._http.get("/api/v1/health")

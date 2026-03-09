@@ -16,7 +16,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
-from src.api.schemas import CandleResponse
+from src.api.schemas import CandleResponse, PaginatedResponse
 from src.api.services.backfill_helper import maybe_backfill_candles
 from src.api.services.validation import backfill_limiter, validate_symbol
 from src.config import Timeframe
@@ -26,14 +26,16 @@ router = APIRouter(prefix="/api/v1", tags=["candles"])
 
 @router.get(
     "/candles/{symbol}",
-    response_model=list[CandleResponse],
+    response_model=PaginatedResponse[CandleResponse],
     summary="Get historical candles",
     description=(
         "Retrieve OHLCV candle bars for a given symbol and timeframe. "
         "Results are ordered by time ascending. "
         "If the requested range is not yet in the database, the system "
         "automatically fetches it from MetaTrader 5 (may take a few seconds "
-        "on first request)."
+        "on first request).\n\n"
+        "The response includes `has_more` / `next_from` pagination metadata "
+        "so you can iterate through large datasets page by page."
     ),
 )
 async def get_candles(
@@ -58,7 +60,7 @@ async def get_candles(
         le=50000,
         description="Maximum number of candles to return.",
     ),
-) -> list[CandleResponse]:
+) -> PaginatedResponse[CandleResponse]:
     # Validate symbol exists in configuration
     symbol = validate_symbol(symbol)
 
@@ -75,11 +77,27 @@ async def get_candles(
     # Rate-limit backfill triggers
     await backfill_limiter.check(symbol)
 
+    # Fetch limit + 1 to detect whether more rows exist
     rows = await maybe_backfill_candles(
         symbol=symbol,
         timeframe=timeframe.upper(),
         dt_from=from_dt,
         dt_to=to_dt,
-        limit=limit,
+        limit=limit + 1,
+    )
+
+    has_more = len(rows) > limit
+    if has_more:
+        next_from = rows[limit]["time"].isoformat()
+        rows = rows[:limit]
+    else:
+        next_from = None
+
+    data = [CandleResponse(**r) for r in rows]
+    return PaginatedResponse(
+        data=data,
+        count=len(data),
+        has_more=has_more,
+        next_from=next_from,
     )
     return [CandleResponse(**r) for r in rows]

@@ -23,7 +23,7 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
-from src.api.schemas import CandleResponse
+from src.api.schemas import CandleResponse, PaginatedResponse
 from src.api.services.backfill_helper import (
     maybe_backfill_candles,
     maybe_backfill_ticks,
@@ -55,7 +55,7 @@ def _choose_source_tf(bucket_seconds: int) -> str:
 
 @router.get(
     "/candles/custom/{symbol}",
-    response_model=list[CandleResponse],
+    response_model=PaginatedResponse[CandleResponse],
     summary="Custom-timeframe candles",
     description=(
         "Build candles for **any** timeframe on-the-fly.\n\n"
@@ -111,10 +111,12 @@ async def get_custom_candles(
             "fewer than N ticks.  Default: only full bars."
         ),
     ),
-) -> list[CandleResponse]:
+) -> PaginatedResponse[CandleResponse]:
     symbol = validate_symbol(symbol)
     tf_str = timeframe.strip().upper()
     await backfill_limiter.check(symbol)
+
+    fetch_limit = limit + 1  # fetch one extra to detect has_more
 
     # ------ Standard TF fast-path ------
     if is_standard_timeframe(tf_str):
@@ -123,9 +125,9 @@ async def get_custom_candles(
             timeframe=tf_str,
             dt_from=from_dt,
             dt_to=to_dt,
-            limit=limit,
+            limit=fetch_limit,
         )
-        return [CandleResponse(**r) for r in rows]
+        return _paginate_candles(rows, limit)
 
     # ------ Parse custom TF ------
     try:
@@ -153,11 +155,11 @@ async def get_custom_candles(
             tf_label=ctf.raw,
             dt_from=from_dt,
             dt_to=to_dt,
-            limit=limit,
+            limit=fetch_limit,
             price_field=price,
             include_incomplete=include_incomplete,
         )
-        return [CandleResponse(**r) for r in rows]
+        return _paginate_candles(rows, limit)
 
     # ------ Time-based custom TF ------
     if ctf.seconds < 60:
@@ -186,7 +188,28 @@ async def get_custom_candles(
         tf_label=ctf.raw,
         dt_from=from_dt,
         dt_to=to_dt,
-        limit=limit,
+        limit=fetch_limit,
         source_tf=source_tf,
     )
-    return [CandleResponse(**r) for r in rows]
+    return _paginate_candles(rows, limit)
+
+
+def _paginate_candles(
+    rows: list[dict],
+    limit: int,
+) -> PaginatedResponse[CandleResponse]:
+    """Build a PaginatedResponse from raw rows, detecting has_more."""
+    has_more = len(rows) > limit
+    if has_more:
+        next_from = rows[limit]["time"].isoformat()
+        rows = rows[:limit]
+    else:
+        next_from = None
+
+    data = [CandleResponse(**r) for r in rows]
+    return PaginatedResponse(
+        data=data,
+        count=len(data),
+        has_more=has_more,
+        next_from=next_from,
+    )

@@ -124,20 +124,25 @@ curl "http://localhost:9000/api/v1/candles/EURUSD?timeframe=H1&from=2026-03-01T0
 
 **Response:**
 ```json
-[
-  {
-    "time": "2026-03-01T00:00:00Z",
-    "symbol": "EURUSD",
-    "timeframe": "H1",
-    "open": 1.0856,
-    "high": 1.0872,
-    "low": 1.0843,
-    "close": 1.0861,
-    "tick_volume": 4523,
-    "real_volume": 0,
-    "spread": 1
-  }
-]
+{
+  "data": [
+    {
+      "time": "2026-03-01T00:00:00Z",
+      "symbol": "EURUSD",
+      "timeframe": "H1",
+      "open": 1.0856,
+      "high": 1.0872,
+      "low": 1.0843,
+      "close": 1.0861,
+      "tick_volume": 4523,
+      "real_volume": 0,
+      "spread": 1
+    }
+  ],
+  "count": 1,
+  "has_more": true,
+  "next_from": "2026-03-01T01:00:00+00:00"
+}
 ```
 
 #### GET /api/v1/candles/custom/{symbol}
@@ -182,20 +187,25 @@ curl "http://localhost:9000/api/v1/candles/custom/EURUSD?timeframe=T100&from=202
 
 **Response (same schema as standard candles):**
 ```json
-[
-  {
-    "time": "2026-03-07T10:00:00Z",
-    "symbol": "EURUSD",
-    "timeframe": "M2",
-    "open": 1.0856,
-    "high": 1.0872,
-    "low": 1.0843,
-    "close": 1.0861,
-    "tick_volume": 85,
-    "real_volume": 0,
-    "spread": 1
-  }
-]
+{
+  "data": [
+    {
+      "time": "2026-03-07T10:00:00Z",
+      "symbol": "EURUSD",
+      "timeframe": "M2",
+      "open": 1.0856,
+      "high": 1.0872,
+      "low": 1.0843,
+      "close": 1.0861,
+      "tick_volume": 85,
+      "real_volume": 0,
+      "spread": 1
+    }
+  ],
+  "count": 1,
+  "has_more": false,
+  "next_from": null
+}
 ```
 
 #### GET /api/v1/ticks/{symbol}
@@ -326,6 +336,40 @@ curl "http://192.168.1.4:9000/api/v1/stats/daily?limit=7"
   }
 ]
 ```
+
+### Pagination
+
+All list endpoints (candles, ticks, custom candles) return a **paginated envelope**:
+
+```json
+{
+  "data": [ ... ],
+  "count": 1000,
+  "has_more": true,
+  "next_from": "2026-03-08T12:00:00+00:00"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `data` | array | Items for the current page |
+| `count` | int | Number of items in `data` |
+| `has_more` | bool | `true` if more rows exist beyond the limit |
+| `next_from` | string / null | ISO-8601 timestamp — pass as `from` for the next page |
+
+**Iterating pages:**
+```bash
+# Page 1
+curl "http://localhost:9000/api/v1/candles/EURUSD?timeframe=H1&limit=500"
+# → {"data": [...], "has_more": true, "next_from": "2026-02-15T10:00:00+00:00"}
+
+# Page 2
+curl "http://localhost:9000/api/v1/candles/EURUSD?timeframe=H1&limit=500&from=2026-02-15T10:00:00%2B00:00"
+# Repeat until has_more is false
+```
+
+The Python client SDK provides `get_all_candles()` / `get_all_ticks()` helpers
+that iterate all pages automatically.
 
 ### WebSocket Endpoints — Real-Time Quotes
 
@@ -479,11 +523,21 @@ async def main():
     # List tracked symbols
     symbols = await client.get_symbols()
 
-    # Historical candles
-    candles = await client.get_candles("EURUSD", "H1", limit=100)
+    # Historical candles (paginated response)
+    page = await client.get_candles("EURUSD", "H1", limit=100)
+    candles = page["data"]       # list of candle dicts
+    print(page["has_more"])      # True if more pages available
+    print(page["next_from"])     # pass as from_dt to get next page
 
-    # Historical ticks
-    ticks = await client.get_ticks("EURUSD", limit=500)
+    # Auto-paginate all candles
+    all_candles = await client.get_all_candles("EURUSD", "H1", limit=1000)
+
+    # Historical ticks (paginated)
+    page = await client.get_ticks("EURUSD", limit=500)
+    ticks = page["data"]
+
+    # Auto-paginate all ticks
+    all_ticks = await client.get_all_ticks("EURUSD", limit=5000)
 
     # Real-time tick stream (runs forever)
     async for tick in client.stream_ticks("EURUSD"):
@@ -503,12 +557,17 @@ from src.api.client import MT5ClientSync
 
 client = MT5ClientSync("http://192.168.1.4:9000")
 
-# Get 100 H1 candles
-candles = client.get_candles("EURUSD", "H1", limit=100)
-print(f"Got {len(candles)} candles")
+# Get 100 H1 candles (paginated response)
+page = client.get_candles("EURUSD", "H1", limit=100)
+candles = page["data"]
+print(f"Got {len(candles)} candles, has_more={page['has_more']}")
+
+# Auto-paginate all candles
+all_candles = client.get_all_candles("EURUSD", "H1", limit=1000)
 
 # Get latest ticks
-ticks = client.get_ticks("EURUSD", limit=500)
+page = client.get_ticks("EURUSD", limit=500)
+ticks = page["data"]
 
 # Check health
 print(client.health())
@@ -529,17 +588,34 @@ BASE = "http://192.168.1.4:9000/api/v1"
 r = requests.get(f"{BASE}/health")
 print(r.json())
 
-# Get M5 candles for XAUUSD
+# Get M5 candles for XAUUSD (paginated response)
 r = requests.get(f"{BASE}/candles/XAUUSD", params={
     "timeframe": "M5",
     "from": "2026-03-01T00:00:00Z",
     "limit": 500,
 })
-candles = r.json()
+page = r.json()
+candles = page["data"]            # list of candle dicts
+has_more = page["has_more"]       # True if more pages
+next_from = page["next_from"]     # use as 'from' for next page
 
-# Get tick data
+# Iterate all pages
+all_candles = []
+cursor = "2026-03-01T00:00:00Z"
+while True:
+    r = requests.get(f"{BASE}/candles/XAUUSD", params={
+        "timeframe": "M5", "from": cursor, "limit": 1000,
+    })
+    page = r.json()
+    all_candles.extend(page["data"])
+    if not page["has_more"]:
+        break
+    cursor = page["next_from"]
+
+# Get tick data (also paginated)
 r = requests.get(f"{BASE}/ticks/EURUSD", params={"limit": 1000})
-ticks = r.json()
+page = r.json()
+ticks = page["data"]
 
 # Data coverage
 r = requests.get(f"{BASE}/coverage")

@@ -330,6 +330,61 @@ curl http://<server-ip>:9000/api/v1/stats/daily
 
 ---
 
+## Pagination
+
+All list endpoints (candles, ticks, custom candles) return a **paginated
+envelope** instead of a bare JSON array:
+
+```json
+{
+  "data": [ ... ],
+  "count": 1000,
+  "has_more": true,
+  "next_from": "2026-03-08T12:00:00+00:00"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `data` | array | Items for the current page |
+| `count` | int | Number of items in `data` |
+| `has_more` | bool | `true` if additional rows exist beyond the limit |
+| `next_from` | string / null | ISO-8601 timestamp — pass as `from` for the next page |
+
+### Iterating through pages
+
+```bash
+# Page 1
+curl "http://<server-ip>:9000/api/v1/candles/EURUSD?timeframe=H1&limit=500"
+# → { "data": [...], "has_more": true, "next_from": "2026-02-15T10:00:00+00:00" }
+
+# Page 2 — use next_from as the `from` parameter
+curl "http://<server-ip>:9000/api/v1/candles/EURUSD?timeframe=H1&limit=500&from=2026-02-15T10:00:00%2B00:00"
+
+# Repeat until has_more is false
+```
+
+### Python SDK — automatic pagination
+
+```python
+from src.api.client import MT5Client
+
+client = MT5Client("http://<server-ip>:9000")
+
+# Single page
+page = await client.get_candles("EURUSD", "H1", limit=1000)
+candles = page["data"]
+if page["has_more"]:
+    page2 = await client.get_candles(
+        "EURUSD", "H1", from_dt=page["next_from"], limit=1000,
+    )
+
+# All pages at once
+all_candles = await client.get_all_candles("EURUSD", "H1", limit=1000)
+```
+
+---
+
 ## Python Client SDK
 
 Built-in async and sync clients — see
