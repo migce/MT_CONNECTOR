@@ -142,6 +142,7 @@ async def _health_checker_loop(api_port: int) -> None:
                 # ── DB health ───────────────────────────────────────────
                 db_ok = False
                 db_lat = 0.0
+                db_size_gb = 0.0
                 try:
                     engine = _get_engine()
                     t0 = time.perf_counter()
@@ -149,6 +150,15 @@ async def _health_checker_loop(api_port: int) -> None:
                         await conn.execute(sa_text("SELECT 1"))
                     db_lat = (time.perf_counter() - t0) * 1000
                     db_ok = True
+                    # query DB size (non-critical)
+                    try:
+                        async with engine.connect() as conn:
+                            row = await conn.execute(
+                                sa_text("SELECT pg_database_size(current_database())")
+                            )
+                            db_size_gb = row.scalar() / (1024 ** 3)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
@@ -169,6 +179,7 @@ async def _health_checker_loop(api_port: int) -> None:
                     redis_ok=redis_ok,
                     db_latency_ms=round(db_lat, 1),
                     redis_latency_ms=round(redis_lat, 1),
+                    db_size_gb=round(db_size_gb, 3),
                 )
 
                 # ── Publish poller status to Redis for API /health ─────

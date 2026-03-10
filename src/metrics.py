@@ -133,6 +133,7 @@ class PollerMetrics:
         self.redis_healthy: bool = False
         self.db_latency_ms: float = 0.0
         self.redis_latency_ms: float = 0.0
+        self.db_size_gb: float = 0.0
 
         # ── Uptime / downtime accumulators (seconds) ────────────────
         _now = time.monotonic()
@@ -414,6 +415,7 @@ class PollerMetrics:
         redis_ok: bool,
         db_latency_ms: float = 0.0,
         redis_latency_ms: float = 0.0,
+        db_size_gb: float = 0.0,
     ) -> None:
         now = time.monotonic()
         with self._lock:
@@ -438,6 +440,7 @@ class PollerMetrics:
             self.redis_healthy = redis_ok
             self.db_latency_ms = db_latency_ms
             self.redis_latency_ms = redis_latency_ms
+            self.db_size_gb = db_size_gb
 
     # -- uptime / downtime helpers --------------------------------------
 

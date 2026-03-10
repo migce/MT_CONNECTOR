@@ -488,8 +488,10 @@ def _build_infra_panel(m: PollerMetrics) -> Panel:
     dot = _health_dot(m.db_healthy)
     lbl = Text(" OK", style=S_OK) if m.db_healthy else Text(" Down", style=S_ERR)
     db_up, db_dn, db_pct = m.db_uptime()
+    size_txt = f"{m.db_size_gb:.2f} GB" if m.db_size_gb >= 0.01 else f"{m.db_size_gb * 1024:.1f} MB"
     tbl.add_row(
-        Text.assemble(f" {ICO_DB} TimescaleDB  ", dot, lbl),
+        Text.assemble(f" {ICO_DB} TimescaleDB  ", dot, lbl,
+                      Text(f"  {size_txt}", style=S_DIM)),
         Text.assemble(
             _latency_text(m.db_latency_ms),
             Text("  ↑", style=S_DIM), _pct_colored(db_pct),
