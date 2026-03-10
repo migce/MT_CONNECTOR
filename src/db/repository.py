@@ -212,6 +212,109 @@ async def query_ticks(
         return [dict(r._mapping) for r in result.all()]
 
 
+# ---------------------------------------------------------------
+# Spread history (from candles — fast, or from ticks — granular)
+# ---------------------------------------------------------------
+
+@_db_retry
+async def query_spread_from_candles(
+    symbol: str,
+    timeframe: str = "M1",
+    dt_from: datetime | None = None,
+    dt_to: datetime | None = None,
+    limit: int = 5000,
+) -> list[dict[str, Any]]:
+    """Return spread time-series from the candles table."""
+    clauses = ["symbol = :symbol", "timeframe = :timeframe"]
+    params: dict[str, Any] = {"symbol": symbol, "timeframe": timeframe, "limit": limit}
+
+    if dt_from:
+        clauses.append("time >= :dt_from")
+        params["dt_from"] = dt_from
+    if dt_to:
+        clauses.append("time <= :dt_to")
+        params["dt_to"] = dt_to
+
+    where = " AND ".join(clauses)
+    sql = text(
+        f"SELECT time, spread FROM candles "
+        f"WHERE {where} ORDER BY time ASC LIMIT :limit"
+    )
+
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(sql, params)
+        return [dict(r._mapping) for r in result.all()]
+
+
+@_db_retry
+async def query_spread_from_ticks(
+    symbol: str,
+    dt_from: datetime | None = None,
+    dt_to: datetime | None = None,
+    limit: int = 5000,
+) -> list[dict[str, Any]]:
+    """Return computed spread (ask − bid) from raw ticks."""
+    clauses = ["symbol = :symbol", "ask IS NOT NULL", "bid IS NOT NULL"]
+    params: dict[str, Any] = {"symbol": symbol, "limit": limit}
+
+    if dt_from:
+        clauses.append("time_msc >= :dt_from")
+        params["dt_from"] = dt_from
+    if dt_to:
+        clauses.append("time_msc <= :dt_to")
+        params["dt_to"] = dt_to
+
+    where = " AND ".join(clauses)
+    sql = text(
+        f"SELECT time_msc AS time, (ask - bid) AS spread_raw "
+        f"FROM ticks WHERE {where} ORDER BY time_msc ASC LIMIT :limit"
+    )
+
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(sql, params)
+        return [dict(r._mapping) for r in result.all()]
+
+
+@_db_retry
+async def query_spread_aggregated(
+    symbol: str,
+    bucket: str = "1 hour",
+    dt_from: datetime | None = None,
+    dt_to: datetime | None = None,
+    limit: int = 5000,
+) -> list[dict[str, Any]]:
+    """
+    Aggregate tick-level spread into time buckets using TimescaleDB
+    ``time_bucket``. Returns avg / min / max spread per bucket.
+    """
+    clauses = ["symbol = :symbol", "ask IS NOT NULL", "bid IS NOT NULL"]
+    params: dict[str, Any] = {"symbol": symbol, "bucket": bucket, "limit": limit}
+
+    if dt_from:
+        clauses.append("time_msc >= :dt_from")
+        params["dt_from"] = dt_from
+    if dt_to:
+        clauses.append("time_msc <= :dt_to")
+        params["dt_to"] = dt_to
+
+    where = " AND ".join(clauses)
+    sql = text(
+        f"SELECT time_bucket(:bucket, time_msc) AS time, "
+        f"  avg(ask - bid) AS spread_avg, "
+        f"  min(ask - bid) AS spread_min, "
+        f"  max(ask - bid) AS spread_max "
+        f"FROM ticks WHERE {where} "
+        f"GROUP BY 1 ORDER BY 1 ASC LIMIT :limit"
+    )
+
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(sql, params)
+        return [dict(r._mapping) for r in result.all()]
+
+
 @_db_retry
 async def find_candle_gaps(
     symbol: str,

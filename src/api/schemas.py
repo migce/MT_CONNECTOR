@@ -126,6 +126,28 @@ class UptimeResponse(BaseModel):
 
 
 # ---------------------------------------------------------------
+# Spread history
+# ---------------------------------------------------------------
+
+class SpreadPoint(BaseModel):
+    """Single spread data point (from candles or raw ticks)."""
+    time: datetime
+    spread: float = Field(description="Spread value (points for candles, price units for ticks)")
+
+    model_config = {"from_attributes": True}
+
+
+class SpreadAggPoint(BaseModel):
+    """Aggregated spread over a time bucket."""
+    time: datetime = Field(description="Bucket start time")
+    spread_avg: float = Field(description="Average spread in the bucket")
+    spread_min: float = Field(description="Minimum spread in the bucket")
+    spread_max: float = Field(description="Maximum spread in the bucket")
+
+    model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------
 # WebSocket messages (used for documentation / client SDK)
 # ---------------------------------------------------------------
 

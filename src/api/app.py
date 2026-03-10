@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 
 from src.api.middleware.request_metrics import RequestMetricsMiddleware
-from src.api.routes import candles, coverage, custom_candles, health, stats, symbols, ticks
+from src.api.routes import candles, coverage, custom_candles, health, spread, stats, symbols, ticks
 from src.api.websocket import streams
 from src.config import get_settings
 from src.db.engine import dispose_engine, get_engine
@@ -454,6 +454,14 @@ _OPENAPI_TAGS: list[dict] = [
         ),
     },
     {
+        "name": "spread",
+        "description": (
+            "Spread history: retrieve the bid-ask spread over time from "
+            "candle metadata or raw ticks, with optional time-bucket "
+            "aggregation (avg/min/max)."
+        ),
+    },
+    {
         "name": "stats",
         "description": (
             "API request metrics: total requests, errors, windowed counters "
@@ -588,6 +596,42 @@ Response: PaginatedResponse with TickResponse items
   "count": 1,
   "has_more": false,
   "next_from": null
+}
+```
+
+### GET /api/v1/spread/{symbol}
+Spread history for a symbol. Three modes via `source` parameter:
+
+**source=candles** (default): integer spread from OHLCV candles.  
+**source=ticks**: raw `ask − bid` from tick data (max precision).  
+**source=ticks_agg**: tick spread aggregated into time buckets (avg/min/max).
+
+Parameters:
+- symbol (path, required): Instrument name
+- source (query, default "candles"): candles | ticks | ticks_agg
+- timeframe (query, default "M1"): Candle TF (only for source=candles)
+- bucket (query, default "1 hour"): Time-bucket interval (only for source=ticks_agg). Allowed: 1 min, 5 min, 15 min, 30 min, 1 hour, 4 hours, 1 day
+- from (query, optional): Start datetime, ISO 8601
+- to (query, optional): End datetime, ISO 8601
+- limit (query, default 5000, max 50000): Max data points
+
+Response (source=candles or ticks): PaginatedResponse with SpreadPoint items
+```json
+{
+  "data": [
+    {"time": "2026-03-08T12:00:00Z", "spread": 12}
+  ],
+  "count": 1, "has_more": false, "next_from": null
+}
+```
+
+Response (source=ticks_agg): PaginatedResponse with SpreadAggPoint items
+```json
+{
+  "data": [
+    {"time": "2026-03-08T12:00:00Z", "spread_avg": 0.00021, "spread_min": 0.00015, "spread_max": 0.00035}
+  ],
+  "count": 1, "has_more": false, "next_from": null
 }
 ```
 
@@ -753,6 +797,16 @@ GET /api/v1/candles/custom/EURUSD?timeframe=T500&price=mid&limit=200
 # Repeat until has_more=false
 ```
 
+### Spread analysis: hourly aggregated spread for a day
+```
+GET /api/v1/spread/EURUSD?source=ticks_agg&bucket=1 hour&from=2026-03-08T00:00:00Z&to=2026-03-08T23:59:59Z
+```
+
+### Spread from M5 candles
+```
+GET /api/v1/spread/EURUSD?source=candles&timeframe=M5&limit=1000
+```
+
 ### Check if service is healthy before querying
 ```
 GET /api/v1/health
@@ -834,6 +888,7 @@ def create_app() -> FastAPI:
     app.include_router(custom_candles.router)  # must precede candles (path overlap)
     app.include_router(candles.router)
     app.include_router(ticks.router)
+    app.include_router(spread.router)
     app.include_router(symbols.router)
     app.include_router(health.router)
     app.include_router(coverage.router)
