@@ -2,6 +2,7 @@
 
 > Production-grade REST + WebSocket API for MetaTrader 5 market data.
 > Base URL: http://<server-ip>:9000
+> Supervisor: http://localhost:9100
 > OpenAPI spec: http://<server-ip>:9000/openapi.json
 > Interactive docs: http://<server-ip>:9000/docs
 
@@ -23,6 +24,16 @@ All list endpoints (candles, ticks) return a paginated envelope:
 ```
 
 To fetch all pages: repeat the request with `from=<next_from>` until `has_more` is `false`.
+
+## Price & Money Precision
+
+All price fields (open, high, low, close, bid, ask, price_open, etc.) are normalised
+to the symbol's native digit precision using `Decimal`-based rounding
+(`ROUND_HALF_EVEN`). Money fields (profit, commission, swap, fee, balance, equity,
+margin, etc.) are rounded to 2 decimal places. This eliminates IEEE-754 float artefacts
+like `1.1521100000000002` — you always get clean values such as `1.15211`.
+
+This applies to REST responses, paginated lists and WebSocket streams alike.
 
 ## Endpoints
 
@@ -153,6 +164,7 @@ Response:
 {
   "status": "ok",
   "mt5_connected": true,
+  "trader_connected": true,
   "db_connected": true,
   "redis_connected": true,
   "uptime_sec": 3600.5,
@@ -160,6 +172,9 @@ Response:
   "version": "1.0.0"
 }
 ```
+
+Fields:
+- trader_connected: true if the Windows trader process is running and reporting heartbeats (checked via Redis key `trader:status`, TTL 30s)
 
 ### GET /api/v1/uptime
 Service uptime summary for the last 24 hours and 30 days.
@@ -182,6 +197,76 @@ Response:
   ]
 }
 ```
+
+### GET /api/v1/poller/status
+Full poller dashboard snapshot — the same data rendered by the Rich terminal
+dashboard, exposed as JSON. The poller writes this to Redis every 2 s (TTL 10 s).
+If the poller is offline the key expires and this endpoint returns **503**.
+Also available as a WebSocket stream: `ws://<server-ip>:9000/ws/poller/status`.
+
+Response (truncated):
+```json
+{
+  "mt5_connected": true,
+  "uptime": "02:15:30",
+  "started_at": "2026-03-15T18:00:00+00:00",
+  "ticks_total": 1234567,
+  "ticks_flushed": 1230000,
+  "tick_rate": 85.3,
+  "peak_ticks_sec": 120.5,
+  "tick_buffer_depth": 42,
+  "ticks_1h": 305000,
+  "ticks_12h": 1100000,
+  "ticks_24h": 1234567,
+  "ticks_7d": 8500000,
+  "candles_total": 98000,
+  "redis_pub_count": 49000,
+  "flush_count": 12000,
+  "avg_flush_ms": 3.2,
+  "last_flush_ms": 2.8,
+  "candles_1h": 240, "candles_12h": 2880, "candles_24h": 5760, "candles_7d": 40320,
+  "errors_total": 0,
+  "errors_by_category": {},
+  "last_error_category": null,
+  "last_error_ago_sec": null,
+  "reconnect_count": 0,
+  "tasks": {
+    "tick_loop": true, "candle_loop": true, "flush_loop": true,
+    "heartbeat": true, "gap_scan": true, "backfill_listener": true,
+    "health_checker": true, "stats_flusher": true,
+    "uptime_flusher": true, "uptime_summary": true
+  },
+  "backfill_phase": null,
+  "backfill_current": null,
+  "gap_scan_time": "2026-03-15T20:00:00+00:00",
+  "gaps_found": 0,
+  "on_demand_log": [],
+  "db_healthy": true, "db_latency_ms": 3.5, "db_size_gb": 1.962,
+  "redis_healthy": true, "redis_latency_ms": 0.5,
+  "api_healthy": true, "api_latency_ms": 12.0, "api_avg_latency_ms": 2.5,
+  "api_requests_1h": 450, "api_requests_12h": 5400, "api_requests_24h": 10800,
+  "api_errors_1h": 0,
+  "uptime_session": {
+    "mt5":   {"up_sec": 8100.0, "down_sec": 0.0, "pct": 100.0},
+    "db":    {"up_sec": 8100.0, "down_sec": 0.0, "pct": 100.0},
+    "redis": {"up_sec": 8100.0, "down_sec": 0.0, "pct": 100.0},
+    "api":   {"up_sec": 8100.0, "down_sec": 0.0, "pct": 100.0}
+  },
+  "symbols": {
+    "EURUSD": {"bid": 1.14211, "ask": 1.14215, "tick_count": 125000, "age_sec": 0.3, "stale": false},
+    "GBPUSD": {"bid": 1.32150, "ask": 1.32160, "tick_count": 98000, "age_sec": 0.5, "stale": false}
+  }
+}
+```
+
+Key sections:
+- **ticks_***: tick ingestion metrics and time-window counts
+- **candles_***: candle upsert metrics and time-window counts
+- **errors_by_category**: breakdown by `tick_loop`, `candle_loop`, `flush`, `publish`, `heartbeat`, `gap_scan`, `backfill`
+- **tasks**: alive/dead status of each async task running in the poller
+- **on_demand_log**: last 20 on-demand backfill requests
+- **symbols**: live prices with staleness detection (age > 30 s)
+- **uptime_session**: accumulated uptime since poller started (not historical — use `/uptime` for 24h/30d)
 
 ### GET /api/v1/coverage
 Data availability statistics per symbol, timeframe, and ticks.
@@ -283,6 +368,43 @@ Message format:
 ### Heartbeat
 Server sends `{"event": "ping"}` every 30s. Client may send `{"action": "ping"}` to receive `{"event": "pong"}`.
 
+### ws://<server-ip>:9000/ws/trading/account-info
+Real-time account info for **all** accounts. Full list pushed every ~5s on change.
+
+Message format:
+```json
+{"event": "account_info", "accounts": [{"account_id": 1, "balance": 10000.0, "equity": 10050.5, "margin": 120.0, "margin_free": 9930.5, "margin_level": 8375.4, "leverage": 100, "currency": "USD", "profit": 50.5, "name": "John", "server": "Demo", "trade_mode": 0, "open_positions_count": 3, "open_volume_lots": 0.15, "has_open_positions": true}, ...]}
+```
+
+### ws://<server-ip>:9000/ws/trading/account-info/{account_id}
+Real-time account balance / equity / margin updates for a single account. Pushed every ~5s.
+Includes position summary fields.
+
+Message format:
+```json
+{"account_id": 1, "balance": 10000.0, "equity": 10050.5, "margin": 120.0, "margin_free": 9930.5, "margin_level": 8375.4, "leverage": 100, "currency": "USD", "profit": 50.5, "name": "John", "server": "Demo", "trade_mode": 0, "open_positions_count": 3, "open_volume_lots": 0.15, "has_open_positions": true}
+```
+
+### ws://<server-ip>:9000/ws/trading/positions/{account_id}
+Real-time open position snapshots. Full list pushed every ~5s.
+
+Message format:
+```json
+{"account_id": 1, "positions": [{"ticket": 123456, "symbol": "EURUSD", "type": 0, "volume": 0.01, "price_open": 1.0856, "price_current": 1.0861, "profit": 5.0, "sl": 1.08, "tp": 1.09}]}
+```
+
+### ws://<server-ip>:9000/ws/poller/status
+Real-time poller dashboard snapshot via dedicated Redis connection.
+
+Behaviour:
+1. **On connect** — immediately sends the current full snapshot.
+2. **Every ~2 s** — sends an updated snapshot when data changes.
+3. **Every 30 s** — heartbeat `{"event": "ping"}`.
+
+Message format — same as the REST endpoint (40+ fields): `mt5_connected`, `uptime`,
+`ticks_total`, `tick_rate`, `candles_total`, errors breakdown, tasks alive, backfill
+log, infra health, API stats, session uptime, live prices per symbol.
+
 ## Common Patterns for AI Agents
 
 ### Fetch latest 100 H1 candles
@@ -329,6 +451,14 @@ GET /api/v1/uptime
 # Review period_24h and period_30d arrays for all services
 ```
 
+### Full poller dashboard via API
+```
+GET /api/v1/poller/status
+WS  ws://<server-ip>:9000/ws/poller/status
+# Same data as the Rich terminal dashboard: ticks, candles, errors, tasks, live prices
+# REST returns 503 if poller is offline; WS pushes changes every ~2s
+```
+
 ### Discover available data range
 ```
 GET /api/v1/coverage
@@ -347,7 +477,276 @@ Error response format:
 {"detail": "Invalid timeframe 'X'. Allowed: ['M1', 'M5', 'M15', 'H1', 'H4', 'D1']"}
 ```
 
+## Process Supervisor (port 9100)
+
+Lightweight watchdog that auto-starts poller + trader, monitors them, and restarts
+on crash. Exposes an API for manual control. **Concurrent-safe**: all start/stop/restart
+operations are locked per-service — duplicate requests while an operation is in progress
+return HTTP 409.
+
+The supervisor adopts already-running processes on startup (via `wmic` process scan).
+
+Run: `python -m src.supervisor`
+Auto-start install: `.\scripts\install_supervisor.ps1`
+
+### GET /status
+Returns supervisor PID, watchdog interval, and per-service state:
+```json
+{
+  "supervisor_pid": 12345,
+  "watchdog_interval_sec": 5,
+  "services": {
+    "poller": {"name": "poller", "desired": "running", "alive": true, "pid": 6789,
+               "uptime_sec": 3600.1, "restarts": 0, "operation_in_progress": false},
+    "trader": {"name": "trader", "desired": "running", "alive": true, "pid": 6790,
+               "uptime_sec": 3600.1, "restarts": 0, "operation_in_progress": false}
+  }
+}
+```
+
+### POST /services/{name}/start
+Start a stopped service. Returns 409 if an operation is already in progress.
+
+### POST /services/{name}/stop
+Stop a service. Sets desired state to `stopped` (watchdog will NOT restart it).
+Returns 409 if an operation is already in progress.
+
+### POST /services/{name}/restart
+Graceful restart: stop → start, increments restart counter.
+Returns 409 if an operation is already in progress.
+
+### POST /services/start-all / stop-all
+Bulk start or stop all services.
+
+Service names: `poller`, `trader`.
+
+### API Proxy (port 9000)
+
+The main API server exposes the same supervisor endpoints under
+`/api/v1/supervisor/…` — they proxy to the native supervisor:
+
+- `GET  /api/v1/supervisor/status`
+- `POST /api/v1/supervisor/services/{name}/start`
+- `POST /api/v1/supervisor/services/{name}/stop`
+- `POST /api/v1/supervisor/services/{name}/restart`
+- `POST /api/v1/supervisor/services/start-all`
+- `POST /api/v1/supervisor/services/stop-all`
+
+## Dashboard Monitoring Mode
+
+When `python -m src.poller_main --dashboard` is run while the poller is already
+running, it enters **monitoring mode** instead of exiting with an error:
+
+- Shows the same Rich dashboard with all panels (live prices, ticks, candles, etc.)
+- Data is read from Redis (`poller:status` key) in real time
+- Header shows **MONITORING ◉** badge with yellow border
+- Footer shows "Read-only — connected to running poller"
+- No MT5 connection or data collection occurs — purely display-only
+
 ## Rate Limits
 
 Backfill triggers are rate-limited per symbol to prevent MT5 overload.
 Normal queries against cached data have no rate limit.
+
+## Admin API — Trading Accounts
+
+### GET /api/v1/admin/accounts
+List all registered trading accounts (passwords masked).
+
+### GET /api/v1/admin/accounts/{account_id}
+Get a single trading account by ID.
+
+### POST /api/v1/admin/accounts
+Create a new trading account.
+
+A portable MT5 terminal is automatically provisioned for each account under
+`MT5_PORTABLE_DIR/{login}/` (default `C:\MT5_Portable\{login}\`).  The `mt5_path`
+is set automatically — callers never need to specify it.
+
+Request body:
+```json
+{
+  "label": "Demo-1",
+  "mt5_login": 12345,
+  "mt5_password": "secret",
+  "mt5_server": "Broker-Demo",
+  "enabled": true,
+  "verify_credentials": false
+}
+```
+
+Fields:
+- verify_credentials (bool, default false): If true, performs a real MT5 login via the trader process before saving. Returns 400 if credentials are invalid.
+
+Responses: 201 Created, 400 (invalid credentials when verify=true), 409 (duplicate login or label).
+
+### PATCH /api/v1/admin/accounts/{account_id}
+Update fields of an existing account. Only pass changed fields.
+
+Request body (partial update):
+```json
+{
+  "mt5_password": "new_pass",
+  "verify_credentials": true
+}
+```
+
+Behavior:
+- Password-only update works without triggering duplicate login/label errors.
+- Sending the same login/label values as the current record does not conflict.
+- If `verify_credentials=true`, the API merges patch fields with the existing record and verifies the combined credentials via MT5 before saving.
+- If changing `mt5_login` or `mt5_server` with `verify_credentials=true`, `mt5_password` must be provided.
+- Changing `mt5_login` auto-updates `mt5_path` to the new portable terminal path.
+
+Responses: 200, 400 (invalid credentials / missing password), 404 (not found), 409 (duplicate login or label).
+
+### POST /api/v1/admin/accounts/verify
+Verify MT5 credentials without creating or modifying any account record.
+Requires the trader process to be running.
+
+Request body:
+```json
+{
+  "mt5_login": 12345,
+  "mt5_password": "secret",
+  "mt5_server": "Broker-Server",
+  "mt5_path": null,
+  "account_id": null
+}
+```
+
+Fields:
+- mt5_path (optional): Path to terminal64.exe. Uses default from .env if null.
+- account_id (optional): Existing account ID for context (not used for creation).
+
+Response (200 OK):
+```json
+{
+  "ok": true,
+  "account_name": "John Doe",
+  "server": "Broker-Server",
+  "balance": 765.32,
+  "leverage": 1000,
+  "currency": "USD",
+  "message": "MT5 login successful"
+}
+```
+
+Response (400 Bad Request):
+```json
+{"detail": "Invalid MT5 credentials"}
+```
+
+Other error details: "MT5 terminal path is invalid", "Unknown MT5 server", "MT5 initialize failed".
+
+### POST /api/v1/admin/accounts/{account_id}/verify-update
+Verify merged credentials for an existing account without saving anything.
+Merges current DB record with the provided partial update, then performs a real MT5 login.
+
+Request body: same as PATCH (any fields from AccountUpdate, including `mt5_password`).
+
+Response (200 OK): same as `/verify` — `{"ok": true, "account_name": ..., ...}`
+Response (400): `{"detail": "Invalid MT5 credentials"}`
+Response (404): `{"detail": "Account not found"}`
+
+Use case: validate a password change before committing it via PATCH.
+
+### DELETE /api/v1/admin/accounts/{account_id}
+Delete a trading account. Synced deals/positions are NOT deleted.
+Delete is immediately consistent — the account vanishes from list/get right away.
+
+### POST /api/v1/admin/accounts/{account_id}/sync-history
+Force a full deal-history resync from MT5 for the given account.
+Sets a Redis flag that the trader process checks on its next sync cycle (~60 s).
+The trader then pulls **all deals from 2000-01-01 to now** and upserts them into the DB.
+Returns 202 Accepted immediately — the sync happens asynchronously.
+
+Response (202 Accepted):
+```json
+{
+  "status": "accepted",
+  "account_id": 1,
+  "message": "Full deal history resync requested. Will complete within ~60 seconds."
+}
+```
+
+Response (404): `{"detail": "Account not found"}`
+
+Use cases:
+- Account was added before full-history sync was implemented and has incomplete data.
+- Deals appear missing or the history range seems truncated.
+- After reconnecting an account that was offline for a while.
+
+## Trading API — Deals, Positions & Account Info
+
+### GET /api/v1/trading/deals/{account_id}
+Closed deal history for a trading account.
+
+The trader process automatically pulls **full deal history** from MT5 when an account
+is first added (from 2000-01-01), then syncs incrementally every 60 s from the last
+known deal. To force a full re-pull, use `POST /api/v1/admin/accounts/{id}/sync-history`.
+
+Parameters:
+- account_id (path, required): Account ID
+- symbol (query, optional): Filter by symbol
+- from (query, optional): Start datetime (default: 30 days ago)
+- to (query, optional): End datetime (default: now)
+- limit (query, default 1000, max 50000): Max deals per page
+
+Response: PaginatedResponse with DealResponse items (ticket, order, time, type, entry, symbol, volume, price, commission, swap, profit, fee, comment)
+
+### GET /api/v1/trading/positions/{account_id}
+Currently open positions for a trading account.
+
+Parameters:
+- account_id (path, required): Account ID
+- symbol (query, optional): Filter by symbol
+
+Response: list of PositionResponse items (ticket, time, type, symbol, volume, price_open, price_current, sl, tp, swap, profit)
+
+### GET /api/v1/trading/account-info/{account_id}
+Balance, equity, leverage, and margin snapshot for a single account. Updated every ~10s by the trader process.
+
+Parameters:
+- account_id (path, required): Account ID
+
+Response:
+```json
+{
+  "account_id": 1,
+  "balance": 765.32,
+  "equity": 765.32,
+  "margin": 0.0,
+  "margin_free": 765.32,
+  "margin_level": 0.0,
+  "leverage": 1000,
+  "currency": "USD",
+  "profit": 0.0,
+  "name": "John Doe",
+  "server": "Broker-Server",
+  "trade_mode": 2,
+  "open_positions_count": 0,
+  "open_volume_lots": 0.0,
+  "has_open_positions": false,
+  "updated_at": "2026-03-15T14:53:30Z"
+}
+```
+
+Fields:
+- balance: Account balance (deposit currency)
+- equity: Balance + unrealized P&L
+- margin: Used margin
+- margin_free: Available margin (equity − margin)
+- margin_level: Margin level % (equity / margin × 100), 0 if no margin used
+- leverage: Account leverage, e.g. 1000 means 1:1000
+- currency: Account deposit currency (USD, EUR, etc.)
+- profit: Total unrealized profit across all open positions
+- trade_mode: 0 = disabled, 1 = full access, 2 = investor (read-only)
+- open_positions_count: Number of currently open positions (0 if flat)
+- open_volume_lots: Total volume in lots across all open positions
+- has_open_positions: Boolean, true when open_positions_count > 0
+
+### GET /api/v1/trading/account-info
+Balance, equity, leverage, and margin for all trading accounts.
+
+Response: list of AccountInfoResponse items (same schema as above)

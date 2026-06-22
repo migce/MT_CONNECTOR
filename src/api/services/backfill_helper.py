@@ -12,10 +12,12 @@ Provides ``maybe_backfill_candles`` and ``maybe_backfill_ticks`` which:
 
 from __future__ import annotations
 
+import time as _time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import structlog
+from fastapi import HTTPException
 
 from src.config import Timeframe
 from src.db import repository as repo
@@ -30,9 +32,35 @@ _TICK_GAP_TOLERANCE_SEC = 60     # 1 minute
 # Market is open ~5/7 of the week; add 50 % safety margin for gaps/weekends
 _MARKET_HOURS_FACTOR = 1.5
 
+# -----------------------------------------------------------------------
+# Backfill cooldown — avoid re-triggering identical backfills.
+# -----------------------------------------------------------------------
+_BACKFILL_COOLDOWN_SEC = 300  # 5 minutes
+_recent_backfills: dict[str, float] = {}  # "SYMBOL:TF_OR_TYPE" → monotonic ts
 
-def _estimate_from_for_limit(timeframe: str, limit: int) -> datetime:
-    """Estimate how far back we need to go to satisfy *limit* candles."""
+
+def _backfill_on_cooldown(symbol: str, key: str) -> bool:
+    cache_key = f"{symbol}:{key}"
+    ts = _recent_backfills.get(cache_key)
+    if ts is None:
+        return False
+    return (_time.monotonic() - ts) < _BACKFILL_COOLDOWN_SEC
+
+
+def _record_backfill(symbol: str, key: str) -> None:
+    _recent_backfills[f"{symbol}:{key}"] = _time.monotonic()
+
+
+def _estimate_from_for_limit(
+    timeframe: str,
+    limit: int,
+    reference_time: datetime | None = None,
+) -> datetime:
+    """Estimate how far back we need to go to satisfy *limit* candles.
+
+    When *reference_time* is provided the lookback is computed relative
+    to it (used for ``to``-only requests).  Otherwise ``now()`` is used.
+    """
     try:
         tf = Timeframe(timeframe)
     except ValueError:
@@ -40,7 +68,8 @@ def _estimate_from_for_limit(timeframe: str, limit: int) -> datetime:
     else:
         tf_sec = tf.seconds
     needed_seconds = int(tf_sec * limit * _MARKET_HOURS_FACTOR)
-    return datetime.now(timezone.utc) - timedelta(seconds=needed_seconds)
+    ref = reference_time or datetime.now(timezone.utc)
+    return ref - timedelta(seconds=needed_seconds)
 
 
 async def maybe_backfill_candles(
@@ -56,7 +85,23 @@ async def maybe_backfill_candles(
     """
     rows = await repo.query_candles(symbol, timeframe, dt_from, dt_to, limit)
 
-    if not _needs_backfill_candles(rows, dt_from, limit, timeframe):
+    if not _needs_backfill_candles(rows, dt_from, limit, timeframe, dt_to):
+        return rows
+
+    # Skip if we recently triggered a backfill for this exact combo
+    if _backfill_on_cooldown(symbol, timeframe):
+        return rows
+
+    # Soft rate-limit: return available data instead of raising 429
+    from src.api.services.validation import backfill_limiter
+    try:
+        await backfill_limiter.check(symbol)
+    except HTTPException:
+        logger.warning(
+            "backfill_rate_limited",
+            symbol=symbol,
+            timeframe=timeframe,
+        )
         return rows
 
     from src.api.app import get_backfill_requester
@@ -68,9 +113,14 @@ async def maybe_backfill_candles(
     if dt_from is not None:
         bf_from = dt_from
     else:
-        # No explicit from — estimate based on limit & timeframe
-        bf_from = _estimate_from_for_limit(timeframe, limit)
+        # Estimate lookback relative to dt_to (or now if not set)
+        ref = dt_to or datetime.now(timezone.utc)
+        bf_from = _estimate_from_for_limit(timeframe, limit, reference_time=ref)
     bf_to = dt_to or datetime.now(timezone.utc)
+
+    # Sanity check: bf_from must be before bf_to
+    if bf_from >= bf_to:
+        return rows
 
     logger.info(
         "on_demand_backfill_trigger",
@@ -88,6 +138,9 @@ async def maybe_backfill_candles(
         timeframe=timeframe,
         timeout=60.0,
     )
+
+    # Record cooldown only after the attempt (so failures can be retried)
+    _record_backfill(symbol, timeframe)
 
     if result and result.get("status") == "ok" and result.get("rows", 0) > 0:
         # Re-query with the new data
@@ -111,6 +164,18 @@ async def maybe_backfill_ticks(
     if not _needs_backfill_ticks(rows, dt_from, limit):
         return rows
 
+    # Skip if we recently triggered a backfill for ticks on this symbol
+    if _backfill_on_cooldown(symbol, "ticks"):
+        return rows
+
+    # Soft rate-limit: return available data instead of raising 429
+    from src.api.services.validation import backfill_limiter
+    try:
+        await backfill_limiter.check(symbol)
+    except HTTPException:
+        logger.warning("backfill_rate_limited", symbol=symbol, data_type="ticks")
+        return rows
+
     from src.api.app import get_backfill_requester
     requester = get_backfill_requester()
     if requester is None:
@@ -121,8 +186,12 @@ async def maybe_backfill_ticks(
     else:
         # Estimate: assume ~4 ticks/second on average for major pairs
         needed_seconds = max(limit // 4, 60)
-        bf_from = datetime.now(timezone.utc) - timedelta(seconds=needed_seconds)
+        ref = dt_to or datetime.now(timezone.utc)
+        bf_from = ref - timedelta(seconds=needed_seconds)
     bf_to = dt_to or datetime.now(timezone.utc)
+
+    if bf_from >= bf_to:
+        return rows
 
     logger.info(
         "on_demand_backfill_ticks_trigger",
@@ -138,6 +207,8 @@ async def maybe_backfill_ticks(
         dt_to=bf_to,
         timeout=60.0,
     )
+
+    _record_backfill(symbol, "ticks")
 
     if result and result.get("status") == "ok" and result.get("rows", 0) > 0:
         rows = await repo.query_ticks(symbol, dt_from, dt_to, limit)
@@ -155,11 +226,28 @@ def _needs_backfill_candles(
     dt_from: datetime | None,
     limit: int = 1000,
     timeframe: str = "M1",
+    dt_to: datetime | None = None,
 ) -> bool:
     """Return True if data appears to be missing for the requested range."""
     # No explicit start but got fewer rows than requested → need more data
     if dt_from is None:
-        return len(rows) < limit
+        if len(rows) < limit:
+            return True
+        # Even if we have enough rows, check if the latest row is close
+        # to dt_to.  If there's a large gap the DB may hold only old data
+        # that doesn't cover the requested period.
+        if dt_to is not None and rows:
+            latest = rows[-1].get("time")
+            if latest is not None:
+                if not getattr(latest, "tzinfo", None):
+                    latest = latest.replace(tzinfo=timezone.utc)
+                _dt_to = dt_to
+                if not getattr(_dt_to, "tzinfo", None):
+                    _dt_to = _dt_to.replace(tzinfo=timezone.utc)
+                gap = (_dt_to - latest).total_seconds()
+                if gap > _CANDLE_GAP_TOLERANCE_SEC:
+                    return True
+        return False
 
     # Empty result for an explicit from → definitely missing
     if not rows:

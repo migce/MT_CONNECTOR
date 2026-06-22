@@ -18,7 +18,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from src.api.schemas import CandleResponse, PaginatedResponse
 from src.api.services.backfill_helper import maybe_backfill_candles
-from src.api.services.validation import backfill_limiter, validate_symbol
+from src.api.services.validation import validate_symbol
 from src.config import Timeframe
 
 router = APIRouter(prefix="/api/v1", tags=["candles"])
@@ -60,9 +60,18 @@ async def get_candles(
         le=50000,
         description="Maximum number of candles to return.",
     ),
+    bars: Optional[int] = Query(
+        default=None,
+        ge=1,
+        le=50000,
+        description="Alias for limit — number of bars to return.",
+    ),
 ) -> PaginatedResponse[CandleResponse]:
     # Validate symbol exists in configuration
     symbol = validate_symbol(symbol)
+
+    # bars overrides limit when provided
+    effective_limit = bars if bars is not None else limit
 
     # Validate timeframe
     try:
@@ -74,22 +83,31 @@ async def get_candles(
                    f"Allowed: {[t.value for t in Timeframe]}",
         )
 
-    # Rate-limit backfill triggers
-    await backfill_limiter.check(symbol)
+    # For "latest N" queries (no from, optionally capped by to) the DB
+    # uses a DESC/ASC subquery.  The "+1 fetch" trick doesn't apply.
+    use_latest_n = not from_dt
+    fetch_limit = effective_limit if use_latest_n else effective_limit + 1
 
-    # Fetch limit + 1 to detect whether more rows exist
     rows = await maybe_backfill_candles(
         symbol=symbol,
         timeframe=timeframe.upper(),
         dt_from=from_dt,
         dt_to=to_dt,
-        limit=limit + 1,
+        limit=fetch_limit,
     )
 
-    has_more = len(rows) > limit
+    if use_latest_n:
+        data = [CandleResponse(**r) for r in rows]
+        return PaginatedResponse(
+            data=data,
+            count=len(data),
+            has_more=len(rows) >= effective_limit,
+        )
+
+    has_more = len(rows) > effective_limit
     if has_more:
-        next_from = rows[limit]["time"].isoformat()
-        rows = rows[:limit]
+        next_from = rows[effective_limit]["time"].isoformat()
+        rows = rows[:effective_limit]
     else:
         next_from = None
 
@@ -100,4 +118,3 @@ async def get_candles(
         has_more=has_more,
         next_from=next_from,
     )
-    return [CandleResponse(**r) for r in rows]

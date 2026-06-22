@@ -175,10 +175,57 @@ class Settings(BaseSettings):
         default=r"C:\Program Files\MetaTrader 5\terminal64.exe",
         description="Path to MetaTrader 5 terminal executable.",
     )
+    mt5_portable_dir: str = Field(
+        default=r"C:\MT5_Portable",
+        description="Directory for per-account portable MT5 terminal copies.",
+    )
     mt5_login: int = Field(..., description="MT5 account login number.")
     mt5_password: str = Field(..., description="MT5 account password.")
     mt5_server: str = Field(..., description="MT5 broker server name.")
     mt5_timeout: int = Field(default=30000, description="MT5 connection timeout (ms).")
+    mt5_history_lookahead_hours: int = Field(
+        default=6,
+        description=(
+            "Hours added to trader history-deals query upper bound. "
+            "Helps brokers where server time is ahead of UTC."
+        ),
+    )
+    mt5_server_time_offset_hours: int = Field(
+        default=0,
+        description=(
+            "MT5 server time offset versus UTC used for trading timestamps. "
+            "Positive values mean server time is ahead of UTC (e.g. 3)."
+        ),
+    )
+    trader_incremental_overlap_days: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Days overlapped on every trader deal sync. "
+            "Protects against late MT5 history updates and missed close deals."
+        ),
+    )
+    trader_startup_catchup_days: int = Field(
+        default=14,
+        ge=1,
+        description=(
+            "History window reread for every account when trader starts. "
+            "Used after crashes/reboots to recover missed deals."
+        ),
+    )
+    trader_deep_resync_interval_hours: int = Field(
+        default=1,
+        ge=0,
+        description=(
+            "How often trader rereads a wider deal-history window. "
+            "Set 0 to disable periodic deep resync."
+        ),
+    )
+    trader_deep_resync_days: int = Field(
+        default=14,
+        ge=1,
+        description="Deal-history lookback used by periodic trader deep resync.",
+    )
 
     # --- Symbols (stored as raw CSV string to avoid pydantic-settings JSON parse) ---
     symbols_csv: str = Field(

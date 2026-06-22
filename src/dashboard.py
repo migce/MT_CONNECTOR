@@ -33,7 +33,198 @@ from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 
-from src.metrics import PollerMetrics
+from src.metrics import OnDemandEntry, PollerMetrics, SymbolTickInfo
+
+
+# ── MetricsSnapshot — duck-typed PollerMetrics for monitoring mode ───────
+
+class MetricsSnapshot:
+    """Read-only proxy that presents a ``poller:status`` JSON dict
+    with the same interface the dashboard panels expect from
+    :class:`PollerMetrics`.
+    """
+
+    def __init__(self, data: dict | None = None) -> None:
+        self._data: dict = data or {}
+        self._update_ts: float = _time.monotonic()
+        # Populated from JSON
+        self.uptime_24h: dict = {}
+        self.uptime_30d: dict = {}
+        self._apply(self._data)
+
+    # -- bulk update from a new Redis snapshot ----------------------------
+
+    def update(self, data: dict) -> None:
+        self._data = data
+        self._update_ts = _time.monotonic()
+        self._apply(data)
+
+    def _apply(self, d: dict) -> None:
+        # scalars
+        self.mt5_connected: bool = d.get("mt5_connected", False)
+        self.ticks_total: int = d.get("ticks_total", 0)
+        self.ticks_flushed_total: int = d.get("ticks_flushed", 0)
+        self.peak_ticks_sec: float = d.get("peak_ticks_sec", 0.0)
+        self.tick_buffer_depth: int = d.get("tick_buffer_depth", 0)
+        self.candles_total: int = d.get("candles_total", 0)
+        self.redis_pub_count: int = d.get("redis_pub_count", 0)
+        self.flush_count: int = d.get("flush_count", 0)
+        self.last_flush_ms: float = d.get("last_flush_ms", 0.0)
+        self.reconnect_count: int = d.get("reconnect_count", 0)
+        self.backfill_phase: str = d.get("backfill_phase") or ""
+        self.backfill_current: str = d.get("backfill_current") or ""
+        self.gaps_found: int = d.get("gaps_found", 0)
+        self.last_error_category: str = d.get("last_error_category") or ""
+        self.db_healthy: bool = d.get("db_healthy", False)
+        self.db_latency_ms: float = d.get("db_latency_ms", 0.0)
+        self.db_size_gb: float = d.get("db_size_gb", 0.0)
+        self.redis_healthy: bool = d.get("redis_healthy", False)
+        self.redis_latency_ms: float = d.get("redis_latency_ms", 0.0)
+        self.api_healthy: bool = d.get("api_healthy", False)
+        self.api_latency_ms: float = d.get("api_latency_ms", 0.0)
+        self.api_avg_latency_ms: float = d.get("api_avg_latency_ms", 0.0)
+        self.api_requests_1h: int = d.get("api_requests_1h", 0)
+        self.api_requests_12h: int = d.get("api_requests_12h", 0)
+        self.api_requests_24h: int = d.get("api_requests_24h", 0)
+        self.api_errors_1h: int = d.get("api_errors_1h", 0)
+        self.errors: dict = d.get("errors_by_category", {})
+        self.task_alive: dict[str, bool] = d.get("tasks", {})
+
+        # pre-computed values cache
+        self._uptime_str: str = d.get("uptime", "00:00:00")
+        self._tick_rate: float = d.get("tick_rate", 0.0)
+        self._avg_flush: float = d.get("avg_flush_ms", 0.0)
+        self._errors_total: int = d.get("errors_total", 0)
+        self._ticks_1h: int = d.get("ticks_1h", 0)
+        self._ticks_12h: int = d.get("ticks_12h", 0)
+        self._ticks_24h: int = d.get("ticks_24h", 0)
+        self._ticks_7d: int = d.get("ticks_7d", 0)
+        self._candles_1h: int = d.get("candles_1h", 0)
+        self._candles_12h: int = d.get("candles_12h", 0)
+        self._candles_24h: int = d.get("candles_24h", 0)
+        self._candles_7d: int = d.get("candles_7d", 0)
+
+        # last_error_time as monotonic reference
+        ago = d.get("last_error_ago_sec")
+        self.last_error_time: float = (_time.monotonic() - ago) if ago else 0.0
+
+        # gap_scan_time
+        gs = d.get("gap_scan_time")
+        self.last_gap_scan_time: datetime | None = (
+            datetime.fromisoformat(gs) if gs else None
+        )
+
+        # uptime_session → tuples
+        sess = d.get("uptime_session", {})
+        self._mt5_uptime = self._parse_uptime(sess.get("mt5"))
+        self._db_uptime = self._parse_uptime(sess.get("db"))
+        self._redis_uptime = self._parse_uptime(sess.get("redis"))
+        self._api_uptime = self._parse_uptime(sess.get("api"))
+
+        # symbol_ticks → SymbolTickInfo objects
+        now_mono = _time.monotonic()
+        self.symbol_ticks: dict[str, SymbolTickInfo] = {}
+        for sym, info in d.get("symbols", {}).items():
+            age = info.get("age_sec")
+            self.symbol_ticks[sym] = SymbolTickInfo(
+                bid=info.get("bid", 0.0),
+                ask=info.get("ask", 0.0),
+                last_tick_ts=(now_mono - age) if age is not None else 0.0,
+                count=info.get("tick_count", 0),
+            )
+
+        # on_demand_log → OnDemandEntry objects
+        self.on_demand_log: list[OnDemandEntry] = []
+        for e in d.get("on_demand_log", []):
+            try:
+                self.on_demand_log.append(OnDemandEntry(
+                    ts=datetime.fromisoformat(e["ts"]),
+                    symbol=e["symbol"],
+                    data_type=e["data_type"],
+                    timeframe=e.get("timeframe"),
+                    rows=e["rows"],
+                    status=e["status"],
+                    elapsed_sec=e["elapsed_sec"],
+                ))
+            except (KeyError, ValueError):
+                pass
+
+        # poller_started_at (for header)
+        sa = d.get("started_at")
+        self.poller_started_at: datetime = (
+            datetime.fromisoformat(sa) if sa else datetime.now(timezone.utc)
+        )
+
+    @staticmethod
+    def _parse_uptime(obj: dict | None) -> tuple[float, float, float]:
+        if not obj:
+            return (0.0, 0.0, 0.0)
+        return (obj.get("up_sec", 0.0), obj.get("down_sec", 0.0), obj.get("pct", 0.0))
+
+    # -- methods matching PollerMetrics API used by panels ----------------
+
+    def uptime_str(self) -> str:
+        return self._uptime_str
+
+    def ticks_per_sec(self) -> float:
+        return self._tick_rate
+
+    def update_peak_rate(self) -> float:
+        return self._tick_rate
+
+    def avg_flush_ms(self) -> float:
+        return self._avg_flush
+
+    def total_errors(self) -> int:
+        return self._errors_total
+
+    def ticks_in_window(self, seconds: float) -> int:
+        if seconds <= 3600:
+            return self._ticks_1h
+        if seconds <= 43200:
+            return self._ticks_12h
+        if seconds <= 86400:
+            return self._ticks_24h
+        return self._ticks_7d
+
+    def candles_in_window(self, seconds: float) -> int:
+        if seconds <= 3600:
+            return self._candles_1h
+        if seconds <= 43200:
+            return self._candles_12h
+        if seconds <= 86400:
+            return self._candles_24h
+        return self._candles_7d
+
+    def mt5_uptime(self) -> tuple[float, float, float]:
+        return self._mt5_uptime
+
+    def db_uptime(self) -> tuple[float, float, float]:
+        return self._db_uptime
+
+    def redis_uptime(self) -> tuple[float, float, float]:
+        return self._redis_uptime
+
+    def api_uptime(self) -> tuple[float, float, float]:
+        return self._api_uptime
+
+    def stale_symbols(self, threshold_sec: float = 30.0) -> list[str]:
+        now = _time.monotonic()
+        return [
+            sym for sym, info in self.symbol_ticks.items()
+            if info.last_tick_ts > 0 and (now - info.last_tick_ts) > threshold_sec
+        ]
+
+    @staticmethod
+    def _fmt_duration(secs: float) -> str:
+        s = int(secs)
+        if s < 60:
+            return f"{s}s"
+        h, rem = divmod(s, 3600)
+        m, s2 = divmod(rem, 60)
+        if h:
+            return f"{h}h {m:02d}m {s2:02d}s"
+        return f"{m}m {s2:02d}s"
 
 # ── Refresh ──────────────────────────────────────────────────────────────
 _REFRESH_INTERVAL = 1.0
@@ -450,6 +641,20 @@ def _build_candle_panel(m: PollerMetrics) -> Panel:
         Text(""),
     )
 
+    # Row 3b: Last error details (only when errors exist)
+    if total_err and m.last_error_category:
+        now = _time.monotonic()
+        tbl.add_row(
+            Text.assemble(
+                Text("   ↳ ", style=S_DIM),
+                Text(m.last_error_category, style=S_ERR),
+                Text("  ", style=S_DIM),
+                _ts_ago(m.last_error_time, now),
+                Text(" ago", style=S_DIM),
+            ),
+            Text(""),
+        )
+
     tbl.add_row(Text("   ─ ─ ─ ─ ─ ─ ─ ─ ─", style=S_DIM), Text(""))
 
     # Time windows (compact: pairwise)
@@ -668,44 +873,60 @@ def _build_prices_panel(m: PollerMetrics) -> Panel:
 # Header & Footer
 # ═══════════════════════════════════════════════════════════════════════
 
-def _build_header(m: PollerMetrics) -> Panel:
+def _build_header(m, *, monitoring: bool = False) -> Panel:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    title = Text.assemble(
+    parts: list[Text | str] = [
         Text("  ◈ ", style=Style(color=_SAPPHIRE, bold=True)),
         Text("MT5 POLLER", style=Style(color=_BLUE, bold=True)),
-        Text("  DASHBOARD", style=Style(color=_OVERLAY)),
+    ]
+    if monitoring:
+        parts.append(Text("  MONITORING ◉", style=Style(color=_YELLOW, bold=True)))
+    else:
+        parts.append(Text("  DASHBOARD", style=Style(color=_OVERLAY)))
+    parts += [
         Text("   │   ", style=Style(color=_SURFACE1)),
         Text(f"{ICO_CLOCK} ", style=Style(color=_OVERLAY)),
         Text(now, style=Style(color=_SUBTEXT)),
         Text("   │   ", style=Style(color=_SURFACE1)),
         Text(f"{ICO_CLOCK} ", style=Style(color=_OVERLAY)),
         Text(f"up {m.uptime_str()}", style=Style(color=_TEAL)),
-    )
+    ]
+    title = Text.assemble(*parts)
+    border = Style(color=_YELLOW) if monitoring else Style(color=_SURFACE1)
     return Panel(
         title,
         style=Style(color=_TEXT),
-        border_style=Style(color=_SURFACE1),
+        border_style=border,
         padding=(0, 0),
     )
 
 
-def _build_footer() -> Text:
-    return Text.assemble(
+def _build_footer(*, monitoring: bool = False) -> Text:
+    parts: list[Text | str] = [
         Text(f"  {ICO_TASK} ", style=Style(color=_SURFACE1)),
-        Text("Ctrl+X", style=Style(color=_OVERLAY, bold=True)),
+        Text("Ctrl+C", style=Style(color=_OVERLAY, bold=True)),
         Text(" to quit", style=Style(color=_OVERLAY)),
         Text("   │   ", style=Style(color=_SURFACE1)),
         Text("Refresh 1s", style=Style(color=_OVERLAY)),
-        Text("   │   ", style=Style(color=_SURFACE1)),
-        Text("MT5 Connector", style=Style(color=_SURFACE1)),
-    )
+    ]
+    if monitoring:
+        parts += [
+            Text("   │   ", style=Style(color=_SURFACE1)),
+            Text("Read-only — connected to running poller", style=Style(color=_YELLOW)),
+        ]
+    else:
+        parts += [
+            Text("   │   ", style=Style(color=_SURFACE1)),
+            Text("MT5 Connector", style=Style(color=_SURFACE1)),
+        ]
+    return Text.assemble(*parts)
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # Full layout
 # ═══════════════════════════════════════════════════════════════════════
 
-def _build_layout(m: PollerMetrics) -> Layout:
+def _build_layout(m, *, monitoring: bool = False) -> Layout:
     layout = Layout()
 
     layout.split_column(
@@ -717,7 +938,7 @@ def _build_layout(m: PollerMetrics) -> Layout:
         Layout(name="footer", size=1),
     )
 
-    layout["header"].update(_build_header(m))
+    layout["header"].update(_build_header(m, monitoring=monitoring))
 
     layout["row1"].split_row(
         Layout(_build_mt5_panel(m), name="mt5"),
@@ -736,7 +957,7 @@ def _build_layout(m: PollerMetrics) -> Layout:
 
     layout["prices"].update(_build_prices_panel(m))
 
-    layout["footer"].update(_build_footer())
+    layout["footer"].update(_build_footer(monitoring=monitoring))
 
     return layout
 
@@ -766,3 +987,51 @@ async def run_dashboard() -> None:
                 await asyncio.sleep(_REFRESH_INTERVAL)
         except asyncio.CancelledError:
             pass
+
+
+async def run_dashboard_monitor() -> None:
+    """Monitoring-only dashboard.
+
+    Connects to Redis, reads ``poller:status`` every second,
+    and renders the same dashboard in read-only mode with a
+    prominent *MONITORING* badge.  Used when the poller is
+    already running as a separate process.
+    """
+    import orjson
+    import redis.asyncio as aioredis
+
+    from src.config import get_settings
+
+    settings = get_settings()
+    r = aioredis.Redis(
+        host=settings.redis_host,
+        port=settings.redis_port,
+        password=settings.redis_password or None,
+        db=settings.redis_db,
+        decode_responses=False,
+        single_connection_client=True,
+    )
+
+    snap = MetricsSnapshot()
+    console = Console()
+
+    with Live(
+        _build_layout(snap, monitoring=True),
+        console=console,
+        refresh_per_second=1,
+        screen=True,
+    ) as live:
+        try:
+            while True:
+                try:
+                    raw = await r.get("poller:status")
+                    if raw:
+                        snap.update(orjson.loads(raw))
+                except Exception:
+                    pass  # keep showing last snapshot
+                live.update(_build_layout(snap, monitoring=True))
+                await asyncio.sleep(_REFRESH_INTERVAL)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await r.aclose()

@@ -28,7 +28,7 @@ from src.api.services.backfill_helper import (
     maybe_backfill_candles,
     maybe_backfill_ticks,
 )
-from src.api.services.validation import backfill_limiter, validate_symbol
+from src.api.services.validation import validate_symbol
 from src.config import (
     Timeframe,
     is_standard_timeframe,
@@ -96,6 +96,12 @@ async def get_custom_candles(
         le=50000,
         description="Maximum number of candles to return.",
     ),
+    bars: Optional[int] = Query(
+        default=None,
+        ge=1,
+        le=50000,
+        description="Alias for limit — number of bars to return.",
+    ),
     price: Literal["bid", "ask", "last", "mid"] = Query(
         default="bid",
         description=(
@@ -114,9 +120,14 @@ async def get_custom_candles(
 ) -> PaginatedResponse[CandleResponse]:
     symbol = validate_symbol(symbol)
     tf_str = timeframe.strip().upper()
-    await backfill_limiter.check(symbol)
 
-    fetch_limit = limit + 1  # fetch one extra to detect has_more
+    # bars overrides limit when provided
+    effective_limit = bars if bars is not None else limit
+
+    # For "latest N" queries (no from, optionally capped by to) the DB
+    # uses a DESC/ASC subquery.  The "+1 fetch" trick doesn't apply.
+    use_latest_n = not from_dt
+    fetch_limit = effective_limit if use_latest_n else effective_limit + 1
 
     # ------ Standard TF fast-path ------
     if is_standard_timeframe(tf_str):
@@ -127,7 +138,7 @@ async def get_custom_candles(
             dt_to=to_dt,
             limit=fetch_limit,
         )
-        return _paginate_candles(rows, limit)
+        return _paginate_candles(rows, effective_limit, latest_n=use_latest_n)
 
     # ------ Parse custom TF ------
     try:
@@ -159,7 +170,7 @@ async def get_custom_candles(
             price_field=price,
             include_incomplete=include_incomplete,
         )
-        return _paginate_candles(rows, limit)
+        return _paginate_candles(rows, effective_limit, latest_n=use_latest_n)
 
     # ------ Time-based custom TF ------
     if ctf.seconds < 60:
@@ -191,14 +202,26 @@ async def get_custom_candles(
         limit=fetch_limit,
         source_tf=source_tf,
     )
-    return _paginate_candles(rows, limit)
+    return _paginate_candles(rows, effective_limit, latest_n=use_latest_n)
 
 
 def _paginate_candles(
     rows: list[dict],
     limit: int,
+    *,
+    latest_n: bool = False,
 ) -> PaginatedResponse[CandleResponse]:
     """Build a PaginatedResponse from raw rows, detecting has_more."""
+    if latest_n:
+        # No date-range: rows are the latest N in ASC order (no extra row).
+        data = [CandleResponse(**r) for r in rows]
+        return PaginatedResponse(
+            data=data,
+            count=len(data),
+            has_more=len(rows) >= limit,
+        )
+
+    # Range query: one extra row was fetched to detect has_more.
     has_more = len(rows) > limit
     if has_more:
         next_from = rows[limit]["time"].isoformat()

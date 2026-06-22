@@ -1,0 +1,50 @@
+# ── Monitor Stack ────────────────────────────────────────────────────
+# Deploy on Mac server: docker compose -f docker-compose.monitor.yml up -d
+#
+# Set in .env:
+#   WINDOWS_IP=192.168.x.x        (your Windows machine with MT5 API)
+#   JWT_SECRET=<random-secret>
+#   MONITOR_DB_PASSWORD=<strong-password>
+# ─────────────────────────────────────────────────────────────────────
+
+services:
+  monitor-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5434:5432"
+    environment:
+      POSTGRES_DB: monitor
+      POSTGRES_USER: monitor
+      POSTGRES_PASSWORD: ${MONITOR_DB_PASSWORD:-monitor}
+    volumes:
+      - monitor_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monitor"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  monitor-api:
+    build: ./monitor/backend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      MONITOR_DATABASE_URL: postgresql+asyncpg://monitor:${MONITOR_DB_PASSWORD:-monitor}@monitor-db:5432/monitor
+      MONITOR_MT5_API_URL: http://${WINDOWS_IP:-host.docker.internal}:9000
+      MONITOR_JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+    depends_on:
+      monitor-db:
+        condition: service_healthy
+
+  monitor-frontend:
+    build: ./monitor/frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - monitor-api
+
+volumes:
+  monitor_pgdata:

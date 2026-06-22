@@ -21,12 +21,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 
 from src.api.middleware.request_metrics import RequestMetricsMiddleware
-from src.api.routes import candles, coverage, custom_candles, health, spread, stats, symbols, ticks
+from src.api.routes import (
+    accounts,
+    backfill,
+    candles,
+    coverage,
+    custom_candles,
+    health,
+    poller,
+    spread,
+    stats,
+    supervisor,
+    symbols,
+    ticks,
+    trading,
+)
 from src.api.websocket import streams
 from src.config import get_settings
 from src.db.engine import dispose_engine, get_engine
 from src.db.init_timescale import init_timescaledb
 from src.logging_config import setup_logging
+from src.api.digits import load_symbol_digits
 from src.redis_bus.backfill_manager import BackfillRequester
 from src.redis_bus.pool import close_redis_pool
 
@@ -132,6 +147,17 @@ async def _lifespan(app: FastAPI):
     except Exception:
         logger.warning("timescaledb_init_skipped", exc_info=True)
 
+    # Load symbol digits cache from Redis (written by poller)
+    await load_symbol_digits()
+
+    # Load full MT5 symbol catalogue from Redis (written by poller)
+    from src.api.symbol_registry import load_mt5_symbols, symbol_registry_refresh_loop
+    await load_mt5_symbols()
+    symbol_refresh_task = asyncio.create_task(
+        symbol_registry_refresh_loop(),
+        name="symbol_registry_refresh",
+    )
+
     # Connect backfill requester (for on-demand MT5 downloads)
     try:
         requester = BackfillRequester(settings)
@@ -160,8 +186,9 @@ async def _lifespan(app: FastAPI):
         logger.warning("daily_api_stats_final_flush_failed", exc_info=True)
 
     flusher_task.cancel()
+    symbol_refresh_task.cancel()
     try:
-        await flusher_task
+        await asyncio.gather(flusher_task, symbol_refresh_task, return_exceptions=True)
     except asyncio.CancelledError:
         pass
 
@@ -202,6 +229,8 @@ from another computer.
 | REST API | `http://<server-ip>:9000/api/v1/…` |
 | WebSocket ticks | `ws://<server-ip>:9000/ws/ticks/{symbol}` |
 | WebSocket candles | `ws://<server-ip>:9000/ws/candles/{symbol}/{timeframe}` |
+| WebSocket account info | `ws://<server-ip>:9000/ws/trading/account-info/{account_id}` |
+| WebSocket positions | `ws://<server-ip>:9000/ws/trading/positions/{account_id}` |
 | This page | `http://<server-ip>:9000/docs` |
 
 > **Firewall**: make sure TCP port **9000** is open for inbound connections
@@ -276,6 +305,52 @@ ws.onmessage = (e) => {
 ```
 
 Supported timeframes: `M1 M5 M15 H1 H4 D1` and custom (`M2`, `H6`, …).
+
+### `/ws/trading/account-info/{account_id}` — live account balance & equity
+
+The server pushes balance/equity/margin snapshots every ~5 seconds.
+
+**JavaScript:**
+```js
+const ws = new WebSocket("ws://<server-ip>:9000/ws/trading/account-info/1");
+ws.onmessage = (e) => {
+  const info = JSON.parse(e.data);
+  if (info.event === "ping") return;
+  console.log(`Balance=${info.balance} Equity=${info.equity} Profit=${info.profit}`);
+};
+```
+
+**Message:**
+```json
+{"account_id": 1, "balance": 10000.0, "equity": 10050.5,
+ "margin": 120.0, "margin_free": 9930.5, "margin_level": 8375.4,
+ "leverage": 100, "currency": "USD", "profit": 50.5}
+```
+
+### `/ws/trading/positions/{account_id}` — live open positions
+
+Full position list pushed every ~5 seconds.
+
+**JavaScript:**
+```js
+const ws = new WebSocket("ws://<server-ip>:9000/ws/trading/positions/1");
+ws.onmessage = (e) => {
+  const msg = JSON.parse(e.data);
+  if (msg.event === "ping") return;
+  msg.positions.forEach(p =>
+    console.log(`${p.symbol} ${p.volume} lots  P/L=${p.profit}`)
+  );
+};
+```
+
+**Message:**
+```json
+{"account_id": 1, "positions": [
+  {"ticket": 123456, "symbol": "EURUSD", "type": 0,
+   "volume": 0.01, "price_open": 1.0856, "price_current": 1.0861,
+   "profit": 5.0, "sl": 1.0800, "tp": 1.0900}
+]}
+```
 
 ### Multiple symbols
 
@@ -473,9 +548,26 @@ _OPENAPI_TAGS: list[dict] = [
         "description": (
             "**Real-time streaming** via WebSocket.\n\n"
             "- `/ws/ticks/{symbol}` — every bid/ask change\n"
-            "- `/ws/candles/{symbol}/{timeframe}` — live OHLCV updates\n\n"
+            "- `/ws/candles/{symbol}/{timeframe}` — live OHLCV updates\n"
+            "- `/ws/trading/account-info/{account_id}` — balance / equity / margin (~5 s)\n"
+            "- `/ws/trading/positions/{account_id}` — open position snapshots (~5 s)\n\n"
             "See the **WebSocket — Real-Time Quotes** section at the top "
             "of this page for connection examples and message formats."
+        ),
+    },
+    {
+        "name": "admin",
+        "description": (
+            "Administrative endpoints for managing MT5 trading accounts. "
+            "Create, update, enable/disable, and delete accounts that "
+            "the trader process connects to."
+        ),
+    },
+    {
+        "name": "trading",
+        "description": (
+            "Trading data synced by the trader process: closed deal history "
+            "and open position snapshots per account."
         ),
     },
 ]
@@ -773,6 +865,22 @@ Message format:
 ### Heartbeat
 Server sends `{"event": "ping"}` every 30s. Client may send `{"action": "ping"}` to receive `{"event": "pong"}`.
 
+### ws://<server-ip>:9000/ws/trading/account-info/{account_id}
+Real-time account balance / equity / margin updates. Pushed every ~5s.
+
+Message format:
+```json
+{"account_id": 1, "balance": 10000.0, "equity": 10050.5, "margin": 120.0, "margin_free": 9930.5, "margin_level": 8375.4, "leverage": 100, "currency": "USD", "profit": 50.5, "name": "John", "server": "Demo", "trade_mode": 0}
+```
+
+### ws://<server-ip>:9000/ws/trading/positions/{account_id}
+Real-time open position snapshots. Full list pushed every ~5s.
+
+Message format:
+```json
+{"account_id": 1, "positions": [{"ticket": 123456, "symbol": "EURUSD", "type": 0, "volume": 0.01, "price_open": 1.0856, "price_current": 1.0861, "profit": 5.0, "sl": 1.08, "tp": 1.09}]}
+```
+
 ## Common Patterns for AI Agents
 
 ### Fetch latest 100 H1 candles
@@ -841,6 +949,101 @@ Error response format:
 
 Backfill triggers are rate-limited per symbol to prevent MT5 overload.
 Normal queries against cached data have no rate limit.
+
+## Admin API — Trading Accounts
+
+### GET /api/v1/admin/accounts
+List all registered trading accounts (passwords are masked).
+
+Response: `[{"id": 1, "label": "Demo-1", "mt5_login": 12345, "mt5_server": "Broker-Demo", "mt5_path": "C:\\MT5\\Terminal1\\terminal64.exe", "enabled": true, "created_at": "...", "updated_at": "..."}]`
+
+### GET /api/v1/admin/accounts/{account_id}
+Get a single trading account.
+
+### POST /api/v1/admin/accounts
+Create a new trading account.
+
+Body:
+```json
+{
+  "label": "Demo-1",
+  "mt5_login": 12345,
+  "mt5_password": "secret",
+  "mt5_server": "Broker-Demo",
+  "mt5_path": "C:\\MT5\\Terminal1\\terminal64.exe",
+  "enabled": true
+}
+```
+
+### PATCH /api/v1/admin/accounts/{account_id}
+Update fields of an existing account. Only pass changed fields.
+
+### DELETE /api/v1/admin/accounts/{account_id}
+Delete a trading account. Synced deals/positions are NOT deleted.
+
+## Trading API — Deals & Positions
+
+### GET /api/v1/trading/deals/{account_id}
+Closed deal history for a trading account (synced by the trader process).
+
+Parameters:
+- account_id (path, required): Account ID
+- symbol (query, optional): Filter by symbol
+- from (query, optional): Start datetime, ISO 8601 (default: 30 days ago)
+- to (query, optional): End datetime, ISO 8601 (default: now)
+- limit (query, default 1000, max 50000): Max deals per page
+
+Response: PaginatedResponse with DealResponse items
+```json
+{
+  "data": [
+    {
+      "ticket": 123456789,
+      "account_id": 1,
+      "order": 123456788,
+      "time": "2026-03-08T14:30:00Z",
+      "type": 0,
+      "entry": 0,
+      "symbol": "EURUSD",
+      "volume": 0.1,
+      "price": 1.0856,
+      "commission": -0.5,
+      "swap": 0.0,
+      "profit": 23.50
+    }
+  ],
+  "count": 1,
+  "has_more": false,
+  "next_from": null
+}
+```
+
+### GET /api/v1/trading/positions/{account_id}
+Currently open positions for a trading account.
+
+Parameters:
+- account_id (path, required): Account ID
+- symbol (query, optional): Filter by symbol
+
+Response:
+```json
+[
+  {
+    "ticket": 987654321,
+    "account_id": 1,
+    "time": "2026-03-08T10:00:00Z",
+    "type": 0,
+    "symbol": "EURUSD",
+    "volume": 0.5,
+    "price_open": 1.0856,
+    "price_current": 1.0872,
+    "sl": 1.0800,
+    "tp": 1.0950,
+    "swap": -1.20,
+    "profit": 80.00
+  }
+]
+```
 """
 
 
@@ -893,6 +1096,11 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(coverage.router)
     app.include_router(stats.router)
+    app.include_router(accounts.router)
+    app.include_router(trading.router)
+    app.include_router(poller.router)
+    app.include_router(supervisor.router)
+    app.include_router(backfill.router)
 
     # ---- WebSocket routes ----
     app.include_router(streams.router)

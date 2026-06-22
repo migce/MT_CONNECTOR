@@ -13,6 +13,7 @@ from typing import Any, Optional
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+from src.config import get_settings
 from src.db import repository as repo
 
 router = APIRouter(prefix="/api/v1", tags=["coverage"])
@@ -48,9 +49,17 @@ class SymbolCoverage(BaseModel):
 
 
 class CoverageSummary(BaseModel):
+    note: str = (
+        "Coverage shows data currently loaded in the database. "
+        "Additional historical data can be fetched on-demand via "
+        "/api/v1/candles/{symbol}?from=...&to=... or "
+        "POST /api/v1/backfill for explicit range preload."
+    )
     total_candle_rows: int = 0
     total_tick_rows: int = 0
     symbols: list[SymbolCoverage] = []
+    configured_symbols: list[str] = []
+    available_symbols: list[str] = []
 
 
 # ---------------------------------------------------------------
@@ -71,6 +80,7 @@ async def get_coverage() -> CoverageSummary:
     candle_stats = await repo.query_candle_coverage()
     tick_stats = await repo.query_tick_coverage()
     sync_states = await repo.query_all_sync_states()
+    settings = get_settings()
 
     # Index sync states for fast lookup
     sync_map: dict[tuple[str, str], datetime] = {}
@@ -113,8 +123,19 @@ async def get_coverage() -> CoverageSummary:
             last_synced_at=sync_map.get((sym, "tick")),
         )
 
+    # Ensure all configured (tracked) symbols appear (even if no data yet)
+    for sym in settings.symbols:
+        if sym not in symbols_map:
+            symbols_map[sym] = SymbolCoverage(symbol=sym)
+
+    # Also include all MT5-available symbols that have data in DB
+    from src.api.symbol_registry import get_all_mt5_symbols
+    all_mt5 = get_all_mt5_symbols()
+
     return CoverageSummary(
         total_candle_rows=total_candles,
         total_tick_rows=total_ticks,
         symbols=sorted(symbols_map.values(), key=lambda s: s.symbol),
+        configured_symbols=sorted(settings.symbols),
+        available_symbols=sorted(all_mt5.keys()) if all_mt5 else sorted(settings.symbols),
     )

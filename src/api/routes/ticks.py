@@ -16,7 +16,7 @@ from fastapi import APIRouter, Query
 
 from src.api.schemas import PaginatedResponse, TickResponse
 from src.api.services.backfill_helper import maybe_backfill_ticks
-from src.api.services.validation import backfill_limiter, validate_symbol
+from src.api.services.validation import validate_symbol
 
 router = APIRouter(prefix="/api/v1", tags=["ticks"])
 
@@ -56,16 +56,25 @@ async def get_ticks(
     # Validate symbol exists in configuration
     symbol = validate_symbol(symbol)
 
-    # Rate-limit backfill triggers
-    await backfill_limiter.check(symbol)
+    # When no date-range is specified the repository uses DESC/ASC
+    # for latest N.  The "+1 fetch" trick doesn't work with that pattern.
+    no_range = not from_dt and not to_dt
+    fetch_limit = limit if no_range else limit + 1
 
-    # Fetch limit + 1 to detect whether more rows exist
     rows = await maybe_backfill_ticks(
         symbol=symbol,
         dt_from=from_dt,
         dt_to=to_dt,
-        limit=limit + 1,
+        limit=fetch_limit,
     )
+
+    if no_range:
+        data = [TickResponse(**r) for r in rows]
+        return PaginatedResponse(
+            data=data,
+            count=len(data),
+            has_more=len(rows) >= limit,
+        )
 
     has_more = len(rows) > limit
     if has_more:

@@ -21,11 +21,33 @@ from src.api.services.validation import validate_symbol
 
 class TestValidateSymbol:
     def test_valid_symbol(self):
-        # Default symbols_csv is "EURUSD"
-        result = validate_symbol("eurusd")
-        assert result == "EURUSD"
+        # Populate registry so validation works against it
+        import src.api.symbol_registry as reg
+        reg._mt5_symbols["EURUSD"] = "Euro vs US Dollar"
+        reg._loaded = True
+        try:
+            result = validate_symbol("eurusd")
+            assert result == "EURUSD"
+        finally:
+            reg._mt5_symbols.clear()
+            reg._loaded = False
 
     def test_invalid_symbol(self):
-        with pytest.raises(HTTPException) as exc_info:
-            validate_symbol("INVALID")
-        assert exc_info.value.status_code == 404
+        import src.api.symbol_registry as reg
+        reg._mt5_symbols["EURUSD"] = "Euro vs US Dollar"
+        reg._loaded = True
+        try:
+            with pytest.raises(HTTPException) as exc_info:
+                validate_symbol("INVALID")
+            assert exc_info.value.status_code == 404
+        finally:
+            reg._mt5_symbols.clear()
+            reg._loaded = False
+
+    def test_fallback_when_registry_not_loaded(self):
+        """When registry hasn't been populated, any symbol is accepted."""
+        import src.api.symbol_registry as reg
+        reg._loaded = False
+        reg._mt5_symbols.clear()
+        result = validate_symbol("ANYTHING")
+        assert result == "ANYTHING"

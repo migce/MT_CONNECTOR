@@ -161,10 +161,114 @@ SELECT add_retention_policy('service_uptime_log', INTERVAL '90 days', if_not_exi
 SELECT add_retention_policy('ticks', INTERVAL '90 days', if_not_exists => TRUE);
 
 -- ============================================================
--- 5. Helper: generate gap-detection series
+-- 7. TRADING_ACCOUNTS — MT5 accounts managed via admin API
+--    The poller's "system" account is in .env, not here.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS trading_accounts (
+    id            SERIAL             PRIMARY KEY,
+    label         TEXT               NOT NULL UNIQUE,
+    description   VARCHAR(255)       NULL,
+    mt5_login     INTEGER            NOT NULL UNIQUE,
+    mt5_password  TEXT               NOT NULL,
+    mt5_server    TEXT               NOT NULL,
+    mt5_path      TEXT               NOT NULL DEFAULT 'C:\Program Files\MetaTrader 5\terminal64.exe',
+    enabled       BOOLEAN            NOT NULL DEFAULT TRUE,
+    created_at    TIMESTAMPTZ        NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ        NOT NULL DEFAULT NOW()
+);
+
+-- ============================================================
+-- 8. DEALS — closed deal history (from mt5.history_deals_get)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS deals (
+    ticket        BIGINT             PRIMARY KEY,
+    account_id    INTEGER            NOT NULL REFERENCES trading_accounts(id),
+    "order"       BIGINT             NOT NULL,
+    time          TIMESTAMPTZ        NOT NULL,
+    time_msc      BIGINT             NOT NULL,
+    type          INTEGER            NOT NULL,
+    entry         INTEGER            NOT NULL,
+    magic         BIGINT             DEFAULT 0,
+    position_id   BIGINT             DEFAULT 0,
+    reason        INTEGER            DEFAULT 0,
+    symbol        TEXT               NOT NULL,
+    volume        DOUBLE PRECISION   NOT NULL DEFAULT 0,
+    price         DOUBLE PRECISION   NOT NULL DEFAULT 0,
+    commission    DOUBLE PRECISION   DEFAULT 0,
+    swap          DOUBLE PRECISION   DEFAULT 0,
+    profit        DOUBLE PRECISION   NOT NULL DEFAULT 0,
+    fee           DOUBLE PRECISION   DEFAULT 0,
+    comment       TEXT               DEFAULT '',
+    external_id   TEXT               DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_deals_account_time
+    ON deals (account_id, time DESC);
+
+CREATE INDEX IF NOT EXISTS idx_deals_account_symbol
+    ON deals (account_id, symbol);
+
+CREATE INDEX IF NOT EXISTS idx_deals_position
+    ON deals (position_id);
+
+-- ============================================================
+-- 9. POSITIONS — open position snapshots (replaced each sync)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS positions (
+    ticket         BIGINT            PRIMARY KEY,
+    account_id     INTEGER           NOT NULL REFERENCES trading_accounts(id),
+    time           TIMESTAMPTZ       NOT NULL,
+    time_update    TIMESTAMPTZ,
+    type           INTEGER           NOT NULL,
+    magic          BIGINT            DEFAULT 0,
+    identifier     BIGINT            DEFAULT 0,
+    reason         INTEGER           DEFAULT 0,
+    symbol         TEXT              NOT NULL,
+    volume         DOUBLE PRECISION  NOT NULL DEFAULT 0,
+    price_open     DOUBLE PRECISION  NOT NULL DEFAULT 0,
+    price_current  DOUBLE PRECISION  NOT NULL DEFAULT 0,
+    sl             DOUBLE PRECISION  DEFAULT 0,
+    tp             DOUBLE PRECISION  DEFAULT 0,
+    swap           DOUBLE PRECISION  DEFAULT 0,
+    profit         DOUBLE PRECISION  NOT NULL DEFAULT 0,
+    comment        TEXT              DEFAULT '',
+    external_id    TEXT              DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_positions_account
+    ON positions (account_id);
+
+-- ============================================================
+-- 10. ACCOUNT_INFO — balance / equity / margin snapshots
+--     One row per account, upserted every sync cycle.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS account_info (
+    account_id        INTEGER          PRIMARY KEY REFERENCES trading_accounts(id),
+    balance           DOUBLE PRECISION NOT NULL DEFAULT 0,
+    equity            DOUBLE PRECISION NOT NULL DEFAULT 0,
+    margin            DOUBLE PRECISION NOT NULL DEFAULT 0,
+    margin_free       DOUBLE PRECISION NOT NULL DEFAULT 0,
+    margin_level      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    leverage          INTEGER          NOT NULL DEFAULT 0,
+    currency          TEXT             NOT NULL DEFAULT 'USD',
+    profit            DOUBLE PRECISION NOT NULL DEFAULT 0,
+    name              TEXT             NOT NULL DEFAULT '',
+    server            TEXT             NOT NULL DEFAULT '',
+    trade_mode        INTEGER          NOT NULL DEFAULT 0,
+    updated_at        TIMESTAMPTZ      NOT NULL DEFAULT NOW()
+);
+
+-- ============================================================
+-- Helper: generate gap-detection series
 --    Use with:
 --      SELECT gap_start FROM generate_series(from, to, interval)
 --      LEFT JOIN candles …  WHERE candles.time IS NULL
 -- ============================================================
 
 -- Done.  Run migrations via Alembic for schema evolution.
+
+-- ============================================================
+-- Idempotent migrations (safe to re-run on existing DBs)
+-- ============================================================
+ALTER TABLE trading_accounts
+    ADD COLUMN IF NOT EXISTS description VARCHAR(255) NULL;

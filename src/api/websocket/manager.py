@@ -74,6 +74,29 @@ class ConnectionManager:
                 for ws in stale:
                     sockets.discard(ws)
 
+    async def broadcast_raw(self, channel: str, payload: str) -> None:
+        """Send a pre-serialised *payload* string to all subscribers.
+
+        Skips the ``orjson.dumps`` step — use when the message is
+        already JSON-encoded (e.g. forwarded directly from Redis).
+        """
+        sockets = self._subscriptions.get(channel)
+        if not sockets:
+            return
+
+        stale: list[WebSocket] = []
+
+        for ws in list(sockets):
+            try:
+                await ws.send_text(payload)
+            except Exception:
+                stale.append(ws)
+
+        if stale:
+            async with self._lock:
+                for ws in stale:
+                    sockets.discard(ws)
+
     @property
     def channel_count(self) -> int:
         return len(self._subscriptions)

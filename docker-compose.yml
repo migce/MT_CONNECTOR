@@ -78,6 +78,8 @@ services:
       DB_PORT: 5432
       REDIS_HOST: redis
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      # Supervisor runs natively on Windows host
+      SUPERVISOR_URL: http://host.docker.internal:${SUPERVISOR_PORT:-9100}
     depends_on:
       timescaledb:
         condition: service_healthy

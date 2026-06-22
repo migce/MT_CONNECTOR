@@ -34,7 +34,7 @@ def get_redis_pool(settings: Settings | None = None) -> aioredis.Redis:
         retry_on_error=[ConnectionError, TimeoutError],
         socket_connect_timeout=5,
         socket_keepalive=True,
-        max_connections=20,
+        max_connections=50,
     )
     logger.info(
         "redis_pool_created",

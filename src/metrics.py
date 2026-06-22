@@ -92,6 +92,8 @@ class PollerMetrics:
         # Error counters
         self.errors: dict[str, int] = defaultdict(int)
         # categories: tick_loop, candle_loop, flush, publish, heartbeat, gap_scan, backfill
+        self.last_error_category: str = ""
+        self.last_error_time: float = 0.0  # monotonic
 
         # Connection
         self.reconnect_count: int = 0
@@ -214,6 +216,8 @@ class PollerMetrics:
     def record_error(self, category: str) -> None:
         with self._lock:
             self.errors[category] += 1
+            self.last_error_category = category
+            self.last_error_time = time.monotonic()
 
     # -- connection metrics ----------------------------------------------
 

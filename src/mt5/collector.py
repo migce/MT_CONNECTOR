@@ -23,7 +23,7 @@ import structlog
 from src.config import Settings, Timeframe, get_settings
 from src.db import repository as repo
 from src.metrics import PollerMetrics
-from src.mt5.connection import MT5Connection, run_in_mt5
+from src.mt5.connection import MT5Connection, run_in_mt5, get_digits
 from src.mt5.converters import bars_to_dicts
 from src.redis_bus.publisher import RedisPublisher
 
@@ -73,6 +73,9 @@ class Collector:
         self._tasks: list[asyncio.Task] = []
         self._running = False
 
+        # Active symbols — starts with config, updated dynamically
+        self._active_symbols: list[str] = list(self._settings.symbols)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -85,8 +88,20 @@ class Collector:
             asyncio.create_task(self._flush_loop(), name="flush_loop"),
         ]
         logger.info("collector_started",
-                     symbols=self._settings.symbols,
+                     symbols=self._active_symbols,
                      timeframes=[tf.value for tf in self._settings.timeframes])
+
+    def update_symbols(self, symbols: list[str]) -> list[str]:
+        """Replace the active symbol set. Returns list of newly added symbols."""
+        old = set(self._active_symbols)
+        self._active_symbols = list(symbols)
+        added = set(symbols) - old
+        if added:
+            logger.info("collector_symbols_added", added=sorted(added), total=len(symbols))
+        removed = old - set(symbols)
+        if removed:
+            logger.info("collector_symbols_removed", removed=sorted(removed), total=len(symbols))
+        return sorted(added)
 
     async def stop(self) -> None:
         self._running = False
@@ -103,11 +118,10 @@ class Collector:
 
     async def _tick_loop(self) -> None:
         interval = self._settings.tick_poll_interval_ms / 1000.0
-        symbols = self._settings.symbols
 
         while self._running:
             try:
-                for symbol in symbols:
+                for symbol in self._active_symbols:
                     tick = await run_in_mt5(self._get_tick, symbol)
                     if tick is None:
                         continue
@@ -117,14 +131,15 @@ class Collector:
 
                     self._last_tick_msc[symbol] = tick_msc
 
+                    d = get_digits(symbol)
                     tick_dict = {
                         "time_msc": datetime.fromtimestamp(
                             tick_msc / 1000.0, tz=timezone.utc
                         ),
                         "symbol": symbol,
-                        "bid": float(tick.bid),
-                        "ask": float(tick.ask),
-                        "last": float(tick.last),
+                        "bid": round(float(tick.bid), d),
+                        "ask": round(float(tick.ask), d),
+                        "last": round(float(tick.last), d),
                         "volume": int(tick.volume),
                         "flags": int(tick.flags),
                     }
@@ -161,7 +176,6 @@ class Collector:
 
     async def _candle_loop(self) -> None:
         interval = self._settings.candle_poll_interval_sec
-        symbols = self._settings.symbols
         timeframes = self._settings.timeframes
 
         while self._running:
@@ -183,7 +197,7 @@ class Collector:
 
                 tasks = [
                     _poll_one(symbol, tf)
-                    for symbol in symbols
+                    for symbol in self._active_symbols
                     for tf in timeframes
                 ]
                 results = await asyncio.gather(*tasks, return_exceptions=True)

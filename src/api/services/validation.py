@@ -11,22 +11,37 @@ from collections import defaultdict
 from fastapi import HTTPException
 
 from src.config import get_settings
+from src.api.symbol_registry import is_symbol_available
+from src.active_symbols import touch_symbol as _touch_symbol
+
+# Background tasks for fire-and-forget Redis writes
+_bg_tasks: set[asyncio.Task] = set()
 
 
 def validate_symbol(symbol: str) -> str:
     """
-    Validate that *symbol* is in the configured symbol list.
+    Validate that *symbol* is available on the MT5 broker.
 
-    Returns the upper-cased symbol or raises 404.
+    Checks against the dynamic symbol registry (populated from MT5
+    ``symbols_get``).  Returns the upper-cased symbol or raises 404.
+
+    Also records the access so the poller starts actively polling
+    the symbol (auto-expires after 7 days of inactivity).
     """
     symbol = symbol.upper()
-    allowed = get_settings().symbols
-    if symbol not in allowed:
+    if not is_symbol_available(symbol):
         raise HTTPException(
             status_code=404,
-            detail=f"Symbol '{symbol}' is not tracked. "
-                   f"Available: {allowed}",
+            detail=f"Symbol '{symbol}' is not available on the MT5 broker.",
         )
+    # Fire-and-forget: mark symbol as recently accessed
+    try:
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(_touch_symbol(symbol))
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
+    except RuntimeError:
+        pass  # no running loop (e.g. in sync tests)
     return symbol
 
 

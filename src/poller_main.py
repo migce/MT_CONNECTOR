@@ -38,7 +38,7 @@ from src.logging_config import setup_logging
 from src.metrics import PollerMetrics
 from src.mt5.backfill import Backfiller
 from src.mt5.collector import Collector
-from src.mt5.connection import MT5Connection
+from src.mt5.connection import MT5Connection, fetch_symbol_digits
 from src.redis_bus.backfill_manager import BackfillListener
 from src.redis_bus.pool import close_redis_pool, get_redis_pool
 from src.redis_bus.publisher import RedisPublisher
@@ -65,9 +65,8 @@ async def _heartbeat_loop(
                     "mt5_reconnected_gap_backfill",
                     gap_seconds=round(gap_sec, 1),
                 )
-                # Only run a gap-scan for the period we were disconnected
-                # instead of a full initial backfill
-                await backfiller.run_gap_scan()
+                # Backfill ALL ticks + candles from sync_state to now
+                await backfiller.run_reconnect_backfill()
             last_seen = now
         except asyncio.CancelledError:
             break
@@ -75,6 +74,50 @@ async def _heartbeat_loop(
             logger.exception("heartbeat_error")
             metrics.record_error("heartbeat")
             await asyncio.sleep(5)
+
+
+async def _active_symbols_refresh_loop(
+    connection: MT5Connection,
+    collector: Collector,
+    backfiller: Backfiller,
+    settings,
+    interval_sec: int = 30,
+) -> None:
+    """Periodically refresh the active symbol set from Redis.
+
+    Merges ``symbol:active:*`` keys (set by API on each request) with
+    the baseline ``SYMBOLS`` from config.  New symbols are selected in
+    MT5, their digits are fetched, and the collector starts polling them.
+    """
+    from src.active_symbols import get_active_symbols
+
+    while True:
+        try:
+            await asyncio.sleep(interval_sec)
+            api_symbols = await get_active_symbols()
+            baseline = set(settings.symbols)
+            merged = sorted(baseline | api_symbols)
+
+            # Quick‐check: nothing changed?
+            if merged == collector._active_symbols:
+                continue
+
+            # Select new symbols in MT5 terminal
+            added = collector.update_symbols(merged)
+            backfiller.update_symbols(merged)
+            if added:
+                await connection.select_symbols(added)
+                await fetch_symbol_digits(added)
+                logger.info(
+                    "active_symbols_expanded",
+                    added=added,
+                    total=len(merged),
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception("active_symbols_refresh_error")
+            await asyncio.sleep(10)
 
 
 def _monitor_tasks(tasks: dict[str, asyncio.Task]) -> None:
@@ -182,20 +225,113 @@ async def _health_checker_loop(api_port: int) -> None:
                     db_size_gb=round(db_size_gb, 3),
                 )
 
-                # ── Publish poller status to Redis for API /health ─────
+                # ── Publish full poller snapshot to Redis ───────────────
                 try:
                     pool = get_redis_pool()
                     import orjson as _orjson
+
+                    mt5_up, mt5_dn, mt5_pct = metrics.mt5_uptime()
+                    db_up_s, db_dn_s, db_pct = metrics.db_uptime()
+                    redis_up_s, redis_dn_s, redis_pct = metrics.redis_uptime()
+                    api_up_s, api_dn_s, api_pct = metrics.api_uptime()
+
+                    now_mono = time.monotonic()
+                    _symbols = {}
+                    for sym, info in list(metrics.symbol_ticks.items()):
+                        age = round(now_mono - info.last_tick_ts, 1) if info.last_tick_ts > 0 else None
+                        _symbols[sym] = {
+                            "bid": info.bid,
+                            "ask": info.ask,
+                            "tick_count": info.count,
+                            "age_sec": age,
+                            "stale": age is not None and age > 30,
+                        }
+
+                    _on_demand = []
+                    for e in list(metrics.on_demand_log)[-20:]:
+                        _on_demand.append({
+                            "ts": e.ts.isoformat(),
+                            "symbol": e.symbol,
+                            "data_type": e.data_type,
+                            "timeframe": e.timeframe,
+                            "rows": e.rows,
+                            "status": e.status,
+                            "elapsed_sec": round(e.elapsed_sec, 2),
+                        })
+
                     _status = {
+                        # ── connection ──
                         "mt5_connected": metrics.mt5_connected,
                         "uptime": metrics.uptime_str(),
+                        "started_at": metrics.poller_started_at.isoformat(),
+                        # ── ticks ──
                         "ticks_total": metrics.ticks_total,
+                        "ticks_flushed": metrics.ticks_flushed_total,
+                        "tick_rate": round(metrics.ticks_per_sec(), 1),
+                        "peak_ticks_sec": round(metrics.peak_ticks_sec, 1),
+                        "tick_buffer_depth": metrics.tick_buffer_depth,
+                        "ticks_1h": metrics.ticks_in_window(3600),
+                        "ticks_12h": metrics.ticks_in_window(43200),
+                        "ticks_24h": metrics.ticks_in_window(86400),
+                        "ticks_7d": metrics.ticks_in_window(604800),
+                        # ── candles ──
                         "candles_total": metrics.candles_total,
+                        "redis_pub_count": metrics.redis_pub_count,
+                        "flush_count": metrics.flush_count,
+                        "avg_flush_ms": round(metrics.avg_flush_ms(), 1),
+                        "last_flush_ms": round(metrics.last_flush_ms, 1),
+                        "candles_1h": metrics.candles_in_window(3600),
+                        "candles_12h": metrics.candles_in_window(43200),
+                        "candles_24h": metrics.candles_in_window(86400),
+                        "candles_7d": metrics.candles_in_window(604800),
+                        # ── errors ──
+                        "errors_total": metrics.total_errors(),
+                        "errors_by_category": dict(metrics.errors),
+                        "last_error_category": metrics.last_error_category or None,
+                        "last_error_ago_sec": (
+                            round(now_mono - metrics.last_error_time, 1)
+                            if metrics.last_error_time > 0 else None
+                        ),
+                        "reconnect_count": metrics.reconnect_count,
+                        # ── tasks ──
+                        "tasks": dict(metrics.task_alive),
+                        # ── backfill ──
+                        "backfill_phase": metrics.backfill_phase or None,
+                        "backfill_current": metrics.backfill_current or None,
+                        "gap_scan_time": (
+                            metrics.last_gap_scan_time.isoformat()
+                            if metrics.last_gap_scan_time else None
+                        ),
+                        "gaps_found": metrics.gaps_found,
+                        "on_demand_log": _on_demand,
+                        # ── infrastructure ──
+                        "db_healthy": metrics.db_healthy,
+                        "db_latency_ms": metrics.db_latency_ms,
+                        "db_size_gb": round(metrics.db_size_gb, 3),
+                        "redis_healthy": metrics.redis_healthy,
+                        "redis_latency_ms": metrics.redis_latency_ms,
+                        # ── API stats ──
+                        "api_healthy": metrics.api_healthy,
+                        "api_latency_ms": metrics.api_latency_ms,
+                        "api_avg_latency_ms": metrics.api_avg_latency_ms,
+                        "api_requests_1h": metrics.api_requests_1h,
+                        "api_requests_12h": metrics.api_requests_12h,
+                        "api_requests_24h": metrics.api_requests_24h,
+                        "api_errors_1h": metrics.api_errors_1h,
+                        # ── session uptime ──
+                        "uptime_session": {
+                            "mt5": {"up_sec": round(mt5_up, 1), "down_sec": round(mt5_dn, 1), "pct": round(mt5_pct, 2)},
+                            "db": {"up_sec": round(db_up_s, 1), "down_sec": round(db_dn_s, 1), "pct": round(db_pct, 2)},
+                            "redis": {"up_sec": round(redis_up_s, 1), "down_sec": round(redis_dn_s, 1), "pct": round(redis_pct, 2)},
+                            "api": {"up_sec": round(api_up_s, 1), "down_sec": round(api_dn_s, 1), "pct": round(api_pct, 2)},
+                        },
+                        # ── live prices ──
+                        "symbols": _symbols,
                     }
                     await pool.set(
                         "poller:status",
                         _orjson.dumps(_status),
-                        ex=30,  # expires in 30s — stale = poller down
+                        ex=10,
                     )
                 except Exception:
                     pass
@@ -203,7 +339,7 @@ async def _health_checker_loop(api_port: int) -> None:
                 # ── Prune old minute-buckets every cycle ────────────────
                 metrics.prune_minute_buckets()
 
-                await asyncio.sleep(10.0)
+                await asyncio.sleep(2.0)
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -405,8 +541,12 @@ async def _keyboard_listener(stop_event: asyncio.Event) -> None:
 _LOCK_FILE = ".poller.lock"
 
 
-def _acquire_lock() -> object:
-    """Acquire an exclusive file lock. Exit immediately if another instance is running."""
+def _acquire_lock() -> object | None:
+    """Acquire an exclusive file lock.
+
+    Returns the file handle on success, or ``None`` if another
+    instance is already running (caller should enter monitoring mode).
+    """
     try:
         fh = open(_LOCK_FILE, "w")  # noqa: SIM115
         msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
@@ -414,12 +554,7 @@ def _acquire_lock() -> object:
         fh.flush()
         return fh
     except (OSError, PermissionError):
-        print(
-            "\n  ✗ Another poller instance is already running.\n"
-            "    Kill it first or delete .poller.lock\n",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        return None
 
 
 def _release_lock(fh: object) -> None:
@@ -434,6 +569,42 @@ def _release_lock(fh: object) -> None:
 
 async def main(dashboard: bool = False) -> None:
     lock_fh = _acquire_lock()
+
+    # -- Monitoring mode: another poller is running, just show dashboard --
+    if lock_fh is None:
+        if not dashboard:
+            print(
+                "\n  ✗ Another poller instance is already running.\n"
+                "    Use --dashboard to watch it in monitoring mode,\n"
+                "    or kill the existing process first.\n",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Dashboard-only: read from Redis, render in read-only mode
+        print("  ◉ Poller is already running — entering monitoring mode…\n")
+        from src.dashboard import run_dashboard_monitor
+
+        stop_event = asyncio.Event()
+
+        def _signal_handler():
+            stop_event.set()
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _signal_handler)
+            except NotImplementedError:
+                signal.signal(sig, lambda s, f: _signal_handler())
+
+        monitor_task = asyncio.create_task(run_dashboard_monitor(), name="monitor")
+        kb_task = asyncio.create_task(_keyboard_listener(stop_event), name="kb")
+
+        await stop_event.wait()
+        monitor_task.cancel()
+        kb_task.cancel()
+        await asyncio.gather(monitor_task, kb_task, return_exceptions=True)
+        return
 
     settings = get_settings()
     setup_logging(settings.log_level, settings.log_format)
@@ -514,6 +685,11 @@ async def main(dashboard: bool = False) -> None:
     connection = MT5Connection(settings)
     await connection.connect()
     await connection.select_symbols(settings.symbols)
+    await fetch_symbol_digits(settings.symbols)
+
+    # Publish full MT5 symbol catalogue to Redis for the API process
+    from src.mt5.connection import publish_mt5_symbols
+    await publish_mt5_symbols(connection)
 
     # --- Backfill ---
     backfiller = Backfiller(connection, settings)
@@ -544,6 +720,12 @@ async def main(dashboard: bool = False) -> None:
         backfiller.start_scheduled_gap_scan(),
         name="gap_scan",
     )
+    active_symbols_task = asyncio.create_task(
+        _active_symbols_refresh_loop(
+            connection, collector, backfiller, settings,
+        ),
+        name="active_symbols_refresh",
+    )
 
     logger.info(
         "poller_running",
@@ -555,6 +737,7 @@ async def main(dashboard: bool = False) -> None:
         "heartbeat": heartbeat_task,
         "gap_scan": gap_scan_task,
         "backfill_listener": backfill_listener_task,
+        "active_symbols_refresh": active_symbols_task,
         # collector tasks are internal but we reference them by name
     }
     # Register collector sub-tasks

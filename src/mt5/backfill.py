@@ -64,6 +64,12 @@ class Backfiller:
         self._conn = connection
         self._settings = settings or get_settings()
         self._metrics = PollerMetrics()
+        # Active symbols — starts with config, updated dynamically
+        self._active_symbols: list[str] = list(self._settings.symbols)
+
+    def update_symbols(self, symbols: list[str]) -> None:
+        """Replace the active symbol set used by gap scan / reconnect."""
+        self._active_symbols = list(symbols)
 
     # ------------------------------------------------------------------
     # Initial backfill (called on startup)
@@ -104,7 +110,7 @@ class Backfiller:
         now = datetime.now(timezone.utc)
         total_gaps = 0
 
-        for symbol in self._settings.symbols:
+        for symbol in self._active_symbols:
             for tf in self._settings.timeframes:
                 state = await repo.get_sync_state(symbol, tf.value)
                 if state is None:
@@ -134,13 +140,69 @@ class Backfiller:
                 self._metrics.record_gap_scan(len(market_gaps))
                 total_gaps += len(market_gaps)
 
-                # Re-download the range that contains gaps
+                # Re-download the range that contains gaps (ignore sync_state)
                 range_start = market_gaps[0]
                 range_end = market_gaps[-1] + timedelta(seconds=tf.seconds)
-                await self._backfill_candles(symbol, tf, range_start, range_end)
+                await self.on_demand_candles(symbol, tf.value, range_start, range_end)
 
         self._metrics.record_gap_scan(total_gaps)
         logger.info("gap_scan_complete")
+
+    async def run_reconnect_backfill(self) -> None:
+        """Backfill ALL ticks and candles after a connection gap.
+
+        Uses ``on_demand_*`` methods that **ignore sync_state** so
+        that gaps in the middle of an already-synced range are filled.
+        The real-time collector may have advanced sync_state past the
+        gap, so we cannot rely on ``_backfill_candles``/``_backfill_ticks``
+        which skip data before ``last_synced_at``.
+
+        Scans ``find_candle_gaps`` per (symbol, tf) to discover the
+        exact missing period and re-downloads only that range.
+        For ticks, re-downloads the last ``backfill_days`` range
+        (``insert_ticks`` is idempotent via ON CONFLICT).
+        """
+        logger.info("reconnect_backfill_start")
+        self._metrics.set_backfill_phase("reconnect")
+        now = datetime.now(timezone.utc)
+        default_start = now - timedelta(days=self._settings.backfill_days)
+
+        for symbol in self._active_symbols:
+            # ── Candle gap repair per timeframe (ignores sync_state) ──
+            for tf in self._settings.timeframes:
+                self._metrics.set_backfill_phase("reconnect", f"{symbol} {tf.value}")
+
+                # Look back a generous window for gaps
+                state = await repo.get_sync_state(symbol, tf.value)
+                scan_from = default_start
+                if state and state["last_synced_at"] > default_start:
+                    scan_from = state["last_synced_at"] - timedelta(days=1)
+
+                gaps = await repo.find_candle_gaps(
+                    symbol, tf.value, scan_from, now, tf.seconds,
+                )
+                market_gaps = [g for g in gaps if is_forex_market_open(g)]
+                if not market_gaps:
+                    continue
+
+                range_start = market_gaps[0]
+                range_end = market_gaps[-1] + timedelta(seconds=tf.seconds)
+                logger.warning(
+                    "reconnect_gap_fill",
+                    symbol=symbol,
+                    timeframe=tf.value,
+                    gap_count=len(market_gaps),
+                    range_from=str(range_start),
+                    range_to=str(range_end),
+                )
+                await self.on_demand_candles(symbol, tf.value, range_start, range_end)
+
+            # ── Tick backfill (idempotent) ──
+            self._metrics.set_backfill_phase("reconnect", f"{symbol} ticks")
+            await self.on_demand_ticks(symbol, default_start, now)
+
+        self._metrics.set_backfill_phase("")
+        logger.info("reconnect_backfill_complete")
 
     async def start_scheduled_gap_scan(self) -> None:
         """Run gap scan in an infinite loop at the configured interval."""
@@ -299,6 +361,13 @@ class Backfiller:
     # Internal: tick backfill
     # ------------------------------------------------------------------
 
+    # Maximum seconds to wait for a single copy_ticks_range IPC call.
+    # MT5 can hang indefinitely on large ranges; cap it to keep startup unblocked.
+    _TICKS_IPC_TIMEOUT = 20
+    # On initial backfill cap tick history to this many hours so we never
+    # request a multi-day range that causes IPC hangs.
+    _TICKS_BACKFILL_MAX_HOURS = 4
+
     async def _backfill_ticks(
         self,
         symbol: str,
@@ -308,6 +377,18 @@ class Backfiller:
         state = await repo.get_sync_state(symbol, "tick")
         if state and state["last_synced_at"] > dt_from:
             dt_from = state["last_synced_at"]
+
+        # Cap the lookback so a single copy_ticks_range call is never
+        # given a huge range (which causes IPC hangs on Windows).
+        min_from = dt_to - timedelta(hours=self._TICKS_BACKFILL_MAX_HOURS)
+        if dt_from < min_from:
+            logger.info(
+                "backfill_ticks_range_capped",
+                symbol=symbol,
+                original_from=str(dt_from),
+                capped_from=str(min_from),
+            )
+            dt_from = min_from
 
         if dt_from >= dt_to:
             return
@@ -323,9 +404,20 @@ class Backfiller:
         cursor = dt_from
 
         while cursor < dt_to:
-            ticks = await run_in_mt5(
-                self._copy_ticks_range, symbol, cursor, dt_to
-            )
+            try:
+                ticks = await asyncio.wait_for(
+                    run_in_mt5(self._copy_ticks_range, symbol, cursor, dt_to),
+                    timeout=self._TICKS_IPC_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "backfill_ticks_ipc_timeout",
+                    symbol=symbol,
+                    cursor=str(cursor),
+                    timeout_sec=self._TICKS_IPC_TIMEOUT,
+                )
+                break
+
             if ticks is None or len(ticks) == 0:
                 break
 

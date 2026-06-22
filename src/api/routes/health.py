@@ -67,6 +67,7 @@ async def health_check() -> HealthResponse:
 
     # MT5 status from poller (via Redis key with 30s TTL)
     mt5_ok = False
+    trader_ok = False
     if redis_ok and r is not None:
         try:
             raw = await r.get("poller:status")
@@ -75,10 +76,18 @@ async def health_check() -> HealthResponse:
                 mt5_ok = bool(poller_data.get("mt5_connected", False))
         except Exception:
             pass
+        try:
+            raw_t = await r.get("trader:status")
+            if raw_t is not None:
+                trader_data = orjson.loads(raw_t)
+                trader_ok = bool(trader_data.get("running", False))
+        except Exception:
+            pass
 
     return HealthResponse(
         status="ok" if db_ok else "degraded",
         mt5_connected=mt5_ok,
+        trader_connected=trader_ok,
         db_connected=db_ok,
         redis_connected=redis_ok,
         uptime_sec=round(time.time() - _start_time, 1),

@@ -118,6 +118,24 @@ class MT5Connection:
             else:
                 logger.debug("mt5_symbol_selected", symbol=sym)
 
+    async def get_all_symbols(self) -> list[dict[str, str]]:
+        """Fetch all symbols available on the broker's server.
+
+        Returns a list of ``{"name": ..., "description": ...}`` dicts.
+        """
+        raw = await run_in_mt5(self._symbols_get)
+        if raw is None:
+            logger.warning("mt5_symbols_get_failed")
+            return []
+        results = []
+        for info in raw:
+            results.append({
+                "name": info.name,
+                "description": getattr(info, "description", ""),
+            })
+        logger.info("mt5_symbols_fetched", count=len(results))
+        return results
+
     async def shutdown(self) -> None:
         """Cleanly close the MT5 connection."""
         await run_in_mt5(self._shutdown)
@@ -135,8 +153,11 @@ class MT5Connection:
 
     def _try_connect(self) -> bool:
         import MetaTrader5 as mt5
+        from src.mt5.portable import minimize_terminal_window, prepare_terminal
 
         s = self._settings
+        # Write chart-less terminal.ini before mt5.initialize launches it
+        prepare_terminal(s.mt5_path)
         if not mt5.initialize(
             path=s.mt5_path,
             login=s.mt5_login,
@@ -154,6 +175,8 @@ class MT5Connection:
         ):
             return False
 
+        # Terminal is connected — minimize its window
+        minimize_terminal_window(s.mt5_path)
         return True
 
     @staticmethod
@@ -172,6 +195,83 @@ class MT5Connection:
         return mt5.symbol_select(symbol, True)
 
     @staticmethod
+    def _symbol_info(symbol: str):
+        import MetaTrader5 as mt5
+        return mt5.symbol_info(symbol)
+
+    @staticmethod
+    def _symbols_get():
+        import MetaTrader5 as mt5
+        return mt5.symbols_get()
+
+    @staticmethod
     def _shutdown():
         import MetaTrader5 as mt5
         mt5.shutdown()
+
+
+# ------------------------------------------------------------------
+# Symbol digits cache
+# ------------------------------------------------------------------
+
+_symbol_digits: dict[str, int] = {}
+
+
+async def fetch_symbol_digits(symbols: list[str]) -> dict[str, int]:
+    """Fetch and cache the number of price decimal digits for each symbol.
+
+    Also persists the mapping to Redis so the API process can read it.
+    """
+    for symbol in symbols:
+        info = await run_in_mt5(MT5Connection._symbol_info, symbol)
+        if info is not None:
+            _symbol_digits[symbol] = info.digits
+            logger.debug("symbol_digits_cached", symbol=symbol, digits=info.digits)
+        else:
+            logger.warning("symbol_digits_unavailable", symbol=symbol)
+
+    # Persist to Redis for the API process
+    if _symbol_digits:
+        try:
+            from src.redis_bus.pool import get_redis_pool
+            import orjson
+            redis = get_redis_pool()
+            await redis.set(
+                "meta:symbol_digits",
+                orjson.dumps(_symbol_digits),
+            )
+            logger.info("symbol_digits_published_to_redis", count=len(_symbol_digits))
+        except Exception:
+            logger.warning("symbol_digits_redis_publish_failed", exc_info=True)
+
+    return _symbol_digits
+
+
+def get_digits(symbol: str) -> int:
+    """Return cached price digits for *symbol* (default 5)."""
+    return _symbol_digits.get(symbol, 5)
+
+
+# ------------------------------------------------------------------
+# Publish full MT5 symbol catalogue to Redis
+# ------------------------------------------------------------------
+
+async def publish_mt5_symbols(connection: MT5Connection) -> int:
+    """Fetch all symbols from MT5 and store in Redis for the API process.
+
+    Returns the number of symbols published.
+    """
+    all_symbols = await connection.get_all_symbols()
+    if not all_symbols:
+        logger.warning("mt5_no_symbols_to_publish")
+        return 0
+
+    try:
+        import orjson
+        from src.redis_bus.pool import get_redis_pool
+        redis = get_redis_pool()
+        await redis.set("meta:mt5_symbols", orjson.dumps(all_symbols))
+        logger.info("mt5_symbols_published_to_redis", count=len(all_symbols))
+    except Exception:
+        logger.warning("mt5_symbols_redis_publish_failed", exc_info=True)
+    return len(all_symbols)

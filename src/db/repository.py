@@ -170,11 +170,23 @@ async def query_candles(
         params["dt_to"] = dt_to
 
     where = " AND ".join(clauses)
-    sql = text(
-        f"SELECT time, symbol, timeframe, open, high, low, close, "
-        f"tick_volume, real_volume, spread "
-        f"FROM candles WHERE {where} ORDER BY time ASC LIMIT :limit"
-    )
+    if dt_from:
+        # Explicit start — return oldest-first from that point
+        sql = text(
+            f"SELECT time, symbol, timeframe, open, high, low, close, "
+            f"tick_volume, real_volume, spread "
+            f"FROM candles WHERE {where} ORDER BY time ASC LIMIT :limit"
+        )
+    else:
+        # No start specified (to-only or no range) —
+        # return the LATEST N candles (optionally capped by dt_to)
+        sql = text(
+            f"SELECT * FROM ("
+            f"  SELECT time, symbol, timeframe, open, high, low, close, "
+            f"  tick_volume, real_volume, spread "
+            f"  FROM candles WHERE {where} ORDER BY time DESC LIMIT :limit"
+            f") sub ORDER BY time ASC"
+        )
 
     factory = get_session_factory()
     async with factory() as session:
@@ -201,10 +213,19 @@ async def query_ticks(
         params["dt_to"] = dt_to
 
     where = " AND ".join(clauses)
-    sql = text(
-        f"SELECT time_msc, symbol, bid, ask, last, volume, flags "
-        f"FROM ticks WHERE {where} ORDER BY time_msc ASC LIMIT :limit"
-    )
+    if dt_from or dt_to:
+        sql = text(
+            f"SELECT time_msc, symbol, bid, ask, last, volume, flags "
+            f"FROM ticks WHERE {where} ORDER BY time_msc ASC LIMIT :limit"
+        )
+    else:
+        # No range — return the LATEST N ticks in ascending order
+        sql = text(
+            f"SELECT * FROM ("
+            f"  SELECT time_msc, symbol, bid, ask, last, volume, flags "
+            f"  FROM ticks WHERE {where} ORDER BY time_msc DESC LIMIT :limit"
+            f") sub ORDER BY time_msc ASC"
+        )
 
     factory = get_session_factory()
     async with factory() as session:
@@ -290,7 +311,7 @@ async def query_spread_aggregated(
     ``time_bucket``. Returns avg / min / max spread per bucket.
     """
     clauses = ["symbol = :symbol", "ask IS NOT NULL", "bid IS NOT NULL"]
-    params: dict[str, Any] = {"symbol": symbol, "bucket": bucket, "limit": limit}
+    params: dict[str, Any] = {"symbol": symbol, "limit": limit}
 
     if dt_from:
         clauses.append("time_msc >= :dt_from")
@@ -300,13 +321,18 @@ async def query_spread_aggregated(
         params["dt_to"] = dt_to
 
     where = " AND ".join(clauses)
+    # bucket is validated against _VALID_BUCKETS whitelist in the route,
+    # so safe to inline. asyncpg cannot bind interval parameters directly.
+    # Wrap in subquery to get the LATEST N buckets in ascending order.
     sql = text(
-        f"SELECT time_bucket(:bucket, time_msc) AS time, "
-        f"  avg(ask - bid) AS spread_avg, "
-        f"  min(ask - bid) AS spread_min, "
-        f"  max(ask - bid) AS spread_max "
-        f"FROM ticks WHERE {where} "
-        f"GROUP BY 1 ORDER BY 1 ASC LIMIT :limit"
+        f"SELECT * FROM ("
+        f"  SELECT time_bucket('{bucket}'::interval, time_msc) AS time, "
+        f"    avg(ask - bid) AS spread_avg, "
+        f"    min(ask - bid) AS spread_min, "
+        f"    max(ask - bid) AS spread_max "
+        f"  FROM ticks WHERE {where} "
+        f"  GROUP BY 1 ORDER BY 1 DESC LIMIT :limit"
+        f") sub ORDER BY time ASC"
     )
 
     factory = get_session_factory()
@@ -424,7 +450,8 @@ async def query_custom_tf_candles(
         params["dt_to"] = dt_to
 
     where = " AND ".join(clauses)
-    sql = text(f"""
+
+    inner = f"""
         SELECT
             time_bucket(make_interval(secs => CAST(:bucket_seconds AS double precision)), c.time) AS time,
             c.symbol,
@@ -439,9 +466,16 @@ async def query_custom_tf_candles(
         FROM candles c
         WHERE {where}
         GROUP BY time_bucket(make_interval(secs => CAST(:bucket_seconds AS double precision)), c.time), c.symbol
-        ORDER BY time ASC
-        LIMIT :limit
-    """)
+    """
+
+    if dt_from:
+        sql = text(f"{inner} ORDER BY time ASC LIMIT :limit")
+    else:
+        # No start specified (to-only or no range) —
+        # return the LATEST N bars in ascending order
+        sql = text(
+            f"SELECT * FROM ({inner} ORDER BY time DESC LIMIT :limit) sub ORDER BY time ASC"
+        )
 
     factory = get_session_factory()
     async with factory() as session:
@@ -510,35 +544,71 @@ async def query_tick_bars(
     where = " AND ".join(clauses)
     having = "" if include_incomplete else "HAVING COUNT(*) = :tick_count"
 
-    sql = text(f"""
-        WITH numbered AS (
+    if dt_from or dt_to:
+        # Explicit range — oldest-first
+        sql = text(f"""
+            WITH numbered AS (
+                SELECT
+                    t.time_msc,
+                    {price_expr}   AS price,
+                    t.volume,
+                    t.flags,
+                    (ROW_NUMBER() OVER (ORDER BY t.time_msc ASC) - 1)
+                        / :tick_count  AS bar_idx
+                FROM ticks t
+                WHERE {where}
+            )
             SELECT
-                t.time_msc,
-                {price_expr}   AS price,
-                t.volume,
-                t.flags,
-                (ROW_NUMBER() OVER (ORDER BY t.time_msc ASC) - 1)
-                    / :tick_count  AS bar_idx
-            FROM ticks t
-            WHERE {where}
-        )
-        SELECT
-            MIN(time_msc)                                    AS time,
-            :symbol                                          AS symbol,
-            :tf_label                                        AS timeframe,
-            (ARRAY_AGG(price ORDER BY time_msc ASC))[1]      AS open,
-            MAX(price)                                       AS high,
-            MIN(price)                                       AS low,
-            (ARRAY_AGG(price ORDER BY time_msc DESC))[1]     AS close,
-            COUNT(*)::bigint                                 AS tick_volume,
-            COALESCE(SUM(volume), 0)::bigint                 AS real_volume,
-            0                                                AS spread
-        FROM numbered
-        GROUP BY bar_idx
-        {having}
-        ORDER BY MIN(time_msc) ASC
-        LIMIT :limit
-    """)
+                MIN(time_msc)                                    AS time,
+                :symbol                                          AS symbol,
+                :tf_label                                        AS timeframe,
+                (ARRAY_AGG(price ORDER BY time_msc ASC))[1]      AS open,
+                MAX(price)                                       AS high,
+                MIN(price)                                       AS low,
+                (ARRAY_AGG(price ORDER BY time_msc DESC))[1]     AS close,
+                COUNT(*)::bigint                                 AS tick_volume,
+                COALESCE(SUM(volume), 0)::bigint                 AS real_volume,
+                0                                                AS spread
+            FROM numbered
+            GROUP BY bar_idx
+            {having}
+            ORDER BY MIN(time_msc) ASC
+            LIMIT :limit
+        """)
+    else:
+        # No range — return the LATEST N bars in ascending order
+        sql = text(f"""
+            WITH numbered AS (
+                SELECT
+                    t.time_msc,
+                    {price_expr}   AS price,
+                    t.volume,
+                    t.flags,
+                    (ROW_NUMBER() OVER (ORDER BY t.time_msc DESC) - 1)
+                        / :tick_count  AS bar_idx
+                FROM ticks t
+                WHERE {where}
+            ),
+            bars AS (
+                SELECT
+                    MIN(time_msc)                                    AS time,
+                    :symbol                                          AS symbol,
+                    :tf_label                                        AS timeframe,
+                    (ARRAY_AGG(price ORDER BY time_msc ASC))[1]      AS open,
+                    MAX(price)                                       AS high,
+                    MIN(price)                                       AS low,
+                    (ARRAY_AGG(price ORDER BY time_msc DESC))[1]     AS close,
+                    COUNT(*)::bigint                                 AS tick_volume,
+                    COALESCE(SUM(volume), 0)::bigint                 AS real_volume,
+                    0                                                AS spread
+                FROM numbered
+                GROUP BY bar_idx
+                {having}
+                ORDER BY MIN(time_msc) DESC
+                LIMIT :limit
+            )
+            SELECT * FROM bars ORDER BY time ASC
+        """)
 
     factory = get_session_factory()
     async with factory() as session:

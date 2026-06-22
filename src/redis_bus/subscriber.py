@@ -65,35 +65,50 @@ class RedisSubscriber:
         """
         Async generator that yields ``(channel_name, parsed_message)``
         tuples indefinitely.
+
+        Uses native Redis async iteration for minimal latency.
         """
         if self._pubsub is None:
             raise RuntimeError("Call connect() first")
 
-        while True:
+        async for message in self._pubsub.listen():
+            if message["type"] != "message":
+                continue
+
+            channel = (
+                message["channel"].decode()
+                if isinstance(message["channel"], bytes)
+                else message["channel"]
+            )
             try:
-                message = await self._pubsub.get_message(
-                    ignore_subscribe_messages=True, timeout=1.0
-                )
-                if message is None:
-                    await asyncio.sleep(0.01)
-                    continue
-
-                if message["type"] != "message":
-                    continue
-
-                channel = (
-                    message["channel"].decode()
-                    if isinstance(message["channel"], bytes)
-                    else message["channel"]
-                )
                 data = orjson.loads(message["data"])
-                yield channel, data
-
-            except asyncio.CancelledError:
-                break
             except Exception:
-                logger.warning("redis_subscriber_listen_error", exc_info=True)
-                await asyncio.sleep(0.5)
+                logger.warning("redis_subscriber_parse_error", exc_info=True)
+                continue
+            yield channel, data
+
+    async def listen_raw(self) -> AsyncIterator[tuple[str, str]]:
+        """
+        Yield ``(channel_name, raw_payload_str)`` without JSON parsing.
+
+        Optimal for forwarding to WebSocket clients where the message
+        is already JSON-serialised by the publisher.
+        """
+        if self._pubsub is None:
+            raise RuntimeError("Call connect() first")
+
+        async for message in self._pubsub.listen():
+            if message["type"] != "message":
+                continue
+
+            channel = (
+                message["channel"].decode()
+                if isinstance(message["channel"], bytes)
+                else message["channel"]
+            )
+            raw = message["data"]
+            payload = raw.decode() if isinstance(raw, bytes) else raw
+            yield channel, payload
 
     async def close(self) -> None:
         if self._pubsub is not None:

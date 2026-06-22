@@ -90,6 +90,8 @@ Server (Windows host):  192.168.1.4
 REST API:               http://192.168.1.4:9000/api/v1/...
 WebSocket ticks:        ws://192.168.1.4:9000/ws/ticks/{symbol}
 WebSocket candles:      ws://192.168.1.4:9000/ws/candles/{symbol}/{timeframe}
+WebSocket account info: ws://192.168.1.4:9000/ws/trading/account-info/{account_id}
+WebSocket positions:    ws://192.168.1.4:9000/ws/trading/positions/{account_id}
 OpenAPI docs:           http://192.168.1.4:9000/docs
 ```
 
@@ -104,9 +106,19 @@ OpenAPI docs:           http://192.168.1.4:9000/docs
 | `/api/v1/candles/custom/{symbol}` | GET | **Custom timeframe candles** (M2, H6, T100…) |
 | `/api/v1/ticks/{symbol}` | GET | Historical raw ticks |
 | `/api/v1/health` | GET | Service health check (MT5 + DB + Redis status) |
+| `/api/v1/poller/status` | GET | **Full poller dashboard snapshot** (ticks, candles, errors, tasks, live prices) |
 | `/api/v1/coverage` | GET | Data coverage: first/last bar per symbol × timeframe |
 | `/api/v1/stats` | GET | API request statistics (1h/12h/24h windows) |
 | `/api/v1/stats/daily` | GET | **Historical daily statistics** (persisted, survives restarts) |
+| `/api/v1/trading/deals/{account_id}` | GET | Closed deal history for a trading account |
+| `/api/v1/trading/positions/{account_id}` | GET | Currently open positions |
+| `/api/v1/trading/account-info/{account_id}` | GET | **Account balance / equity / leverage / margin** |
+| `/api/v1/trading/account-info` | GET | All accounts balance / equity snapshot |
+| `/api/v1/admin/accounts` | GET/POST | List or create trading accounts |
+| `/api/v1/admin/accounts/{account_id}` | GET/PATCH/DELETE | Get, update, or delete a trading account |
+| `/api/v1/admin/accounts/verify` | POST | **Verify MT5 credentials** (no DB record created) |
+| `/api/v1/admin/accounts/{account_id}/verify-update` | POST | **Verify merged credentials** for existing account |
+| `/api/v1/admin/accounts/{account_id}/sync-history` | POST | **Force full deal-history resync** from MT5 (async, 202) |
 
 #### GET /api/v1/candles/{symbol}
 
@@ -229,6 +241,7 @@ curl "http://192.168.1.4:9000/api/v1/health"
 {
   "status": "ok",
   "mt5_connected": true,
+  "trader_connected": true,
   "db_connected": true,
   "redis_connected": true,
   "uptime_sec": 3600.5,
@@ -241,6 +254,7 @@ curl "http://192.168.1.4:9000/api/v1/health"
 |---|---|
 | `status` | `ok` or `degraded` (DB unreachable) |
 | `mt5_connected` | `true` if the Windows poller is running and connected to MT5 terminal |
+| `trader_connected` | `true` if the trader process is running (heartbeat via Redis, TTL 30s) |
 | `symbols_active` | Number of symbols being tracked |
 
 #### GET /api/v1/coverage
@@ -503,6 +517,236 @@ symbols.forEach(sym => {
 });
 ```
 
+#### Trading Account Data — Real-Time via WebSocket
+
+Live account balance/equity and position updates, pushed every ~5 seconds.
+
+**`/ws/trading/account-info/{account_id}`** — balance, equity, margin:
+
+```javascript
+const ws = new WebSocket("ws://192.168.1.4:9000/ws/trading/account-info/1");
+ws.onmessage = (e) => {
+  const info = JSON.parse(e.data);
+  if (info.event === "ping") return;
+  console.log(`Balance=${info.balance}  Equity=${info.equity}  Profit=${info.profit}`);
+};
+```
+
+Message:
+```json
+{
+  "account_id": 1,
+  "balance": 10000.0,
+  "equity": 10050.5,
+  "margin": 120.0,
+  "margin_free": 9930.5,
+  "margin_level": 8375.4,
+  "leverage": 100,
+  "currency": "USD",
+  "profit": 50.5
+}
+```
+
+**`/ws/trading/positions/{account_id}`** — open positions:
+
+```javascript
+const ws = new WebSocket("ws://192.168.1.4:9000/ws/trading/positions/1");
+ws.onmessage = (e) => {
+  const msg = JSON.parse(e.data);
+  if (msg.event === "ping") return;
+  msg.positions.forEach(p =>
+    console.log(`${p.symbol} ${p.volume} lots  P/L=${p.profit}`)
+  );
+};
+```
+
+Message:
+```json
+{
+  "account_id": 1,
+  "positions": [
+    {
+      "ticket": 123456,
+      "symbol": "EURUSD",
+      "type": 0,
+      "volume": 0.01,
+      "price_open": 1.0856,
+      "price_current": 1.0861,
+      "profit": 5.0,
+      "sl": 1.08,
+      "tp": 1.09
+    }
+  ]
+}
+```
+
+## Trading API
+
+Endpoints for trading account data — deal history, open positions, and account balance/equity snapshots. Data is synced from MT5 by the **trader process** (`python -m src.trader_main`).
+
+### Admin — Account Management
+
+Full CRUD for trading accounts with credential verification support.
+
+Each account automatically gets its own **portable MT5 terminal** copy under `MT5_PORTABLE_DIR/{login}/` (default `C:\MT5_Portable\{login}\`). This ensures accounts never interfere with each other or the poller's terminal. The terminal is provisioned by the trader process on first connect; callers never need to specify `mt5_path`.
+
+#### POST /api/v1/admin/accounts
+
+Create a new trading account.
+
+```bash
+curl -X POST http://localhost:9000/api/v1/admin/accounts \
+  -H 'Content-Type: application/json' \
+  -d '{"label": "Demo-1", "mt5_login": 12345, "mt5_password": "secret", "mt5_server": "Broker-Server", "verify_credentials": true}'
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `label` | string | yes | Human-readable label |
+| `mt5_login` | int | yes | MT5 account number |
+| `mt5_password` | string | yes | MT5 password |
+| `mt5_server` | string | yes | Broker server name |
+| `enabled` | bool | no | Default `true` |
+| `verify_credentials` | bool | no | If `true`, verify MT5 login before saving (requires trader process) |
+
+Responses: `201 Created`, `400` (invalid credentials), `409` (duplicate login/label).
+
+#### PATCH /api/v1/admin/accounts/{account_id}
+
+Partially update an existing account. Only send the fields you want to change.
+
+```bash
+curl -X PATCH http://localhost:9000/api/v1/admin/accounts/1 \
+  -H 'Content-Type: application/json' \
+  -d '{"mt5_password": "new_password", "verify_credentials": true}'
+```
+
+Behavior:
+- **Password-only update** works without false duplicate login/label errors.
+- Sending the same login/label as the current record does not conflict.
+- If `verify_credentials=true`, merges patch fields with the existing DB record and verifies combined credentials via MT5 before saving.
+- Changing `mt5_login` or `mt5_server` with `verify_credentials=true` requires `mt5_password`.
+
+Responses: `200`, `400` (invalid credentials / missing password), `404`, `409` (duplicate).
+
+#### POST /api/v1/admin/accounts/verify
+
+Verify MT5 credentials **without creating or modifying any record**. Requires the trader process.
+
+```bash
+curl -X POST http://localhost:9000/api/v1/admin/accounts/verify \
+  -H 'Content-Type: application/json' \
+  -d '{"mt5_login": 12345, "mt5_password": "secret", "mt5_server": "Broker-Server"}'
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `mt5_login` | int | yes | MT5 account number |
+| `mt5_password` | string | yes | MT5 password |
+| `mt5_server` | string | yes | Broker server name |
+| `mt5_path` | string | no | Path to terminal64.exe (default from .env) |
+| `account_id` | int | no | Existing account ID (context only) |
+
+**Response (200 OK):**
+```json
+{
+  "ok": true,
+  "account_name": "John Doe",
+  "server": "Broker-Server",
+  "balance": 765.32,
+  "leverage": 1000,
+  "currency": "USD",
+  "message": "MT5 login successful"
+}
+```
+
+**Response (400):** `{"detail": "Invalid MT5 credentials"}` (or: invalid path / unknown server / initialize failed)
+
+**Response (504):** `{"detail": "Trader process did not respond. Is it running?"}` (timeout 60s)
+
+#### POST /api/v1/admin/accounts/{account_id}/verify-update
+
+Verify **merged credentials** of an existing account without saving. Takes the current DB record, applies the partial update, and performs an MT5 login.
+
+```bash
+curl -X POST http://localhost:9000/api/v1/admin/accounts/1/verify-update \
+  -H 'Content-Type: application/json' \
+  -d '{"mt5_password": "new_password"}'
+```
+
+Request body: any fields from `AccountUpdate` (same as PATCH body).
+
+Response: same as `/verify` — `200 {ok, account_name, ...}` or `400 {detail}` or `404`.
+
+**Use case:** validate a password change before committing it via PATCH.
+
+#### DELETE /api/v1/admin/accounts/{account_id}
+
+Delete a trading account. Synced deals/positions are NOT deleted.  
+Deletion is immediately consistent — the account disappears from list/get right away.
+
+### Trading Data
+
+#### GET /api/v1/trading/deals/{account_id}
+
+Closed deal history.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `symbol` | string | — | Filter by symbol |
+| `from` | datetime | 30d ago | Start time (ISO 8601) |
+| `to` | datetime | now | End time (ISO 8601) |
+| `limit` | int | 1000 | Max rows (1–50000) |
+
+### GET /api/v1/trading/positions/{account_id}
+
+Currently open positions. Returns a plain array (not paginated).
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `symbol` | string | — | Filter by symbol |
+
+### GET /api/v1/trading/account-info/{account_id}
+
+Account balance, equity, leverage, and margin — updated every ~10s.
+
+```bash
+curl "http://192.168.1.4:9000/api/v1/trading/account-info/1"
+```
+
+**Response:**
+```json
+{
+  "account_id": 1,
+  "balance": 765.32,
+  "equity": 765.32,
+  "margin": 0.0,
+  "margin_free": 765.32,
+  "margin_level": 0.0,
+  "leverage": 1000,
+  "currency": "USD",
+  "profit": 0.0,
+  "name": "John Doe",
+  "server": "Broker-Server",
+  "trade_mode": 2,
+  "updated_at": "2026-03-15T14:53:30Z"
+}
+```
+
+| Field | Description |
+|---|---|
+| `balance` | Account balance in deposit currency |
+| `equity` | Balance + unrealized P&L |
+| `margin` | Used margin |
+| `margin_free` | Available margin (equity − margin) |
+| `margin_level` | Margin level % (0 if no open positions) |
+| `leverage` | Account leverage (e.g. 1000 = 1:1000) |
+| `trade_mode` | 0 = disabled, 1 = full access, 2 = investor (read-only) |
+
+### GET /api/v1/trading/account-info
+
+Same data for **all** accounts. Returns a list.
+
 ## Python Client SDK
 
 A built-in client library for consuming the API from Python scripts, notebooks, or other services.
@@ -665,14 +909,18 @@ MT_Connector/
     ├── config.py               # Pydantic settings
     ├── logging_config.py       # Structured logging
     ├── poller_main.py          # MT5 poller entry point
+    ├── trader_main.py          # Trading account sync entry point
     ├── models/                 # SQLAlchemy models
     │   ├── tick.py
     │   ├── candle.py
+    │   ├── trading.py          # Deal + Position models
+    │   ├── account.py          # TradingAccount model
     │   └── sync_state.py
     ├── db/                     # Database layer
     │   ├── engine.py           # Async engine + pool
     │   ├── init_timescale.py   # Schema init
-    │   └── repository.py       # CRUD operations
+    │   ├── repository.py       # Market-data CRUD
+    │   └── trading_repository.py # Trading accounts, deals, positions, account info
     ├── mt5/                    # MetaTrader 5 integration
     │   ├── connection.py       # Connect + reconnect + heartbeat
     │   ├── collector.py        # Real-time tick/candle polling
@@ -698,9 +946,12 @@ MT_Connector/
         │   ├── symbols.py
         │   ├── health.py
         │   ├── coverage.py         # Data coverage stats
-        │   └── stats.py            # API request metrics
+        │   ├── stats.py            # API request metrics
+        │   ├── trading.py          # Deals, positions, account info
+        │   └── accounts.py         # Admin CRUD for trading accounts
         └── websocket/
             ├── manager.py      # WS connection manager
+            ├── aggregator.py   # Real-time candle aggregation for custom TFs
             └── streams.py      # WS endpoints (ticks + candles)
 ```
 
