@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from unittest.mock import patch
+
+import pytest
+
+from src.db import repository
+
+
+class _Rows:
+    def all(self) -> list[object]:
+        return []
+
+
+class _Session:
+    def __init__(self) -> None:
+        self.statement = None
+        self.params = None
+
+    async def __aenter__(self) -> _Session:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def execute(self, statement: object, params: dict[str, object]) -> _Rows:
+        self.statement = statement
+        self.params = params
+        return _Rows()
+
+
+class _Factory:
+    def __init__(self, session: _Session) -> None:
+        self.session = session
+
+    def __call__(self) -> _Session:
+        return self.session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dt_from", "dt_to", "source_order", "number_order"),
+    [
+        (None, None, "ORDER BY t.time_msc DESC", "ORDER BY t.time_msc DESC"),
+        (
+            datetime(2026, 8, 1, tzinfo=UTC),
+            datetime(2026, 8, 2, tzinfo=UTC),
+            "ORDER BY t.time_msc ASC",
+            "ORDER BY t.time_msc ASC",
+        ),
+    ],
+)
+async def test_tick_bar_query_bounds_source_before_windowing(
+    dt_from: datetime | None,
+    dt_to: datetime | None,
+    source_order: str,
+    number_order: str,
+) -> None:
+    session = _Session()
+    with patch.object(repository, "get_session_factory", return_value=_Factory(session)):
+        rows = await repository.query_tick_bars(
+            symbol="EURUSD",
+            tick_count=4_000,
+            tf_label="T4000",
+            dt_from=dt_from,
+            dt_to=dt_to,
+            limit=51,
+            price_field="mid",
+            include_incomplete=False,
+        )
+
+    assert rows == []
+    assert session.params is not None
+    assert session.params["source_limit"] == 204_000
+    sql = str(session.statement)
+    source_start = sql.index("WITH source_ticks AS")
+    source_limit = sql.index("LIMIT :source_limit")
+    numbered_start = sql.index("numbered AS")
+    assert source_start < source_limit < numbered_start
+    assert source_order in sql[source_start:numbered_start]
+    assert number_order in sql[numbered_start:]
+    assert "(t.bid + t.ask) / 2.0" in sql[source_start:numbered_start]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("price_field", ["bid", "ask", "last", "mid"])
+@pytest.mark.parametrize("include_incomplete", [False, True])
+async def test_tick_bar_query_keeps_price_and_incomplete_contract(
+    price_field: str,
+    include_incomplete: bool,
+) -> None:
+    session = _Session()
+    with patch.object(repository, "get_session_factory", return_value=_Factory(session)):
+        await repository.query_tick_bars(
+            symbol="XAUUSD",
+            tick_count=500,
+            tf_label="T500",
+            limit=7,
+            price_field=price_field,  # type: ignore[arg-type]
+            include_incomplete=include_incomplete,
+        )
+
+    sql = str(session.statement)
+    expected_price = "(t.bid + t.ask) / 2.0" if price_field == "mid" else f"t.{price_field}"
+    assert expected_price in sql
+    assert ("HAVING COUNT(*) = :tick_count" in sql) is (not include_incomplete)
+    assert session.params is not None
+    assert session.params["source_limit"] == 3_500
+
+
+@pytest.mark.asyncio
+async def test_tick_bar_query_rejects_unknown_price_field() -> None:
+    with pytest.raises(ValueError, match="Unknown price_field"):
+        await repository.query_tick_bars(
+            symbol="EURUSD",
+            tick_count=100,
+            tf_label="T100",
+            price_field="secret",  # type: ignore[arg-type]
+        )

@@ -9,12 +9,11 @@ All write methods use UPSERT semantics:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from typing import Any, Literal, Sequence
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any, Literal
 
 import structlog
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -22,9 +21,16 @@ from tenacity import (
     wait_exponential,
 )
 
+from src.config import Timeframe
 from src.db.engine import get_session_factory
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
 logger = structlog.get_logger(__name__)
+
+_LATEST_CANDLE_MIN_LOOKBACK = timedelta(days=14)
+_LATEST_CANDLE_GAP_FACTOR = 4
 
 # --- Retry decorator for transient DB errors ---
 _db_retry = retry(
@@ -92,6 +98,38 @@ async def upsert_candles(rows: list[dict[str, Any]]) -> int:
             result = await session.execute(_UPSERT_CANDLES_SQL, rows)
             affected = result.rowcount  # type: ignore[union-attr]
     logger.debug("candles_upserted", count=affected, total=len(rows))
+    return affected
+
+
+@_db_retry
+async def upsert_candles_and_sync(
+    rows: list[dict[str, Any]],
+    sync_rows: list[dict[str, Any]],
+) -> int:
+    """Persist one collector cycle atomically in a single transaction.
+
+    ``rows`` contains only candles whose persisted OHLCV payload changed.
+    ``sync_rows`` contains symbol/timeframe pairs whose latest bar timestamp
+    advanced; unchanged rows already have the same authoritative sync value.
+    """
+    if not rows and not sync_rows:
+        return 0
+
+    factory = get_session_factory()
+    async with factory() as session, session.begin():
+        affected = 0
+        if rows:
+            result = await session.execute(_UPSERT_CANDLES_SQL, rows)
+            affected = result.rowcount  # type: ignore[union-attr]
+        if sync_rows:
+            await session.execute(_UPSERT_SYNC_SQL, sync_rows)
+
+    logger.debug(
+        "collector_candle_batch_persisted",
+        candles=affected,
+        candle_rows=len(rows),
+        sync_rows=len(sync_rows),
+    )
     return affected
 
 
@@ -170,6 +208,13 @@ async def query_candles(
         params["dt_to"] = dt_to
 
     where = " AND ".join(clauses)
+    latest_sql_template = (
+        "SELECT * FROM ("
+        "  SELECT time, symbol, timeframe, open, high, low, close, "
+        "  tick_volume, real_volume, spread "
+        "  FROM candles WHERE {where} ORDER BY time DESC LIMIT :limit"
+        ") sub ORDER BY time ASC"
+    )
     if dt_from:
         # Explicit start — return oldest-first from that point
         sql = text(
@@ -180,16 +225,37 @@ async def query_candles(
     else:
         # No start specified (to-only or no range) —
         # return the LATEST N candles (optionally capped by dt_to)
-        sql = text(
-            f"SELECT * FROM ("
-            f"  SELECT time, symbol, timeframe, open, high, low, close, "
-            f"  tick_volume, real_volume, spread "
-            f"  FROM candles WHERE {where} ORDER BY time DESC LIMIT :limit"
-            f") sub ORDER BY time ASC"
-        )
+        sql = text(latest_sql_template.format(where=where))
 
     factory = get_session_factory()
     async with factory() as session:
+        if not dt_from:
+            try:
+                timeframe_seconds = Timeframe.from_string(timeframe).seconds
+            except ValueError:
+                timeframe_seconds = 0
+            if timeframe_seconds:
+                anchor = dt_to or datetime.now(UTC)
+                estimated = timedelta(
+                    seconds=timeframe_seconds * max(1, limit) * _LATEST_CANDLE_GAP_FACTOR,
+                )
+                params["recent_from"] = anchor - max(
+                    estimated,
+                    _LATEST_CANDLE_MIN_LOOKBACK,
+                )
+                recent_where = f"{where} AND time >= :recent_from"
+                recent_result = await session.execute(
+                    text(latest_sql_template.format(where=recent_where)),
+                    params,
+                )
+                recent_rows = [dict(row._mapping) for row in recent_result.all()]
+                if len(recent_rows) >= limit:
+                    return recent_rows
+
+                # Sparse/offline symbols and unusually long market closures
+                # retain the exact historical behavior by falling back to the
+                # unrestricted query when the bounded window is insufficient.
+                params.pop("recent_from", None)
         result = await session.execute(sql, params)
         return [dict(r._mapping) for r in result.all()]
 
@@ -451,22 +517,25 @@ async def query_custom_tf_candles(
 
     where = " AND ".join(clauses)
 
-    inner = f"""
-        SELECT
-            time_bucket(make_interval(secs => CAST(:bucket_seconds AS double precision)), c.time) AS time,
-            c.symbol,
-            :tf_label                                        AS timeframe,
-            (ARRAY_AGG(c.open  ORDER BY c.time ASC))[1]      AS open,
-            MAX(c.high)                                      AS high,
-            MIN(c.low)                                       AS low,
-            (ARRAY_AGG(c.close ORDER BY c.time DESC))[1]     AS close,
-            SUM(c.tick_volume)::bigint                       AS tick_volume,
-            SUM(c.real_volume)::bigint                       AS real_volume,
-            MAX(c.spread)                                    AS spread
-        FROM candles c
-        WHERE {where}
-        GROUP BY time_bucket(make_interval(secs => CAST(:bucket_seconds AS double precision)), c.time), c.symbol
-    """
+    def build_inner(effective_where: str) -> str:
+        return f"""
+            SELECT
+                time_bucket(make_interval(secs => CAST(:bucket_seconds AS double precision)), c.time) AS time,
+                c.symbol,
+                :tf_label                                        AS timeframe,
+                (ARRAY_AGG(c.open  ORDER BY c.time ASC))[1]      AS open,
+                MAX(c.high)                                      AS high,
+                MIN(c.low)                                       AS low,
+                (ARRAY_AGG(c.close ORDER BY c.time DESC))[1]     AS close,
+                SUM(c.tick_volume)::bigint                       AS tick_volume,
+                SUM(c.real_volume)::bigint                       AS real_volume,
+                MAX(c.spread)                                    AS spread
+            FROM candles c
+            WHERE {effective_where}
+            GROUP BY time_bucket(make_interval(secs => CAST(:bucket_seconds AS double precision)), c.time), c.symbol
+        """
+
+    inner = build_inner(where)
 
     if dt_from:
         sql = text(f"{inner} ORDER BY time ASC LIMIT :limit")
@@ -479,6 +548,33 @@ async def query_custom_tf_candles(
 
     factory = get_session_factory()
     async with factory() as session:
+        if not dt_from:
+            anchor = dt_to or datetime.now(UTC)
+            estimated = timedelta(
+                seconds=bucket_seconds * max(1, limit) * _LATEST_CANDLE_GAP_FACTOR,
+            )
+            params["recent_from"] = anchor - max(
+                estimated,
+                _LATEST_CANDLE_MIN_LOOKBACK,
+            )
+            recent_where = (
+                f"{where} AND c.time >= "
+                "time_bucket("
+                "make_interval(secs => CAST(:bucket_seconds AS double precision)), "
+                "CAST(:recent_from AS timestamptz)"
+                ")"
+            )
+            recent_inner = build_inner(recent_where)
+            recent_sql = text(
+                f"SELECT * FROM ({recent_inner} ORDER BY time DESC LIMIT :limit) "
+                "sub ORDER BY time ASC"
+            )
+            recent_result = await session.execute(recent_sql, params)
+            recent_rows = [dict(row._mapping) for row in recent_result.all()]
+            if len(recent_rows) >= limit:
+                return recent_rows
+
+            params.pop("recent_from", None)
         result = await session.execute(sql, params)
         return [dict(r._mapping) for r in result.all()]
 
@@ -533,6 +629,10 @@ async def query_tick_bars(
         "tick_count": tick_count,
         "tf_label": tf_label,
         "limit": limit,
+        # The result can consume at most this many source rows.  Bounding the
+        # indexed tick scan before ROW_NUMBER/GROUP BY avoids sorting and
+        # spilling the symbol's complete history for every T<n> request.
+        "source_limit": tick_count * limit,
     }
     if dt_from:
         clauses.append("t.time_msc >= :dt_from")
@@ -547,16 +647,26 @@ async def query_tick_bars(
     if dt_from or dt_to:
         # Explicit range — oldest-first
         sql = text(f"""
-            WITH numbered AS (
+            WITH source_ticks AS (
                 SELECT
                     t.time_msc,
                     {price_expr}   AS price,
                     t.volume,
-                    t.flags,
-                    (ROW_NUMBER() OVER (ORDER BY t.time_msc ASC) - 1)
-                        / :tick_count  AS bar_idx
+                    t.flags
                 FROM ticks t
                 WHERE {where}
+                ORDER BY t.time_msc ASC
+                LIMIT :source_limit
+            ),
+            numbered AS (
+                SELECT
+                    time_msc,
+                    price,
+                    volume,
+                    flags,
+                    (ROW_NUMBER() OVER (ORDER BY t.time_msc ASC) - 1)
+                        / :tick_count  AS bar_idx
+                FROM source_ticks t
             )
             SELECT
                 MIN(time_msc)                                    AS time,
@@ -578,16 +688,26 @@ async def query_tick_bars(
     else:
         # No range — return the LATEST N bars in ascending order
         sql = text(f"""
-            WITH numbered AS (
+            WITH source_ticks AS (
                 SELECT
                     t.time_msc,
                     {price_expr}   AS price,
                     t.volume,
-                    t.flags,
-                    (ROW_NUMBER() OVER (ORDER BY t.time_msc DESC) - 1)
-                        / :tick_count  AS bar_idx
+                    t.flags
                 FROM ticks t
                 WHERE {where}
+                ORDER BY t.time_msc DESC
+                LIMIT :source_limit
+            ),
+            numbered AS (
+                SELECT
+                    time_msc,
+                    price,
+                    volume,
+                    flags,
+                    (ROW_NUMBER() OVER (ORDER BY t.time_msc DESC) - 1)
+                        / :tick_count  AS bar_idx
+                FROM source_ticks t
             ),
             bars AS (
                 SELECT
@@ -647,6 +767,83 @@ async def query_tick_coverage() -> list[dict[str, Any]]:
         FROM ticks
         GROUP BY symbol
         ORDER BY symbol
+    """)
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(sql)
+        return [dict(r._mapping) for r in result.all()]
+
+
+async def query_candle_bounds(
+    timeframes: Sequence[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return exact candle first/last bounds without aggregate row counts.
+
+    The primary ``(symbol, timeframe, time DESC)`` index resolves the first
+    and latest timestamps for each sync-state row without scanning all candles.
+    """
+    clauses = ["s.data_type <> 'tick'"]
+    params: dict[str, Any] = {}
+    if timeframes:
+        clauses.append("s.data_type = ANY(CAST(:timeframes AS text[]))")
+        params["timeframes"] = [value.upper() for value in timeframes]
+
+    sql = text(f"""
+        SELECT s.symbol,
+               s.data_type AS timeframe,
+               first_row.time AS first_bar,
+               last_row.time AS last_bar,
+               0::bigint AS total
+        FROM sync_state s
+        LEFT JOIN LATERAL (
+            SELECT c.time
+            FROM candles c
+            WHERE c.symbol = s.symbol
+              AND c.timeframe = s.data_type
+            ORDER BY c.time ASC
+            LIMIT 1
+        ) first_row ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT c.time
+            FROM candles c
+            WHERE c.symbol = s.symbol
+              AND c.timeframe = s.data_type
+            ORDER BY c.time DESC
+            LIMIT 1
+        ) last_row ON TRUE
+        WHERE {' AND '.join(clauses)}
+        ORDER BY s.symbol, s.data_type
+    """)
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(sql, params)
+        return [dict(r._mapping) for r in result.all()]
+
+
+async def query_tick_bounds() -> list[dict[str, Any]]:
+    """Return exact tick first/last bounds without scanning/counting ticks."""
+    sql = text("""
+        SELECT s.symbol,
+               first_row.time_msc AS first_tick,
+               last_row.time_msc AS last_tick,
+               0::bigint AS total
+        FROM sync_state s
+        LEFT JOIN LATERAL (
+            SELECT t.time_msc
+            FROM ticks t
+            WHERE t.symbol = s.symbol
+            ORDER BY t.time_msc ASC
+            LIMIT 1
+        ) first_row ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT t.time_msc
+            FROM ticks t
+            WHERE t.symbol = s.symbol
+            ORDER BY t.time_msc DESC
+            LIMIT 1
+        ) last_row ON TRUE
+        WHERE s.data_type = 'tick'
+        ORDER BY s.symbol
     """)
     factory = get_session_factory()
     async with factory() as session:
