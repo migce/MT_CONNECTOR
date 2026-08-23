@@ -103,7 +103,7 @@ OpenAPI docs:           http://192.168.1.4:9000/docs
 |---|---|---|
 | `/api/v1/symbols` | GET | List tracked symbols |
 | `/api/v1/candles/{symbol}` | GET | Historical OHLCV candles (standard TFs) |
-| `/api/v1/candles/custom/{symbol}` | GET | **Custom timeframe candles** (M2, H6, T100…) |
+| `/api/v1/candles/custom/{symbol}` | GET | **Custom timeframe candles** (M2, H6, T100, I100…) |
 | `/api/v1/ticks/{symbol}` | GET | Historical raw ticks |
 | `/api/v1/health` | GET | Service health check (MT5 + DB + Redis status) |
 | `/api/v1/poller/status` | GET | **Full poller dashboard snapshot** (ticks, candles, errors, tasks, live prices) |
@@ -167,8 +167,8 @@ Builds non-standard timeframe candles **on-the-fly** from stored data.
 | `from` | datetime | — | Start time (ISO 8601) |
 | `to` | datetime | — | End time (ISO 8601) |
 | `limit` | int | 1000 | Max rows (1–50000) |
-| `price` | string | `bid` | Price for tick bars: `bid`, `ask`, `last`, `mid` |
-| `include_incomplete` | bool | `false` | Include partial last tick bar |
+| `price` | string | `bid` | Price for fixed/adaptive event bars: `bid`, `ask`, `last`, `mid` |
+| `include_incomplete` | bool | `false` | Include the partial last event bar |
 
 **Supported custom timeframes:**
 
@@ -179,6 +179,7 @@ Builds non-standard timeframe candles **on-the-fly** from stored data.
 | `D<n>` | D2, D3 | H1 candles | `time_bucket` aggregation |
 | `W<n>` | W1 | H1 candles | `time_bucket` aggregation |
 | `T<n>` | T100, T250, T500, T1000 | Raw ticks | Every N ticks = 1 bar |
+| `I<n>` | I100, I250, I500, I1000 | Raw ticks | Research-only adaptive causal information budget |
 
 Standard TFs (M1, M5, M15, H1, H4, D1) are **auto-redirected** to the pre-computed table.
 
@@ -195,7 +196,14 @@ curl "http://localhost:9000/api/v1/candles/custom/EURUSD?timeframe=T500&price=mi
 
 # 100-tick bars with time range
 curl "http://localhost:9000/api/v1/candles/custom/EURUSD?timeframe=T100&from=2026-03-07T10:00:00Z&to=2026-03-07T18:00:00Z"
+
+# Research-only adaptive information bars with versioned response metadata
+curl "http://localhost:9000/api/v1/candles/custom/EURUSD?timeframe=I250&price=bid&limit=500"
 ```
+
+`I<n>` bars are deliberately marked `strategy_eligible=false`. Version 1 uses
+a bounded query-prefix anchor over the current stored tick identity, so it is a
+visual/research contract rather than an execution-time sequence contract.
 
 **Response (same schema as standard candles):**
 ```json

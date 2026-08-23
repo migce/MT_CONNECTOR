@@ -118,3 +118,33 @@ async def test_tick_bar_query_rejects_unknown_price_field() -> None:
             tf_label="T100",
             price_field="secret",  # type: ignore[arg-type]
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dt_from", "expected_source_order"),
+    [
+        (None, "ORDER BY t.time_msc DESC"),
+        (datetime(2026, 8, 1, tzinfo=UTC), "ORDER BY t.time_msc ASC"),
+    ],
+)
+async def test_information_bar_tick_source_is_bounded_and_returned_ascending(
+    dt_from: datetime | None,
+    expected_source_order: str,
+) -> None:
+    session = _Session()
+    with patch.object(repository, "get_session_factory", return_value=_Factory(session)):
+        rows = await repository.query_information_bar_ticks(
+            symbol="EURUSD",
+            dt_from=dt_from,
+            dt_to=datetime(2026, 8, 2, tzinfo=UTC),
+            source_limit=123_456,
+        )
+
+    assert rows == []
+    assert session.params is not None
+    assert session.params["source_limit"] == 123_456
+    sql = str(session.statement)
+    assert expected_source_order in sql
+    assert "LIMIT :source_limit" in sql
+    assert "ORDER BY time_msc ASC" in sql or "ORDER BY t.time_msc ASC" in sql

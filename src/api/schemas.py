@@ -5,7 +5,7 @@ Pydantic schemas for the API layer — request parameters and response models.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Generic, Optional, TypeVar
+from typing import Any, Generic, Optional, TypeVar
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -41,6 +41,10 @@ class PaginatedResponse(BaseModel, Generic[T]):
             "for fetching the next page. Null when has_more is false."
         ),
     )
+    meta: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Optional versioned generation metadata for derived data.",
+    )
 
 
 # ---------------------------------------------------------------
@@ -58,6 +62,16 @@ class CandleResponse(BaseModel):
     tick_volume: int
     real_volume: int = 0
     spread: int = 0
+    end_time: Optional[datetime] = None
+    high_time: Optional[datetime] = None
+    low_time: Optional[datetime] = None
+    duration_ms: Optional[int] = None
+    information_value: Optional[float] = None
+    mean_activity: Optional[float] = None
+    mean_coherence: Optional[float] = None
+    mean_information_weight: Optional[float] = None
+    mean_spread: Optional[float] = None
+    is_complete: Optional[bool] = None
 
     model_config = {"from_attributes": True}
 

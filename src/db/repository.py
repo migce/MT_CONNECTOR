@@ -737,6 +737,64 @@ async def query_tick_bars(
 
 
 # ---------------------------------------------------------------
+# Information bars — bounded ordered tick source for Python builder
+# ---------------------------------------------------------------
+
+async def query_information_bar_ticks(
+    symbol: str,
+    *,
+    dt_from: datetime | None = None,
+    dt_to: datetime | None = None,
+    source_limit: int = 1_000_000,
+) -> list[dict[str, Any]]:
+    """Return a bounded ascending tick prefix for adaptive aggregation.
+
+    With ``dt_from`` the prefix starts at that explicit boundary.  Without it,
+    the latest bounded source window is selected in descending index order and
+    then returned ascending for deterministic causal replay.  ``dt_to`` acts as
+    the latest-window anchor in both cases.
+    """
+    clauses = ["t.symbol = :symbol"]
+    params: dict[str, Any] = {
+        "symbol": symbol,
+        "source_limit": max(1, source_limit),
+    }
+    if dt_from is not None:
+        clauses.append("t.time_msc >= :dt_from")
+        params["dt_from"] = dt_from
+    if dt_to is not None:
+        clauses.append("t.time_msc <= :dt_to")
+        params["dt_to"] = dt_to
+    where = " AND ".join(clauses)
+
+    columns = "t.time_msc, t.symbol, t.bid, t.ask, t.last, t.volume, t.flags"
+    if dt_from is not None:
+        sql = text(f"""
+            SELECT {columns}
+            FROM ticks t
+            WHERE {where}
+            ORDER BY t.time_msc ASC
+            LIMIT :source_limit
+        """)
+    else:
+        sql = text(f"""
+            SELECT * FROM (
+                SELECT {columns}
+                FROM ticks t
+                WHERE {where}
+                ORDER BY t.time_msc DESC
+                LIMIT :source_limit
+            ) source_ticks
+            ORDER BY time_msc ASC
+        """)
+
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(sql, params)
+        return [dict(r._mapping) for r in result.all()]
+
+
+# ---------------------------------------------------------------
 # Coverage statistics (for /api/v1/coverage)
 # ---------------------------------------------------------------
 

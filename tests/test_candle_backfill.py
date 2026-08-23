@@ -422,6 +422,52 @@ class TestCustomCandleEndpoint:
         assert mock_bf.call_args.kwargs["limit"] == 200
         assert result.count == 200
 
+    async def test_information_bars_are_built_backend_side_with_research_meta(self):
+        """I<n> returns ready candles and an explicit chart-only contract."""
+        from src.api.routes.custom_candles import get_custom_candles
+
+        start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        ticks = [
+            {
+                "time_msc": start + timedelta(milliseconds=index),
+                "symbol": "EURUSD",
+                "bid": 1.0 + index * 0.00001,
+                "ask": 1.00002 + index * 0.00001,
+                "last": 1.0 + index * 0.00001,
+                "volume": 1,
+                "flags": 6,
+            }
+            for index in range(400)
+        ]
+
+        with (
+            patch("src.api.routes.custom_candles.maybe_backfill_ticks", new_callable=AsyncMock),
+            patch("src.api.routes.custom_candles.validate_symbol", return_value="EURUSD"),
+            patch(
+                "src.api.routes.custom_candles.repo.query_information_bar_ticks",
+                new_callable=AsyncMock,
+                return_value=ticks,
+            ) as query,
+        ):
+            result = await get_custom_candles(
+                symbol="EURUSD",
+                timeframe="I100",
+                from_dt=None,
+                to_dt=None,
+                limit=3,
+                bars=None,
+                price="bid",
+                include_incomplete=False,
+            )
+
+        assert result.count == 3
+        assert all(item.timeframe == "I100" for item in result.data)
+        assert all(item.is_complete is True for item in result.data)
+        assert result.meta is not None
+        assert result.meta["strategy_eligible"] is False
+        assert result.meta["bar_model"]["algorithm"] == "adaptive-information-bars-v1"
+        assert query.call_args.kwargs["source_limit"] > 400
+
 
 # ---------------------------------------------------------------------------
 # 6. Backfill endpoint

@@ -8,6 +8,8 @@ Serves **non-standard timeframe candles** built on-the-fly from stored data:
   ``time_bucket``.
 * **Tick bars** (``T100``, ``T500``, ``T1000``, …) — each bar contains
   exactly *N* ticks, built on-the-fly from the raw ``ticks`` hypertable.
+* **Information bars** (``I100``, ``I500``, ``I1000``, …) — research-only
+  adaptive bars whose bounded causal tick weights fill an information budget.
 
 Standard timeframes (M1, M5, M15, H1, H4, D1) are redirected to the
 pre-computed candle table for maximum performance.
@@ -35,6 +37,11 @@ from src.config import (
     parse_custom_timeframe,
 )
 from src.db import repository as repo
+from src.information_bars import (
+    InformationBarConfig,
+    build_information_bars,
+    information_source_limit,
+)
 
 router = APIRouter(prefix="/api/v1", tags=["custom-candles"])
 
@@ -65,6 +72,9 @@ def _choose_source_tf(bucket_seconds: int) -> str:
         "`D` (days), `W` (weeks).  Minimum bucket size is 60 s.\n\n"
         "**Tick bars**: `T100`, `T250`, `T500`, `T1000`, … — "
         "each bar contains exactly N ticks.\n\n"
+        "**Adaptive information bars**: `I100`, `I250`, `I500`, `I1000`, … — "
+        "research-only causal bars that expand directional activity and "
+        "compress quiet or two-sided tick noise.\n\n"
         "Standard timeframes (M1, M5, M15, H1, H4, D1) are served from "
         "the pre-computed table."
     ),
@@ -76,9 +86,10 @@ async def get_custom_candles(
         description=(
             "Custom timeframe string.  "
             "Time-based: M2, M3, H2, H6, H12, D2, W1, …  "
-            "Tick bars: T100, T500, T1000, …"
+            "Tick bars: T100, T500, T1000, …  "
+            "Information bars: I100, I500, I1000, …"
         ),
-        examples=["M2", "M3", "M10", "H2", "H6", "H12", "T100", "T500"],
+        examples=["M2", "H2", "T500", "I500"],
     ),
     from_dt: Optional[datetime] = Query(
         default=None,
@@ -114,7 +125,7 @@ async def get_custom_candles(
         default=False,
         description=(
             "For tick bars: include the last (incomplete) bar if it has "
-            "fewer than N ticks.  Default: only full bars."
+            "not reached its fixed or adaptive budget. Default: only full bars."
         ),
     ),
 ) -> PaginatedResponse[CandleResponse]:
@@ -145,6 +156,55 @@ async def get_custom_candles(
         ctf = parse_custom_timeframe(tf_str)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    # ------ Adaptive information bars (research-only) ------
+    if ctf.is_information_bar:
+        if ctf.information_budget < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="Information bar budget must be >= 2.",
+            )
+        await maybe_backfill_ticks(
+            symbol=symbol,
+            dt_from=from_dt,
+            dt_to=to_dt,
+            limit=1,
+        )
+        config = InformationBarConfig(budget=ctf.information_budget)
+        source_limit = information_source_limit(config, fetch_limit)
+        ticks = await repo.query_information_bar_ticks(
+            symbol=symbol,
+            dt_from=from_dt,
+            dt_to=to_dt,
+            source_limit=source_limit,
+        )
+        rows = build_information_bars(
+            ticks,
+            config,
+            price_field=price,
+            include_incomplete=include_incomplete,
+        )
+        rows = rows[-fetch_limit:] if use_latest_n else rows[:fetch_limit]
+        meta = {
+            "bar_model": config.metadata(),
+            "price": price,
+            "strategy_eligible": False,
+            "anchor_mode": "bounded_query_prefix",
+            "source_tick_count": len(ticks),
+            "source_limit": source_limit,
+            "source_truncated": len(ticks) >= source_limit,
+            "known_limitations": [
+                "query_prefix_anchor",
+                "same_millisecond_tick_identity",
+                "no_persistent_live_revision_sequence",
+            ],
+        }
+        return _paginate_candles(
+            rows,
+            effective_limit,
+            latest_n=use_latest_n,
+            meta=meta,
+        )
 
     # ------ Tick bars ------
     if ctf.is_tick_bar:
@@ -210,6 +270,7 @@ def _paginate_candles(
     limit: int,
     *,
     latest_n: bool = False,
+    meta: dict | None = None,
 ) -> PaginatedResponse[CandleResponse]:
     """Build a PaginatedResponse from raw rows, detecting has_more."""
     if latest_n:
@@ -219,6 +280,7 @@ def _paginate_candles(
             data=data,
             count=len(data),
             has_more=len(rows) >= limit,
+            meta=meta,
         )
 
     # Range query: one extra row was fetched to detect has_more.
@@ -235,4 +297,5 @@ def _paginate_candles(
         count=len(data),
         has_more=has_more,
         next_from=next_from,
+        meta=meta,
     )

@@ -6,7 +6,7 @@ Endpoints:
   - ``/ws/candles/{symbol}/{timeframe}``  — stream candle updates
 
 Standard timeframes use a shared Redis pump.  Custom timeframes
-(M2, H6, T100, …) are aggregated server-side from the source
+(M2, H6, T100, I100, …) are aggregated server-side from the source
 channel (M1/H1 candles or raw ticks).
 """
 
@@ -23,6 +23,7 @@ from starlette.websockets import WebSocketState
 from src.api.websocket.aggregator import CandleAggregator, TickBarAggregator
 from src.api.websocket.manager import ws_manager
 from src.config import Timeframe, get_settings, is_standard_timeframe, parse_custom_timeframe
+from src.information_bars import InformationBarBuilder, InformationBarConfig
 from src.redis_bus.subscriber import RedisSubscriber
 
 logger = structlog.get_logger(__name__)
@@ -63,7 +64,11 @@ def _validate_ws_timeframe(tf: str) -> bool:
     if is_standard_timeframe(tf):
         return True
     try:
-        parse_custom_timeframe(tf)
+        parsed = parse_custom_timeframe(tf)
+        if parsed.is_tick_bar:
+            return parsed.tick_count >= 2
+        if parsed.is_information_bar:
+            return parsed.information_budget >= 2
         return True
     except ValueError:
         return False
@@ -269,9 +274,9 @@ async def _aggregated_candle_pump(
 async def _aggregated_tick_bar_pump(
     ws: WebSocket,
     symbol: str,
-    aggregator: TickBarAggregator,
+    aggregator: TickBarAggregator | InformationBarBuilder,
 ) -> None:
-    """Subscribe to the tick channel, aggregate into N-tick bars, forward."""
+    """Subscribe to ticks, aggregate fixed/adaptive event bars, and forward."""
     _logger = structlog.get_logger("ws.agg_tick")
     tick_channel = f"tick:{symbol}"
     retry_delay = 1.0
@@ -288,7 +293,8 @@ async def _aggregated_tick_bar_pump(
                 completed, current = aggregator.update(data)
                 if completed is not None:
                     await ws.send_text(orjson.dumps(completed).decode())
-                await ws.send_text(orjson.dumps(current).decode())
+                if current is not None and current is not completed:
+                    await ws.send_text(orjson.dumps(current).decode())
 
         except asyncio.CancelledError:
             break
@@ -316,6 +322,7 @@ async def ws_candles(ws: WebSocket, symbol: str, timeframe: str) -> None:
     **Standard TFs** (M1–D1): shared Redis pump, zero overhead.
     **Custom time-based** (M2, H6, …): server aggregates from M1/H1.
     **Tick bars** (T100, T500, …): server aggregates from raw ticks.
+    **Information bars** (I100, I500, …): research-only adaptive tick clock.
 
     Heartbeats every 30 s. Clients may send ``{"action": "ping"}``.
     """
@@ -370,6 +377,13 @@ async def ws_candles(ws: WebSocket, symbol: str, timeframe: str) -> None:
                 pump_task = asyncio.create_task(
                     _aggregated_tick_bar_pump(ws, symbol, agg)
                 )
+            elif ctf.is_information_bar:
+                agg = InformationBarBuilder(
+                    InformationBarConfig(budget=ctf.information_budget)
+                )
+                pump_task = asyncio.create_task(
+                    _aggregated_tick_bar_pump(ws, symbol, agg)
+                )
             else:
                 source_tf = _choose_source_tf(ctf.seconds)
                 source_channel = f"candle:{symbol}:{source_tf}"
@@ -382,7 +396,11 @@ async def ws_candles(ws: WebSocket, symbol: str, timeframe: str) -> None:
                 "ws_custom_candle_connected",
                 symbol=symbol,
                 timeframe=timeframe,
-                source="ticks" if ctf.is_tick_bar else source_tf,
+                source=(
+                    "ticks"
+                    if ctf.is_tick_bar or ctf.is_information_bar
+                    else source_tf
+                ),
             )
 
             try:
