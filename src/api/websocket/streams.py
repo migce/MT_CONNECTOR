@@ -6,7 +6,7 @@ Endpoints:
   - ``/ws/candles/{symbol}/{timeframe}``  — stream candle updates
 
 Standard timeframes use a shared Redis pump.  Custom timeframes
-(M2, H6, T100, I100, …) are aggregated server-side from the source
+(M2, H6, T100, I100, A100, …) are aggregated server-side from the source
 channel (M1/H1 candles or raw ticks).
 """
 
@@ -24,6 +24,7 @@ from src.api.websocket.aggregator import CandleAggregator, TickBarAggregator
 from src.api.websocket.manager import ws_manager
 from src.config import Timeframe, get_settings, is_standard_timeframe, parse_custom_timeframe
 from src.information_bars import InformationBarBuilder, InformationBarConfig
+from src.information_bars_v2 import InformationBarV2Builder, InformationBarV2Config
 from src.redis_bus.subscriber import RedisSubscriber
 
 logger = structlog.get_logger(__name__)
@@ -69,6 +70,8 @@ def _validate_ws_timeframe(tf: str) -> bool:
             return parsed.tick_count >= 2
         if parsed.is_information_bar:
             return parsed.information_budget >= 2
+        if parsed.is_adaptive_target_bar:
+            return parsed.adaptive_target_ticks >= 2
         return True
     except ValueError:
         return False
@@ -274,7 +277,7 @@ async def _aggregated_candle_pump(
 async def _aggregated_tick_bar_pump(
     ws: WebSocket,
     symbol: str,
-    aggregator: TickBarAggregator | InformationBarBuilder,
+    aggregator: TickBarAggregator | InformationBarBuilder | InformationBarV2Builder,
 ) -> None:
     """Subscribe to ticks, aggregate fixed/adaptive event bars, and forward."""
     _logger = structlog.get_logger("ws.agg_tick")
@@ -323,6 +326,7 @@ async def ws_candles(ws: WebSocket, symbol: str, timeframe: str) -> None:
     **Custom time-based** (M2, H6, …): server aggregates from M1/H1.
     **Tick bars** (T100, T500, …): server aggregates from raw ticks.
     **Information bars** (I100, I500, …): research-only adaptive tick clock.
+    **Adaptive v2 bars** (A100, A500, …): frozen target-tick clock.
 
     Heartbeats every 30 s. Clients may send ``{"action": "ping"}``.
     """
@@ -384,6 +388,15 @@ async def ws_candles(ws: WebSocket, symbol: str, timeframe: str) -> None:
                 pump_task = asyncio.create_task(
                     _aggregated_tick_bar_pump(ws, symbol, agg)
                 )
+            elif ctf.is_adaptive_target_bar:
+                agg = InformationBarV2Builder(
+                    InformationBarV2Config(
+                        neutral_ticks=ctf.adaptive_target_ticks
+                    )
+                )
+                pump_task = asyncio.create_task(
+                    _aggregated_tick_bar_pump(ws, symbol, agg)
+                )
             else:
                 source_tf = _choose_source_tf(ctf.seconds)
                 source_channel = f"candle:{symbol}:{source_tf}"
@@ -398,7 +411,11 @@ async def ws_candles(ws: WebSocket, symbol: str, timeframe: str) -> None:
                 timeframe=timeframe,
                 source=(
                     "ticks"
-                    if ctf.is_tick_bar or ctf.is_information_bar
+                    if (
+                        ctf.is_tick_bar
+                        or ctf.is_information_bar
+                        or ctf.is_adaptive_target_bar
+                    )
                     else source_tf
                 ),
             )

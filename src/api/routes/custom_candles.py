@@ -10,6 +10,8 @@ Serves **non-standard timeframe candles** built on-the-fly from stored data:
   exactly *N* ticks, built on-the-fly from the raw ``ticks`` hypertable.
 * **Information bars** (``I100``, ``I500``, ``I1000``, …) — research-only
   adaptive bars whose bounded causal tick weights fill an information budget.
+* **Adaptive v2 bars** (``A100``, ``A500``, ``A1000``, …) — research-only
+  bars whose target tick count is frozen before each bar opens.
 
 Standard timeframes (M1, M5, M15, H1, H4, D1) are redirected to the
 pre-computed candle table for maximum performance.
@@ -41,6 +43,11 @@ from src.information_bars import (
     InformationBarConfig,
     build_information_bars,
     information_source_limit,
+)
+from src.information_bars_v2 import (
+    InformationBarV2Config,
+    build_information_bars_v2,
+    information_v2_source_limit,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["custom-candles"])
@@ -75,6 +82,9 @@ def _choose_source_tf(bucket_seconds: int) -> str:
         "**Adaptive information bars**: `I100`, `I250`, `I500`, `I1000`, … — "
         "research-only causal bars that expand directional activity and "
         "compress quiet or two-sided tick noise.\n\n"
+        "**Adaptive target-tick v2 bars**: `A100`, `A250`, `A500`, "
+        "`A1000`, … — research-only causal bars with a target tick count "
+        "frozen before each bar opens.\n\n"
         "Standard timeframes (M1, M5, M15, H1, H4, D1) are served from "
         "the pre-computed table."
     ),
@@ -87,9 +97,10 @@ async def get_custom_candles(
             "Custom timeframe string.  "
             "Time-based: M2, M3, H2, H6, H12, D2, W1, …  "
             "Tick bars: T100, T500, T1000, …  "
-            "Information bars: I100, I500, I1000, …"
+            "Information bars v1: I100, I500, I1000, …  "
+            "Adaptive v2 bars: A100, A500, A1000, …"
         ),
-        examples=["M2", "H2", "T500", "I500"],
+        examples=["M2", "H2", "T500", "I500", "A500"],
     ),
     from_dt: Optional[datetime] = Query(
         default=None,
@@ -156,6 +167,58 @@ async def get_custom_candles(
         ctf = parse_custom_timeframe(tf_str)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    # ------ Adaptive target-tick bars v2 (research-only) ------
+    if ctf.is_adaptive_target_bar:
+        if ctf.adaptive_target_ticks < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="Adaptive v2 neutral target must be >= 2.",
+            )
+        await maybe_backfill_ticks(
+            symbol=symbol,
+            dt_from=from_dt,
+            dt_to=to_dt,
+            limit=1,
+        )
+        config_v2 = InformationBarV2Config(
+            neutral_ticks=ctf.adaptive_target_ticks
+        )
+        source_limit = information_v2_source_limit(config_v2, fetch_limit)
+        ticks = await repo.query_information_bar_ticks(
+            symbol=symbol,
+            dt_from=from_dt,
+            dt_to=to_dt,
+            source_limit=source_limit,
+        )
+        rows = build_information_bars_v2(
+            ticks,
+            config_v2,
+            price_field=price,
+            include_incomplete=include_incomplete,
+        )
+        rows = rows[-fetch_limit:] if use_latest_n else rows[:fetch_limit]
+        meta = {
+            "bar_model": config_v2.metadata(),
+            "price": price,
+            "strategy_eligible": False,
+            "anchor_mode": "bounded_query_prefix",
+            "source_tick_count": len(ticks),
+            "source_limit": source_limit,
+            "source_truncated": len(ticks) >= source_limit,
+            "known_limitations": [
+                "query_prefix_anchor",
+                "same_millisecond_tick_identity",
+                "connection_local_live_warmup",
+                "no_persistent_live_revision_sequence",
+            ],
+        }
+        return _paginate_candles(
+            rows,
+            effective_limit,
+            latest_n=use_latest_n,
+            meta=meta,
+        )
 
     # ------ Adaptive information bars (research-only) ------
     if ctf.is_information_bar:

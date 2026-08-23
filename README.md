@@ -103,7 +103,7 @@ OpenAPI docs:           http://192.168.1.4:9000/docs
 |---|---|---|
 | `/api/v1/symbols` | GET | List tracked symbols |
 | `/api/v1/candles/{symbol}` | GET | Historical OHLCV candles (standard TFs) |
-| `/api/v1/candles/custom/{symbol}` | GET | **Custom timeframe candles** (M2, H6, T100, I100…) |
+| `/api/v1/candles/custom/{symbol}` | GET | **Custom timeframe candles** (M2, H6, T100, I100, A100…) |
 | `/api/v1/ticks/{symbol}` | GET | Historical raw ticks |
 | `/api/v1/health` | GET | Service health check (MT5 + DB + Redis status) |
 | `/api/v1/poller/status` | GET | **Full poller dashboard snapshot** (ticks, candles, errors, tasks, live prices) |
@@ -180,6 +180,7 @@ Builds non-standard timeframe candles **on-the-fly** from stored data.
 | `W<n>` | W1 | H1 candles | `time_bucket` aggregation |
 | `T<n>` | T100, T250, T500, T1000 | Raw ticks | Every N ticks = 1 bar |
 | `I<n>` | I100, I250, I500, I1000 | Raw ticks | Research-only adaptive causal information budget |
+| `A<n>` | A100, A250, A500, A1000 | Raw ticks | Research-only v2 target tick count frozen before each bar |
 
 Standard TFs (M1, M5, M15, H1, H4, D1) are **auto-redirected** to the pre-computed table.
 
@@ -199,11 +200,19 @@ curl "http://localhost:9000/api/v1/candles/custom/EURUSD?timeframe=T100&from=202
 
 # Research-only adaptive information bars with versioned response metadata
 curl "http://localhost:9000/api/v1/candles/custom/EURUSD?timeframe=I250&price=bid&limit=500"
+
+# Research-only adaptive v2 bars with a frozen target tick count per bar
+curl "http://localhost:9000/api/v1/candles/custom/EURUSD?timeframe=A250&price=bid&limit=500"
 ```
 
 `I<n>` bars are deliberately marked `strategy_eligible=false`. Version 1 uses
 a bounded query-prefix anchor over the current stored tick identity, so it is a
 visual/research contract rather than an execution-time sequence contract.
+
+`A<n>` is the separate version 2 research contract. The target tick count is
+chosen from causal arrival, path-activity, and directional-efficiency inputs
+before a bar opens and remains fixed until that bar closes. It is also marked
+`strategy_eligible=false` and is not an ATS/execution timeframe.
 
 **Response (same schema as standard candles):**
 ```json

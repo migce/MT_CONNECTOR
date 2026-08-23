@@ -20,7 +20,7 @@ from src.information_bars import PriceField, _as_datetime, tick_price
 if TYPE_CHECKING:
     from datetime import datetime
 
-INFORMATION_BAR_V2_ALGORITHM = "adaptive-target-tick-bars-v2-experimental"
+INFORMATION_BAR_V2_ALGORITHM = "adaptive-target-tick-bars-v2"
 
 
 @dataclass(frozen=True)
@@ -83,6 +83,20 @@ class InformationBarV2Config:
             "min_target_ticks": self.min_target_ticks,
             "max_target_ticks": self.max_target_ticks,
         }
+
+
+def information_v2_source_limit(
+    config: InformationBarV2Config,
+    bar_limit: int,
+    *,
+    hard_cap: int = 1_000_000,
+) -> int:
+    """Return a bounded source window for an on-demand v2 chart request."""
+    requested = (
+        config.max_target_ticks * (max(1, bar_limit) + 2)
+        + config.warmup_ticks
+    )
+    return min(hard_cap, requested)
 
 
 @dataclass(frozen=True)
@@ -283,7 +297,7 @@ class InformationBarV2Builder:
             "time": tick_time,
             "end_time": tick_time,
             "symbol": str(tick.get("symbol") or ""),
-            "timeframe": f"I{self._config.neutral_ticks}",
+            "timeframe": f"A{self._config.neutral_ticks}",
             "open": price,
             "high": price,
             "low": price,

@@ -41,13 +41,23 @@ class TestCustomTimeframe:
         ct = parse_custom_timeframe("T500")
         assert ct.is_tick_bar
         assert not ct.is_information_bar
+        assert not ct.is_adaptive_target_bar
         assert ct.tick_count == 500
 
     def test_information_bar(self):
         ct = parse_custom_timeframe("i500")
         assert not ct.is_tick_bar
         assert ct.is_information_bar
+        assert not ct.is_adaptive_target_bar
         assert ct.information_budget == 500
+        assert ct.seconds == 0
+
+    def test_adaptive_target_bar(self):
+        ct = parse_custom_timeframe("a500")
+        assert not ct.is_tick_bar
+        assert not ct.is_information_bar
+        assert ct.is_adaptive_target_bar
+        assert ct.adaptive_target_ticks == 500
         assert ct.seconds == 0
 
     def test_invalid(self):
@@ -64,3 +74,4 @@ class TestIsStandard:
         assert not is_standard_timeframe("M2")
         assert not is_standard_timeframe("T100")
         assert not is_standard_timeframe("I100")
+        assert not is_standard_timeframe("A100")

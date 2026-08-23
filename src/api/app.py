@@ -213,7 +213,7 @@ Production-grade **REST + WebSocket** API for MetaTrader 5 market data.
 
 * **Historical data** — candles (OHLCV) and raw ticks stored in TimescaleDB
 * **Real-time streaming** — live ticks and candle updates via WebSocket
-* **Custom timeframes** — build M2, M3, H6, H12, T100, I100… on-the-fly
+* **Custom timeframes** — build M2, M3, H6, H12, T100, I100, A100… on-the-fly
 * **Auto-backfill** — missing data is fetched from MT5 automatically
 
 ---
@@ -498,7 +498,8 @@ _OPENAPI_TAGS: list[dict] = [
             "Non-standard timeframe candles built on-the-fly: "
             "**Time-based** (M2, M3, H2, H6, H12, D2, W1…) from stored candles, "
             "**Tick bars** (T100, T500, T1000…) and research-only adaptive "
-            "**information bars** (I100, I500, I1000…) from raw ticks. "
+            "**information bars** (I100, I500, I1000…) and adaptive v2 "
+            "**target-tick bars** (A100, A500, A1000…) from raw ticks. "
             "Standard TFs are auto-redirected to pre-computed data."
         ),
     },
@@ -655,6 +656,7 @@ Parameters:
   - Time-based: M2, M3, M7, M10, M20, M30, H2, H3, H6, H8, H12, D2, W1, ...
   - Tick bars: T100, T250, T500, T1000, ...
   - Adaptive information bars (research-only): I100, I250, I500, I1000, ...
+  - Adaptive target-tick v2 bars (research-only): A100, A250, A500, A1000, ...
   - Standard TFs (M1, M5, M15, H1, H4, D1) auto-redirect to pre-computed data
 - from (query, optional): Start datetime, ISO 8601
 - to (query, optional): End datetime, ISO 8601

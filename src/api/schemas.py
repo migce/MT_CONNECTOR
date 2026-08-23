@@ -70,6 +70,18 @@ class CandleResponse(BaseModel):
     mean_activity: Optional[float] = None
     mean_coherence: Optional[float] = None
     mean_information_weight: Optional[float] = None
+    target_tick_count: Optional[int] = None
+    regime_warmed: Optional[bool] = None
+    regime_observed_ticks: Optional[int] = None
+    arrival_ratio_at_open: Optional[float] = None
+    activity_ratio_at_open: Optional[float] = None
+    directional_efficiency_at_open: Optional[float] = None
+    slow_efficiency_at_open: Optional[float] = None
+    efficiency_ratio_at_open: Optional[float] = None
+    regime_score_at_open: Optional[float] = None
+    gap_count_at_open: Optional[int] = None
+    path_log_return: Optional[float] = None
+    realized_directional_efficiency: Optional[float] = None
     mean_spread: Optional[float] = None
     is_complete: Optional[bool] = None
 

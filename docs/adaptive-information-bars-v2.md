@@ -2,12 +2,12 @@
 
 ## Status
 
-This is an offline research prototype. It is not connected to REST, WebSocket,
-Monitor, or any trading/execution path.
+This is a research-only chart model. Connector exposes it as `A<n>` through
+REST and WebSocket, while every trading/execution path remains excluded.
 
 ## Causal clock
 
-`I<n>` means a neutral target of approximately `n` ticks. Before the first tick
+`A<n>` means a neutral target of approximately `n` ticks. Before the first tick
 of each new bar, the builder freezes a target derived only from previously
 observed ticks:
 

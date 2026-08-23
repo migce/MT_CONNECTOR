@@ -6,6 +6,7 @@ from src.information_bars_v2 import (
     INFORMATION_BAR_V2_ALGORITHM,
     InformationBarV2Config,
     build_information_bars_v2,
+    information_v2_source_limit,
 )
 
 
@@ -48,6 +49,7 @@ def test_target_is_frozen_at_open_and_completed_volume_matches_it() -> None:
 
     assert any(bar["regime_warmed"] for bar in bars)
     assert all(bar["tick_volume"] == bar["target_tick_count"] for bar in bars)
+    assert all(bar["timeframe"] == "A100" for bar in bars)
     assert all(config.min_target_ticks <= bar["tick_volume"] <= config.max_target_ticks for bar in bars)
     assert all(bar["path_log_return"] >= 0 for bar in bars)
     assert all(0 <= bar["realized_directional_efficiency"] <= 1 for bar in bars)
@@ -136,3 +138,5 @@ def test_metadata_exposes_experimental_contract_and_bounds() -> None:
     assert config.metadata()["algorithm"] == INFORMATION_BAR_V2_ALGORITHM
     assert config.min_target_ticks == 250
     assert config.max_target_ticks == 4_000
+    assert information_v2_source_limit(config, 10) < 1_000_000
+    assert information_v2_source_limit(config, 50_000) == 1_000_000

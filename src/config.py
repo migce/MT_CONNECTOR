@@ -82,7 +82,7 @@ TF_AGGREGATION_MAP: dict[Timeframe, Timeframe] = {
 # ---------------------------------------------------------------------------
 
 _CUSTOM_TF_RE = re.compile(
-    r"^(?P<unit>[MHDWTI])(?P<value>\d+)$", re.IGNORECASE,
+    r"^(?P<unit>[MHDWTIA])(?P<value>\d+)$", re.IGNORECASE,
 )
 
 _UNIT_MULTIPLIER = {
@@ -100,12 +100,14 @@ _STANDARD_SECONDS = {tf.seconds for tf in Timeframe}
 class CustomTimeframe:
     """Parsed custom timeframe descriptor."""
 
-    raw: str                  # original string, e.g. "M2", "T500", "I500"
+    raw: str                  # original string, e.g. "M2", "T500", "I500", "A500"
     is_tick_bar: bool         # True for fixed tick-count bars
-    is_information_bar: bool  # True for adaptive information-time bars
+    is_information_bar: bool  # True for v1 adaptive information-time bars
+    is_adaptive_target_bar: bool  # True for v2 frozen target-tick bars
     seconds: int              # interval in seconds (0 for event bars)
     tick_count: int           # ticks per fixed bar (0 otherwise)
-    information_budget: int   # adaptive budget (0 otherwise)
+    information_budget: int   # v1 adaptive budget (0 otherwise)
+    adaptive_target_ticks: int  # v2 neutral tick target (0 otherwise)
 
     @property
     def bucket_interval(self) -> str:
@@ -130,6 +132,9 @@ def parse_custom_timeframe(raw: str) -> CustomTimeframe:
     **Adaptive information-time** (research-only, built from raw ticks):
         ``I100``, ``I250``, ``I500``, ``I1000`` — ``I\\d+``.
 
+    **Adaptive target-tick v2** (research-only, built from raw ticks):
+        ``A100``, ``A250``, ``A500``, ``A1000``.
+
     Raises *ValueError* for unparsable strings.
     """
     raw = raw.strip().upper()
@@ -137,7 +142,7 @@ def parse_custom_timeframe(raw: str) -> CustomTimeframe:
     if not m:
         raise ValueError(
             f"Invalid custom timeframe '{raw}'. "
-            "Expected format: M<n>, H<n>, D<n>, W<n>, T<n> or I<n>."
+            "Expected format: M<n>, H<n>, D<n>, W<n>, T<n>, I<n> or A<n>."
         )
     unit = m.group("unit").upper()
     value = int(m.group("value"))
@@ -149,9 +154,11 @@ def parse_custom_timeframe(raw: str) -> CustomTimeframe:
             raw=raw,
             is_tick_bar=True,
             is_information_bar=False,
+            is_adaptive_target_bar=False,
             seconds=0,
             tick_count=value,
             information_budget=0,
+            adaptive_target_ticks=0,
         )
 
     if unit == "I":
@@ -159,9 +166,23 @@ def parse_custom_timeframe(raw: str) -> CustomTimeframe:
             raw=raw,
             is_tick_bar=False,
             is_information_bar=True,
+            is_adaptive_target_bar=False,
             seconds=0,
             tick_count=0,
             information_budget=value,
+            adaptive_target_ticks=0,
+        )
+
+    if unit == "A":
+        return CustomTimeframe(
+            raw=raw,
+            is_tick_bar=False,
+            is_information_bar=False,
+            is_adaptive_target_bar=True,
+            seconds=0,
+            tick_count=0,
+            information_budget=0,
+            adaptive_target_ticks=value,
         )
 
     seconds = _UNIT_MULTIPLIER[unit] * value
@@ -169,9 +190,11 @@ def parse_custom_timeframe(raw: str) -> CustomTimeframe:
         raw=raw,
         is_tick_bar=False,
         is_information_bar=False,
+        is_adaptive_target_bar=False,
         seconds=seconds,
         tick_count=0,
         information_budget=0,
+        adaptive_target_ticks=0,
     )
 
 
