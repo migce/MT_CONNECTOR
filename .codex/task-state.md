@@ -4,8 +4,8 @@
 
 - Goal: expose A3C-v7 through Connector REST/WebSocket custom candles using
   four fixed chart-only presets analogous to M5, M15, M30 and M60 density.
-- Status: implementation and local verification complete on branch
-  `codex/a3c-v7-chart-presets`; production publication is next.
+- Status: completed, committed, pushed, deployed and production-verified on
+  branch `codex/a3c-v7-chart-presets`.
 - Decisions: preset codes must remain distinct from A1000 v2; no arbitrary
   user-tunable V7 inputs; no ATS, execution, database persistence, strategy
   eligibility or raw-tick delivery to Monitor.
@@ -20,11 +20,20 @@
 - Verification: 195/195 non-service Connector tests pass; the focused V1-V7,
   parser and custom-candle suite passes 135/135; full calibration repeats the
   exact selected budgets and density errors.
-- Next: commit/push, build an overlay from the exact running Connector image,
-  recreate only `mt5_api`, then verify REST/WS, existing A1000 parity, health
-  and unchanged Poller/Trader terminal processes.
+- Publication: commit `4f94e78` is pushed. Production runs image
+  `sha256:724e7d86...` (`mt_connector-api:a3c-v7-chart-presets-20260824`)
+  with rollback `mt_connector-api:rollback-before-a3c-v7-20260824`.
+  Only `mt5_api` was recreated.
+- Production verification: V7M5/V7M15/V7M30/V7M60 each returned 50/50
+  completed, correctly labelled bars with `strategy_eligible=false`; V7M5 live
+  WebSocket delivered developing frames; A1000 still returned its unchanged v2
+  algorithm. API, MT5, Trader, DB and Redis are healthy; 3/3 accounts are
+  healthy; no release-window errors were logged. Terminal PIDs remain exactly
+  25048, 25524, 29680 and 31496.
+- Next: user visual comparison in Market Monitor; no Connector follow-up needed
+  unless the visual evaluation finds a research issue.
 - Blockers: none.
-- Last Updated: 2026-08-24 18:48 MSK
+- Last Updated: 2026-08-24 19:09 MSK
 
 ## Active Task - 2026-08-24 A3C-v7 Dual Clock Bars
 
