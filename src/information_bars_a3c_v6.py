@@ -96,9 +96,11 @@ class A3CV6Builder:
         "_config",
         "_evidence_direction",
         "_gap_count",
+        "_macro_drift_cache",
         "_minute_bucket",
         "_minute_endpoint",
         "_minute_returns",
+        "_minute_rms_cache",
         "_previous_price",
         "_previous_time",
         "_price_field",
@@ -123,6 +125,8 @@ class A3CV6Builder:
             maxlen=self._config.scale_lookback
         )
         self._gap_count = 0
+        self._macro_drift_cache = 0.0
+        self._minute_rms_cache: float | None = None
         self._progress = 0.0
         self._progress_peak = 0.0
         self._evidence_direction = 0
@@ -143,11 +147,13 @@ class A3CV6Builder:
         self._minute_endpoint = None
         self._completed_endpoint = None
         self._minute_returns = deque(maxlen=self._config.scale_lookback)
+        self._macro_drift_cache = 0.0
+        self._minute_rms_cache = None
         self._reset_bar_progress()
 
     def _empty_minute_update(self) -> _MinuteUpdate:
-        macro = self._macro_drift()
-        minute_rms = self._minute_rms()
+        macro = self._macro_drift_cache
+        minute_rms = self._minute_rms_cache
         return _MinuteUpdate(
             False,
             0.0,
@@ -176,8 +182,8 @@ class A3CV6Builder:
             return self._empty_minute_update()
 
         endpoint = self._minute_endpoint
-        prior_macro = self._macro_drift()
-        prior_rms = self._minute_rms()
+        prior_macro = self._macro_drift_cache
+        prior_rms = self._minute_rms_cache
         normalized = 0.0
         delta = 0.0
         direction_reset = False
@@ -210,6 +216,8 @@ class A3CV6Builder:
 
         current_macro = self._macro_drift()
         current_rms = self._minute_rms()
+        self._macro_drift_cache = current_macro
+        self._minute_rms_cache = current_rms
         current_direction = 1 if current_macro > 0 else -1 if current_macro < 0 else 0
         if current_direction != 0:
             if self._evidence_direction == 0:

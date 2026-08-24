@@ -9,6 +9,8 @@ from src.information_bars_a3c_v7 import (
     A3C_V7_TIMEFRAME,
     A3CV7Builder,
     A3CV7Config,
+    a3c_v7_source_limit,
+    a3c_v7_visual_preset_config,
     build_a3c_v7_bars,
 )
 
@@ -92,6 +94,31 @@ def test_invalid_dual_clock_parameters_are_rejected() -> None:
         A3CV7Config(confidence_floor=0.0)
     with pytest.raises(ValueError, match="counter_return_penalty"):
         A3CV7Config(counter_return_penalty=0.9)
+
+
+def test_visual_presets_are_frozen_and_distinct() -> None:
+    expected = {
+        "V7M5": (5, 0.4),
+        "V7M15": (15, 1.0),
+        "V7M30": (30, 2.0),
+        "V7M60": (60, 3.0),
+    }
+
+    for timeframe, (minutes, budget) in expected.items():
+        config = a3c_v7_visual_preset_config(timeframe.lower())
+        assert config.timeframe == timeframe
+        assert config.visual_density_analog_minutes == minutes
+        assert config.trend_max_duration_ms == minutes * 60_000
+        assert config.evidence_budget == pytest.approx(budget)
+        assert config.metadata()["strategy_eligible"] is False
+
+    with pytest.raises(ValueError, match="Unknown A3C-v7 visual preset"):
+        a3c_v7_visual_preset_config("V7M10")
+
+
+def test_visual_preset_source_limits_are_bounded() -> None:
+    assert a3c_v7_source_limit("V7M5", 10) < 1_000_000
+    assert a3c_v7_source_limit("V7M60", 50_000) == 1_000_000
 
 
 def test_same_endpoints_ignore_dense_intraminute_bounce() -> None:

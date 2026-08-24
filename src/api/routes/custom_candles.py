@@ -12,6 +12,8 @@ Serves **non-standard timeframe candles** built on-the-fly from stored data:
   adaptive bars whose bounded causal tick weights fill an information budget.
 * **Adaptive v2 bars** (``A100``, ``A500``, ``A1000``, …) — research-only
   bars whose target tick count is frozen before each bar opens.
+* **A3C-v7 visual presets** (``V7M5``, ``V7M15``, ``V7M30``, ``V7M60``) —
+  research-only dual-clock bars calibrated to analogous visual density.
 
 Standard timeframes (M1, M5, M15, H1, H4, D1) are redirected to the
 pre-computed candle table for maximum performance.
@@ -34,7 +36,6 @@ from src.api.services.backfill_helper import (
 )
 from src.api.services.validation import validate_symbol
 from src.config import (
-    Timeframe,
     is_standard_timeframe,
     parse_custom_timeframe,
 )
@@ -43,6 +44,11 @@ from src.information_bars import (
     InformationBarConfig,
     build_information_bars,
     information_source_limit,
+)
+from src.information_bars_a3c_v7 import (
+    a3c_v7_source_limit,
+    a3c_v7_visual_preset_config,
+    build_a3c_v7_bars,
 )
 from src.information_bars_v2 import (
     InformationBarV2Config,
@@ -85,6 +91,9 @@ def _choose_source_tf(bucket_seconds: int) -> str:
         "**Adaptive target-tick v2 bars**: `A100`, `A250`, `A500`, "
         "`A1000`, … — research-only causal bars with a target tick count "
         "frozen before each bar opens.\n\n"
+        "**A3C-v7 visual presets**: `V7M5`, `V7M15`, `V7M30`, `V7M60` — "
+        "research-only causal bars with density analogous to the named "
+        "time period, while neutral movement remains compressed.\n\n"
         "Standard timeframes (M1, M5, M15, H1, H4, D1) are served from "
         "the pre-computed table."
     ),
@@ -99,8 +108,9 @@ async def get_custom_candles(
             "Tick bars: T100, T500, T1000, …  "
             "Information bars v1: I100, I500, I1000, …  "
             "Adaptive v2 bars: A100, A500, A1000, …"
+            "  A3C-v7 presets: V7M5, V7M15, V7M30, V7M60."
         ),
-        examples=["M2", "H2", "T500", "I500", "A500"],
+        examples=["M2", "H2", "T500", "I500", "A500", "V7M15"],
     ),
     from_dt: Optional[datetime] = Query(
         default=None,
@@ -167,6 +177,52 @@ async def get_custom_candles(
         ctf = parse_custom_timeframe(tf_str)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    # ------ A3C-v7 visual-density presets (research-only) ------
+    if ctf.is_a3c_v7_bar:
+        await maybe_backfill_ticks(
+            symbol=symbol,
+            dt_from=from_dt,
+            dt_to=to_dt,
+            limit=1,
+        )
+        config_v7 = a3c_v7_visual_preset_config(ctf.raw)
+        source_limit = a3c_v7_source_limit(ctf.raw, fetch_limit)
+        ticks = await repo.query_information_bar_ticks(
+            symbol=symbol,
+            dt_from=from_dt,
+            dt_to=to_dt,
+            source_limit=source_limit,
+        )
+        rows = build_a3c_v7_bars(
+            ticks,
+            config_v7,
+            price_field=price,
+            include_incomplete=include_incomplete,
+        )
+        rows = rows[-fetch_limit:] if use_latest_n else rows[:fetch_limit]
+        meta = {
+            "bar_model": config_v7.metadata(),
+            "price": price,
+            "strategy_eligible": False,
+            "anchor_mode": "bounded_query_prefix",
+            "source_tick_count": len(ticks),
+            "source_limit": source_limit,
+            "source_truncated": len(ticks) >= source_limit,
+            "known_limitations": [
+                "query_prefix_anchor",
+                "completed_minute_state_warmup",
+                "same_millisecond_tick_identity",
+                "connection_local_live_warmup",
+                "no_persistent_live_revision_sequence",
+            ],
+        }
+        return _paginate_candles(
+            rows,
+            effective_limit,
+            latest_n=use_latest_n,
+            meta=meta,
+        )
 
     # ------ Adaptive target-tick bars v2 (research-only) ------
     if ctf.is_adaptive_target_bar:

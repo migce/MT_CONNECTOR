@@ -1,5 +1,31 @@
 # A3C-v6 Completed-Minute Drift Bars
 
+## Active Task - 2026-08-24 A3C-v7 Visual Chart Presets
+
+- Goal: expose A3C-v7 through Connector REST/WebSocket custom candles using
+  four fixed chart-only presets analogous to M5, M15, M30 and M60 density.
+- Status: implementation and local verification complete on branch
+  `codex/a3c-v7-chart-presets`; production publication is next.
+- Decisions: preset codes must remain distinct from A1000 v2; no arbitrary
+  user-tunable V7 inputs; no ATS, execution, database persistence, strategy
+  eligibility or raw-tick delivery to Monitor.
+- Result: frozen mappings are `V7M5=(5m, 0.4)`, `V7M15=(15m, 1.0)`,
+  `V7M30=(30m, 2.0)` and `V7M60=(60m, 3.0)`. REST returns ready OHLCV
+  bars and WebSocket uses the matching connection-local builder. The parser
+  accepts only these four codes. Minute-state caching preserves exact output
+  counts while reducing a one-million-tick replay from about 9.1s to 3.2s.
+- Production parity: the V7 parser was applied over the exact running
+  production config contract, preserving its existing trading, database and
+  backfill settings; no ATS or execution values changed.
+- Verification: 195/195 non-service Connector tests pass; the focused V1-V7,
+  parser and custom-candle suite passes 135/135; full calibration repeats the
+  exact selected budgets and density errors.
+- Next: commit/push, build an overlay from the exact running Connector image,
+  recreate only `mt5_api`, then verify REST/WS, existing A1000 parity, health
+  and unchanged Poller/Trader terminal processes.
+- Blockers: none.
+- Last Updated: 2026-08-24 18:48 MSK
+
 ## Active Task - 2026-08-24 A3C-v7 Dual Clock Bars
 
 - Goal: reduce v6 structural over-compression by combining a more responsive

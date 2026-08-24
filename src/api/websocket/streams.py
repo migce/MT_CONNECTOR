@@ -6,7 +6,7 @@ Endpoints:
   - ``/ws/candles/{symbol}/{timeframe}``  — stream candle updates
 
 Standard timeframes use a shared Redis pump.  Custom timeframes
-(M2, H6, T100, I100, A100, …) are aggregated server-side from the source
+(M2, H6, T100, I100, A100, V7M15, …) are aggregated server-side from the source
 channel (M1/H1 candles or raw ticks).
 """
 
@@ -18,12 +18,15 @@ from typing import Any
 import orjson
 import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from starlette.websockets import WebSocketState
 
 from src.api.websocket.aggregator import CandleAggregator, TickBarAggregator
 from src.api.websocket.manager import ws_manager
-from src.config import Timeframe, get_settings, is_standard_timeframe, parse_custom_timeframe
+from src.config import get_settings, is_standard_timeframe, parse_custom_timeframe
 from src.information_bars import InformationBarBuilder, InformationBarConfig
+from src.information_bars_a3c_v7 import (
+    A3CV7Builder,
+    a3c_v7_visual_preset_config,
+)
 from src.information_bars_v2 import InformationBarV2Builder, InformationBarV2Config
 from src.redis_bus.subscriber import RedisSubscriber
 
@@ -72,6 +75,8 @@ def _validate_ws_timeframe(tf: str) -> bool:
             return parsed.information_budget >= 2
         if parsed.is_adaptive_target_bar:
             return parsed.adaptive_target_ticks >= 2
+        if parsed.is_a3c_v7_bar:
+            return parsed.a3c_v7_analog_minutes in {5, 15, 30, 60}
         return True
     except ValueError:
         return False
@@ -277,7 +282,12 @@ async def _aggregated_candle_pump(
 async def _aggregated_tick_bar_pump(
     ws: WebSocket,
     symbol: str,
-    aggregator: TickBarAggregator | InformationBarBuilder | InformationBarV2Builder,
+    aggregator: (
+        TickBarAggregator
+        | InformationBarBuilder
+        | InformationBarV2Builder
+        | A3CV7Builder
+    ),
 ) -> None:
     """Subscribe to ticks, aggregate fixed/adaptive event bars, and forward."""
     _logger = structlog.get_logger("ws.agg_tick")
@@ -327,6 +337,7 @@ async def ws_candles(ws: WebSocket, symbol: str, timeframe: str) -> None:
     **Tick bars** (T100, T500, …): server aggregates from raw ticks.
     **Information bars** (I100, I500, …): research-only adaptive tick clock.
     **Adaptive v2 bars** (A100, A500, …): frozen target-tick clock.
+    **A3C-v7 presets** (V7M5, V7M15, V7M30, V7M60): dual clock.
 
     Heartbeats every 30 s. Clients may send ``{"action": "ping"}``.
     """
@@ -397,6 +408,11 @@ async def ws_candles(ws: WebSocket, symbol: str, timeframe: str) -> None:
                 pump_task = asyncio.create_task(
                     _aggregated_tick_bar_pump(ws, symbol, agg)
                 )
+            elif ctf.is_a3c_v7_bar:
+                agg = A3CV7Builder(a3c_v7_visual_preset_config(ctf.raw))
+                pump_task = asyncio.create_task(
+                    _aggregated_tick_bar_pump(ws, symbol, agg)
+                )
             else:
                 source_tf = _choose_source_tf(ctf.seconds)
                 source_channel = f"candle:{symbol}:{source_tf}"
@@ -415,6 +431,7 @@ async def ws_candles(ws: WebSocket, symbol: str, timeframe: str) -> None:
                         ctf.is_tick_bar
                         or ctf.is_information_bar
                         or ctf.is_adaptive_target_bar
+                        or ctf.is_a3c_v7_bar
                     )
                     else source_tf
                 ),

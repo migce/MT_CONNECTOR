@@ -14,6 +14,18 @@ if TYPE_CHECKING:
 
 A3C_V7_ALGORITHM = "causal-completed-minute-dual-clock-bars-v7-a3c"
 A3C_V7_TIMEFRAME = "A3C7"
+A3C_V7_VISUAL_PRESET_PARAMETERS: dict[str, tuple[int, float]] = {
+    "V7M5": (5, 0.40),
+    "V7M15": (15, 1.00),
+    "V7M30": (30, 2.00),
+    "V7M60": (60, 3.00),
+}
+A3C_V7_REFERENCE_TICKS_PER_BAR: dict[str, int] = {
+    "V7M5": 223,
+    "V7M15": 592,
+    "V7M30": 1336,
+    "V7M60": 2393,
+}
 
 
 @dataclass(frozen=True)
@@ -35,6 +47,8 @@ class A3CV7Config:
     max_duration_ms: int = 120 * 60 * 1000
     hard_max_raw_ticks: int = 100_000
     gap_reset_ms: int = 5 * 60 * 1000
+    timeframe: str = A3C_V7_TIMEFRAME
+    visual_density_analog_minutes: int | None = None
 
     def __post_init__(self) -> None:
         if self.evidence_budget <= 0:
@@ -72,14 +86,55 @@ class A3CV7Config:
             <= 0
         ):
             raise ValueError("liveness and gap bounds must be positive")
+        if not self.timeframe or self.timeframe != self.timeframe.upper():
+            raise ValueError("timeframe must be a non-empty uppercase label")
+        if (
+            self.visual_density_analog_minutes is not None
+            and self.visual_density_analog_minutes <= 0
+        ):
+            raise ValueError("visual density analog must be positive")
 
     def metadata(self) -> dict[str, Any]:
         return {
             "algorithm": A3C_V7_ALGORITHM,
-            "timeframe": A3C_V7_TIMEFRAME,
             "strategy_eligible": False,
             **asdict(self),
         }
+
+
+def a3c_v7_visual_preset_config(timeframe: str) -> A3CV7Config:
+    """Return one frozen chart-density preset without exposing free parameters."""
+    normalized = timeframe.strip().upper()
+    try:
+        analog_minutes, evidence_budget = A3C_V7_VISUAL_PRESET_PARAMETERS[
+            normalized
+        ]
+    except KeyError as exc:
+        supported = ", ".join(A3C_V7_VISUAL_PRESET_PARAMETERS)
+        raise ValueError(
+            f"Unknown A3C-v7 visual preset '{timeframe}'. Expected one of: {supported}."
+        ) from exc
+    return A3CV7Config(
+        evidence_budget=evidence_budget,
+        trend_max_duration_ms=analog_minutes * 60_000,
+        timeframe=normalized,
+        visual_density_analog_minutes=analog_minutes,
+    )
+
+
+def a3c_v7_source_limit(
+    timeframe: str,
+    bar_limit: int,
+    *,
+    hard_cap: int = 1_000_000,
+) -> int:
+    """Bound a latest-tick query using the frozen calibration density."""
+    normalized = timeframe.strip().upper()
+    if normalized not in A3C_V7_REFERENCE_TICKS_PER_BAR:
+        a3c_v7_visual_preset_config(normalized)
+    reference = A3C_V7_REFERENCE_TICKS_PER_BAR[normalized]
+    requested = reference * (max(1, bar_limit) + 2) * 2 + 10_000
+    return min(hard_cap, requested)
 
 
 class A3CV7Builder(A3CV6Builder):
@@ -110,8 +165,8 @@ class A3CV7Builder(A3CV6Builder):
             return self._empty_minute_update()
 
         endpoint = self._minute_endpoint
-        prior_macro = self._macro_drift()
-        prior_rms = self._minute_rms()
+        prior_macro = self._macro_drift_cache
+        prior_rms = self._minute_rms_cache
         normalized = 0.0
         delta = 0.0
         direction_reset = False
@@ -145,6 +200,8 @@ class A3CV7Builder(A3CV6Builder):
 
         current_macro = self._macro_drift()
         current_rms = self._minute_rms()
+        self._macro_drift_cache = current_macro
+        self._minute_rms_cache = current_rms
         current_direction = 1 if current_macro > 0 else -1 if current_macro < 0 else 0
         if current_direction != 0:
             if self._evidence_direction == 0:
@@ -182,7 +239,7 @@ class A3CV7Builder(A3CV6Builder):
 
     def _open_bar(self, tick: dict[str, Any], price: float, tick_time: datetime) -> dict[str, Any]:
         bar = super()._open_bar(tick, price, tick_time)
-        bar["timeframe"] = A3C_V7_TIMEFRAME
+        bar["timeframe"] = self._config.timeframe
         bar["confidence_at_close"] = None
         bar["trend_active_at_close"] = False
         bar["trend_elapsed_completed_minutes"] = 0

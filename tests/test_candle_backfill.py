@@ -516,6 +516,66 @@ class TestCustomCandleEndpoint:
         assert "connection_local_live_warmup" in result.meta["known_limitations"]
         assert query.call_args.kwargs["source_limit"] > 400
 
+    async def test_a3c_v7_visual_preset_returns_ready_chart_bars(self):
+        """V7M<n> is built server-side with one frozen preset contract."""
+        from src.api.routes.custom_candles import get_custom_candles
+
+        start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        ticks = []
+        for minute in range(90):
+            for second in (10, 50):
+                price = 1.0 + minute * 0.00010 + second * 0.0000001
+                ticks.append(
+                    {
+                        "time_msc": start
+                        + timedelta(minutes=minute, seconds=second),
+                        "symbol": "EURUSD",
+                        "bid": price,
+                        "ask": price + 0.00002,
+                        "last": price,
+                        "volume": 1,
+                        "flags": 6,
+                    }
+                )
+
+        with (
+            patch(
+                "src.api.routes.custom_candles.maybe_backfill_ticks",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "src.api.routes.custom_candles.validate_symbol",
+                return_value="EURUSD",
+            ),
+            patch(
+                "src.api.routes.custom_candles.repo.query_information_bar_ticks",
+                new_callable=AsyncMock,
+                return_value=ticks,
+            ) as query,
+        ):
+            result = await get_custom_candles(
+                symbol="EURUSD",
+                timeframe="V7M15",
+                from_dt=None,
+                to_dt=None,
+                limit=3,
+                bars=None,
+                price="bid",
+                include_incomplete=False,
+            )
+
+        assert result.count == 3
+        assert all(item.timeframe == "V7M15" for item in result.data)
+        assert all(item.is_complete is True for item in result.data)
+        assert result.meta is not None
+        assert result.meta["strategy_eligible"] is False
+        assert result.meta["bar_model"]["algorithm"] == (
+            "causal-completed-minute-dual-clock-bars-v7-a3c"
+        )
+        assert result.meta["bar_model"]["visual_density_analog_minutes"] == 15
+        assert "completed_minute_state_warmup" in result.meta["known_limitations"]
+        assert query.call_args.kwargs["source_limit"] > len(ticks)
+
 
 # ---------------------------------------------------------------------------
 # 6. Backfill endpoint

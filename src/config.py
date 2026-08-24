@@ -84,6 +84,7 @@ TF_AGGREGATION_MAP: dict[Timeframe, Timeframe] = {
 _CUSTOM_TF_RE = re.compile(
     r"^(?P<unit>[MHDWTIA])(?P<value>\d+)$", re.IGNORECASE,
 )
+_A3C_V7_TF_RE = re.compile(r"^V7M(?P<value>5|15|30|60)$", re.IGNORECASE)
 
 _UNIT_MULTIPLIER = {
     "M": 60,      # minutes
@@ -100,14 +101,16 @@ _STANDARD_SECONDS = {tf.seconds for tf in Timeframe}
 class CustomTimeframe:
     """Parsed custom timeframe descriptor."""
 
-    raw: str                  # original string, e.g. "M2", "T500", "I500", "A500"
+    raw: str                  # original string, e.g. "M2", "T500", "A500", "V7M15"
     is_tick_bar: bool         # True for fixed tick-count bars
     is_information_bar: bool  # True for v1 adaptive information-time bars
     is_adaptive_target_bar: bool  # True for v2 frozen target-tick bars
+    is_a3c_v7_bar: bool  # True for one of four frozen V7 visual presets
     seconds: int              # interval in seconds (0 for event bars)
     tick_count: int           # ticks per fixed bar (0 otherwise)
     information_budget: int   # v1 adaptive budget (0 otherwise)
     adaptive_target_ticks: int  # v2 neutral tick target (0 otherwise)
+    a3c_v7_analog_minutes: int  # V7 visual-density analog (0 otherwise)
 
     @property
     def bucket_interval(self) -> str:
@@ -135,14 +138,32 @@ def parse_custom_timeframe(raw: str) -> CustomTimeframe:
     **Adaptive target-tick v2** (research-only, built from raw ticks):
         ``A100``, ``A250``, ``A500``, ``A1000``.
 
+    **A3C-v7 visual presets** (research-only, built from raw ticks):
+        ``V7M5``, ``V7M15``, ``V7M30``, ``V7M60``.
+
     Raises *ValueError* for unparsable strings.
     """
     raw = raw.strip().upper()
+    v7_match = _A3C_V7_TF_RE.fullmatch(raw)
+    if v7_match:
+        analog_minutes = int(v7_match.group("value"))
+        return CustomTimeframe(
+            raw=raw,
+            is_tick_bar=False,
+            is_information_bar=False,
+            is_adaptive_target_bar=False,
+            is_a3c_v7_bar=True,
+            seconds=0,
+            tick_count=0,
+            information_budget=0,
+            adaptive_target_ticks=0,
+            a3c_v7_analog_minutes=analog_minutes,
+        )
     m = _CUSTOM_TF_RE.match(raw)
     if not m:
         raise ValueError(
             f"Invalid custom timeframe '{raw}'. "
-            "Expected format: M<n>, H<n>, D<n>, W<n>, T<n>, I<n> or A<n>."
+            "Expected M/H/D/W/T/I/A<n> or V7M5/V7M15/V7M30/V7M60."
         )
     unit = m.group("unit").upper()
     value = int(m.group("value"))
@@ -155,10 +176,12 @@ def parse_custom_timeframe(raw: str) -> CustomTimeframe:
             is_tick_bar=True,
             is_information_bar=False,
             is_adaptive_target_bar=False,
+            is_a3c_v7_bar=False,
             seconds=0,
             tick_count=value,
             information_budget=0,
             adaptive_target_ticks=0,
+            a3c_v7_analog_minutes=0,
         )
 
     if unit == "I":
@@ -167,10 +190,12 @@ def parse_custom_timeframe(raw: str) -> CustomTimeframe:
             is_tick_bar=False,
             is_information_bar=True,
             is_adaptive_target_bar=False,
+            is_a3c_v7_bar=False,
             seconds=0,
             tick_count=0,
             information_budget=value,
             adaptive_target_ticks=0,
+            a3c_v7_analog_minutes=0,
         )
 
     if unit == "A":
@@ -179,10 +204,12 @@ def parse_custom_timeframe(raw: str) -> CustomTimeframe:
             is_tick_bar=False,
             is_information_bar=False,
             is_adaptive_target_bar=True,
+            is_a3c_v7_bar=False,
             seconds=0,
             tick_count=0,
             information_budget=0,
             adaptive_target_ticks=value,
+            a3c_v7_analog_minutes=0,
         )
 
     seconds = _UNIT_MULTIPLIER[unit] * value
@@ -191,10 +218,12 @@ def parse_custom_timeframe(raw: str) -> CustomTimeframe:
         is_tick_bar=False,
         is_information_bar=False,
         is_adaptive_target_bar=False,
+        is_a3c_v7_bar=False,
         seconds=seconds,
         tick_count=0,
         information_budget=0,
         adaptive_target_ticks=0,
+        a3c_v7_analog_minutes=0,
     )
 
 
@@ -278,6 +307,39 @@ class Settings(BaseSettings):
         ge=1,
         description="Deal-history lookback used by periodic trader deep resync.",
     )
+    trader_position_sync_interval_sec: float = Field(
+        default=1.0,
+        ge=0.2,
+        description=(
+            "Open-position observation interval. Position lifecycle events and "
+            "forced-exit detection use this cadence."
+        ),
+    )
+
+    # --- Close-only trading execution (safe defaults) ---
+    internal_api_token: str = Field(
+        default="",
+        description=(
+            "Bearer token required by all broker-event and trade-command APIs. "
+            "An empty token keeps those APIs unavailable."
+        ),
+    )
+    trading_execution_enabled: bool = Field(
+        default=False,
+        description="Hard Connector-side kill switch for MT5 write operations.",
+    )
+    trading_account_allowlist_csv: str = Field(
+        default="",
+        alias="TRADING_ACCOUNT_ALLOWLIST",
+        description="Comma-separated Connector account IDs allowed to execute closes.",
+    )
+    trader_command_poll_interval_ms: int = Field(default=250, ge=100, le=10_000)
+    trader_command_claim_timeout_sec: int = Field(default=120, ge=30)
+    trader_command_default_ttl_sec: int = Field(default=86_400, ge=60)
+    trader_close_retry_delay_sec: float = Field(default=5.0, ge=0.5)
+    trader_close_send_attempts: int = Field(default=3, ge=1, le=10)
+    trader_close_reconcile_timeout_sec: float = Field(default=5.0, ge=0.5, le=60)
+    trader_close_deviation_points: int = Field(default=100, ge=0, le=100_000)
 
     # --- Symbols (stored as raw CSV string to avoid pydantic-settings JSON parse) ---
     symbols_csv: str = Field(
@@ -304,6 +366,24 @@ class Settings(BaseSettings):
     )
     db_pool_min: int = Field(default=2)
     db_pool_max: int = Field(default=10)
+    db_command_timeout_sec: float = Field(
+        default=120.0,
+        ge=5.0,
+        le=900.0,
+        description="Client-side timeout for one PostgreSQL command.",
+    )
+    db_statement_timeout_ms: int = Field(
+        default=120_000,
+        ge=5_000,
+        le=900_000,
+        description="Server-side PostgreSQL statement timeout for Connector sessions.",
+    )
+    db_idle_in_transaction_timeout_ms: int = Field(
+        default=120_000,
+        ge=5_000,
+        le=900_000,
+        description="Server-side timeout for Connector sessions left idle in a transaction.",
+    )
 
     # --- Redis ---
     redis_host: str = Field(default="localhost")
@@ -315,6 +395,18 @@ class Settings(BaseSettings):
     tick_poll_interval_ms: int = Field(default=50)
     candle_poll_interval_sec: int = Field(default=5)
     backfill_days: int = Field(default=30)
+    backfill_candle_batch_rows: int = Field(
+        default=2_000,
+        ge=100,
+        le=10_000,
+        description="Maximum candle rows committed by one backfill transaction.",
+    )
+    backfill_job_timeout_sec: float = Field(
+        default=300.0,
+        ge=30.0,
+        le=3_600.0,
+        description="Maximum wall time of one Poller-side on-demand backfill request.",
+    )
     gap_scan_interval_min: int = Field(default=15)
     mt5_heartbeat_interval_sec: int = Field(default=10)
 
@@ -352,6 +444,16 @@ class Settings(BaseSettings):
     def timeframes(self) -> list[Timeframe]:
         """Parsed list of Timeframe enums."""
         return [Timeframe(s.strip().upper()) for s in self.timeframes_csv.split(",") if s.strip()]
+
+    @property
+    def trading_account_allowlist(self) -> set[int]:
+        """Parsed Connector account IDs permitted to execute close commands."""
+        result: set[int] = set()
+        for raw in self.trading_account_allowlist_csv.split(","):
+            value = raw.strip()
+            if value:
+                result.add(int(value))
+        return result
 
     @property
     def dsn(self) -> str:
