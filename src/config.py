@@ -415,6 +415,29 @@ class Settings(BaseSettings):
     api_port: int = Field(default=8000)
     api_workers: int = Field(default=2)
     ws_heartbeat_sec: int = Field(default=30)
+    custom_candle_max_source_ticks: int = Field(
+        default=300_000,
+        ge=50_000,
+        le=1_000_000,
+        description=(
+            "Maximum raw tick rows consumed by one event-bar REST snapshot. "
+            "Protects API health from multi-million-row chart requests."
+        ),
+    )
+    custom_candle_max_concurrency: int = Field(
+        default=1,
+        ge=1,
+        le=4,
+        description="Maximum concurrent event-bar snapshots per API worker.",
+    )
+    custom_candle_work_mem_mb: int = Field(
+        default=32,
+        ge=4,
+        le=128,
+        description=(
+            "Transaction-local PostgreSQL work_mem for bounded event-bar queries."
+        ),
+    )
     cors_origins: str = Field(
         default="*",
         description=(

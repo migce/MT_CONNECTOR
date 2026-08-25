@@ -592,6 +592,8 @@ async def query_tick_bars(
     limit: int = 1000,
     price_field: Literal["bid", "ask", "last", "mid"] = "bid",
     include_incomplete: bool = False,
+    max_source_rows: int | None = None,
+    work_mem_mb: int | None = None,
 ) -> list[dict[str, Any]]:
     """
     Build OHLCV bars where each bar is formed from exactly *tick_count*
@@ -624,6 +626,12 @@ async def query_tick_bars(
         raise ValueError(f"Unknown price_field '{price_field}'. Use bid/ask/last/mid.")
 
     clauses = ["t.symbol = :symbol"]
+    requested_source_rows = tick_count * limit
+    source_limit = (
+        min(requested_source_rows, max_source_rows)
+        if max_source_rows is not None
+        else requested_source_rows
+    )
     params: dict[str, Any] = {
         "symbol": symbol,
         "tick_count": tick_count,
@@ -632,7 +640,7 @@ async def query_tick_bars(
         # The result can consume at most this many source rows.  Bounding the
         # indexed tick scan before ROW_NUMBER/GROUP BY avoids sorting and
         # spilling the symbol's complete history for every T<n> request.
-        "source_limit": tick_count * limit,
+        "source_limit": max(1, source_limit),
     }
     if dt_from:
         clauses.append("t.time_msc >= :dt_from")
@@ -732,6 +740,12 @@ async def query_tick_bars(
 
     factory = get_session_factory()
     async with factory() as session:
+        if work_mem_mb is not None:
+            bounded_work_mem = max(1, min(256, int(work_mem_mb)))
+            await session.execute(
+                text(f"SET LOCAL work_mem = '{bounded_work_mem}MB'"),
+                {},
+            )
         result = await session.execute(sql, params)
         return [dict(r._mapping) for r in result.all()]
 
@@ -746,6 +760,7 @@ async def query_information_bar_ticks(
     dt_from: datetime | None = None,
     dt_to: datetime | None = None,
     source_limit: int = 1_000_000,
+    work_mem_mb: int | None = None,
 ) -> list[dict[str, Any]]:
     """Return a bounded ascending tick prefix for adaptive aggregation.
 
@@ -790,6 +805,12 @@ async def query_information_bar_ticks(
 
     factory = get_session_factory()
     async with factory() as session:
+        if work_mem_mb is not None:
+            bounded_work_mem = max(1, min(256, int(work_mem_mb)))
+            await session.execute(
+                text(f"SET LOCAL work_mem = '{bounded_work_mem}MB'"),
+                {},
+            )
         result = await session.execute(sql, params)
         return [dict(r._mapping) for r in result.all()]
 

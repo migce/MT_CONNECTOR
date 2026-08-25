@@ -24,9 +24,12 @@ cover the requested range, the system automatically fetches it from MT5.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
+from time import perf_counter
 from typing import Literal, Optional
 
+import structlog
 from fastapi import APIRouter, HTTPException, Query
 
 from src.api.schemas import CandleResponse, PaginatedResponse
@@ -36,6 +39,7 @@ from src.api.services.backfill_helper import (
 )
 from src.api.services.validation import validate_symbol
 from src.config import (
+    get_settings,
     is_standard_timeframe,
     parse_custom_timeframe,
 )
@@ -57,6 +61,70 @@ from src.information_bars_v2 import (
 )
 
 router = APIRouter(prefix="/api/v1", tags=["custom-candles"])
+logger = structlog.get_logger(__name__)
+
+_event_gate_loop: asyncio.AbstractEventLoop | None = None
+_event_gate: asyncio.Semaphore | None = None
+
+
+def _event_request_gate() -> asyncio.Semaphore:
+    """Return one loop-local gate so heavy snapshots cannot crowd out health."""
+    global _event_gate_loop, _event_gate
+    loop = asyncio.get_running_loop()
+    if _event_gate is None or _event_gate_loop is not loop:
+        _event_gate_loop = loop
+        _event_gate = asyncio.Semaphore(
+            get_settings().custom_candle_max_concurrency
+        )
+    return _event_gate
+
+
+async def _build_adaptive_snapshot(
+    *,
+    symbol: str,
+    timeframe: str,
+    dt_from: datetime | None,
+    dt_to: datetime | None,
+    source_limit: int,
+    builder,
+    config,
+    price: str,
+    include_incomplete: bool,
+) -> tuple[list[dict], list[dict]]:
+    """Read a bounded tick prefix and build bars without blocking the event loop."""
+    settings = get_settings()
+    queued_at = perf_counter()
+    async with _event_request_gate():
+        started_at = perf_counter()
+        ticks = await repo.query_information_bar_ticks(
+            symbol=symbol,
+            dt_from=dt_from,
+            dt_to=dt_to,
+            source_limit=source_limit,
+            work_mem_mb=settings.custom_candle_work_mem_mb,
+        )
+        queried_at = perf_counter()
+        rows = await asyncio.to_thread(
+            builder,
+            ticks,
+            config,
+            price_field=price,
+            include_incomplete=include_incomplete,
+        )
+        completed_at = perf_counter()
+    logger.info(
+        "custom_candle_snapshot_built",
+        symbol=symbol,
+        timeframe=timeframe,
+        source_limit=source_limit,
+        source_tick_count=len(ticks),
+        output_bars=len(rows),
+        queue_ms=round((started_at - queued_at) * 1000, 1),
+        query_ms=round((queried_at - started_at) * 1000, 1),
+        build_ms=round((completed_at - queried_at) * 1000, 1),
+        total_ms=round((completed_at - queued_at) * 1000, 1),
+    )
+    return rows, ticks
 
 
 def _choose_source_tf(bucket_seconds: int) -> str:
@@ -187,17 +255,20 @@ async def get_custom_candles(
             limit=1,
         )
         config_v7 = a3c_v7_visual_preset_config(ctf.raw)
-        source_limit = a3c_v7_source_limit(ctf.raw, fetch_limit)
-        ticks = await repo.query_information_bar_ticks(
+        source_limit = a3c_v7_source_limit(
+            ctf.raw,
+            fetch_limit,
+            hard_cap=get_settings().custom_candle_max_source_ticks,
+        )
+        rows, ticks = await _build_adaptive_snapshot(
             symbol=symbol,
+            timeframe=ctf.raw,
             dt_from=from_dt,
             dt_to=to_dt,
             source_limit=source_limit,
-        )
-        rows = build_a3c_v7_bars(
-            ticks,
-            config_v7,
-            price_field=price,
+            builder=build_a3c_v7_bars,
+            config=config_v7,
+            price=price,
             include_incomplete=include_incomplete,
         )
         rows = rows[-fetch_limit:] if use_latest_n else rows[:fetch_limit]
@@ -240,17 +311,20 @@ async def get_custom_candles(
         config_v2 = InformationBarV2Config(
             neutral_ticks=ctf.adaptive_target_ticks
         )
-        source_limit = information_v2_source_limit(config_v2, fetch_limit)
-        ticks = await repo.query_information_bar_ticks(
+        source_limit = information_v2_source_limit(
+            config_v2,
+            fetch_limit,
+            hard_cap=get_settings().custom_candle_max_source_ticks,
+        )
+        rows, ticks = await _build_adaptive_snapshot(
             symbol=symbol,
+            timeframe=ctf.raw,
             dt_from=from_dt,
             dt_to=to_dt,
             source_limit=source_limit,
-        )
-        rows = build_information_bars_v2(
-            ticks,
-            config_v2,
-            price_field=price,
+            builder=build_information_bars_v2,
+            config=config_v2,
+            price=price,
             include_incomplete=include_incomplete,
         )
         rows = rows[-fetch_limit:] if use_latest_n else rows[:fetch_limit]
@@ -290,17 +364,20 @@ async def get_custom_candles(
             limit=1,
         )
         config = InformationBarConfig(budget=ctf.information_budget)
-        source_limit = information_source_limit(config, fetch_limit)
-        ticks = await repo.query_information_bar_ticks(
+        source_limit = information_source_limit(
+            config,
+            fetch_limit,
+            hard_cap=get_settings().custom_candle_max_source_ticks,
+        )
+        rows, ticks = await _build_adaptive_snapshot(
             symbol=symbol,
+            timeframe=ctf.raw,
             dt_from=from_dt,
             dt_to=to_dt,
             source_limit=source_limit,
-        )
-        rows = build_information_bars(
-            ticks,
-            config,
-            price_field=price,
+            builder=build_information_bars,
+            config=config,
+            price=price,
             include_incomplete=include_incomplete,
         )
         rows = rows[-fetch_limit:] if use_latest_n else rows[:fetch_limit]
@@ -339,17 +416,54 @@ async def get_custom_candles(
             dt_to=to_dt,
             limit=1,  # just trigger backfill if needed
         )
-        rows = await repo.query_tick_bars(
+        settings = get_settings()
+        requested_source_ticks = ctf.tick_count * fetch_limit
+        queued_at = perf_counter()
+        async with _event_request_gate():
+            started_at = perf_counter()
+            rows = await repo.query_tick_bars(
+                symbol=symbol,
+                tick_count=ctf.tick_count,
+                tf_label=ctf.raw,
+                dt_from=from_dt,
+                dt_to=to_dt,
+                limit=fetch_limit,
+                price_field=price,
+                include_incomplete=include_incomplete,
+                max_source_rows=settings.custom_candle_max_source_ticks,
+                work_mem_mb=settings.custom_candle_work_mem_mb,
+            )
+            completed_at = perf_counter()
+        logger.info(
+            "custom_candle_snapshot_built",
             symbol=symbol,
-            tick_count=ctf.tick_count,
-            tf_label=ctf.raw,
-            dt_from=from_dt,
-            dt_to=to_dt,
-            limit=fetch_limit,
-            price_field=price,
-            include_incomplete=include_incomplete,
+            timeframe=ctf.raw,
+            source_limit=min(
+                requested_source_ticks,
+                settings.custom_candle_max_source_ticks,
+            ),
+            requested_source_ticks=requested_source_ticks,
+            output_bars=len(rows),
+            queue_ms=round((started_at - queued_at) * 1000, 1),
+            query_ms=round((completed_at - started_at) * 1000, 1),
+            build_ms=0.0,
+            total_ms=round((completed_at - queued_at) * 1000, 1),
         )
-        return _paginate_candles(rows, effective_limit, latest_n=use_latest_n)
+        return _paginate_candles(
+            rows,
+            effective_limit,
+            latest_n=use_latest_n,
+            meta={
+                "source_limit": min(
+                    requested_source_ticks,
+                    settings.custom_candle_max_source_ticks,
+                ),
+                "source_truncated": (
+                    requested_source_ticks
+                    > settings.custom_candle_max_source_ticks
+                ),
+            },
+        )
 
     # ------ Time-based custom TF ------
     if ctf.seconds < 60:

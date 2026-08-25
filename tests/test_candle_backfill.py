@@ -576,6 +576,103 @@ class TestCustomCandleEndpoint:
         assert "completed_minute_state_warmup" in result.meta["known_limitations"]
         assert query.call_args.kwargs["source_limit"] > len(ticks)
 
+    async def test_adaptive_snapshot_is_capped_and_built_off_event_loop(self):
+        """Large chart requests stay bounded and yield the API event loop."""
+        from types import SimpleNamespace
+
+        from src.api.routes.custom_candles import get_custom_candles
+
+        with (
+            patch(
+                "src.api.routes.custom_candles.maybe_backfill_ticks",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "src.api.routes.custom_candles.validate_symbol",
+                return_value="EURUSD",
+            ),
+            patch(
+                "src.api.routes.custom_candles.get_settings",
+                return_value=SimpleNamespace(
+                    custom_candle_max_source_ticks=300_000,
+                    custom_candle_max_concurrency=1,
+                    custom_candle_work_mem_mb=32,
+                ),
+            ),
+            patch(
+                "src.api.routes.custom_candles.repo.query_information_bar_ticks",
+                new_callable=AsyncMock,
+                return_value=[],
+            ) as query,
+            patch(
+                "src.api.routes.custom_candles.asyncio.to_thread",
+                new_callable=AsyncMock,
+                return_value=[],
+            ) as to_thread,
+        ):
+            result = await get_custom_candles(
+                symbol="EURUSD",
+                timeframe="A1000",
+                from_dt=None,
+                to_dt=None,
+                limit=1_500,
+                bars=None,
+                price="bid",
+                include_incomplete=False,
+            )
+
+        assert result.count == 0
+        assert query.call_args.kwargs["source_limit"] == 300_000
+        assert query.call_args.kwargs["work_mem_mb"] == 32
+        to_thread.assert_awaited_once()
+
+    async def test_tick_snapshot_is_capped_and_reports_truncation(self):
+        """T<n> SQL cannot expand a chart request beyond the source-row cap."""
+        from types import SimpleNamespace
+
+        from src.api.routes.custom_candles import get_custom_candles
+
+        with (
+            patch(
+                "src.api.routes.custom_candles.maybe_backfill_ticks",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "src.api.routes.custom_candles.validate_symbol",
+                return_value="EURUSD",
+            ),
+            patch(
+                "src.api.routes.custom_candles.get_settings",
+                return_value=SimpleNamespace(
+                    custom_candle_max_source_ticks=300_000,
+                    custom_candle_max_concurrency=1,
+                    custom_candle_work_mem_mb=32,
+                ),
+            ),
+            patch(
+                "src.api.routes.custom_candles.repo.query_tick_bars",
+                new_callable=AsyncMock,
+                return_value=[],
+            ) as query,
+        ):
+            result = await get_custom_candles(
+                symbol="EURUSD",
+                timeframe="T1000",
+                from_dt=None,
+                to_dt=None,
+                limit=1_500,
+                bars=None,
+                price="bid",
+                include_incomplete=False,
+            )
+
+        assert query.call_args.kwargs["max_source_rows"] == 300_000
+        assert query.call_args.kwargs["work_mem_mb"] == 32
+        assert result.meta == {
+            "source_limit": 300_000,
+            "source_truncated": True,
+        }
+
 
 # ---------------------------------------------------------------------------
 # 6. Backfill endpoint

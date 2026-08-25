@@ -17,6 +17,7 @@ class _Session:
     def __init__(self) -> None:
         self.statement = None
         self.params = None
+        self.calls: list[tuple[object, dict[str, object]]] = []
 
     async def __aenter__(self) -> _Session:
         return self
@@ -27,6 +28,7 @@ class _Session:
     async def execute(self, statement: object, params: dict[str, object]) -> _Rows:
         self.statement = statement
         self.params = params
+        self.calls.append((statement, params))
         return _Rows()
 
 
@@ -121,6 +123,24 @@ async def test_tick_bar_query_rejects_unknown_price_field() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tick_bar_query_applies_source_cap_and_local_work_mem() -> None:
+    session = _Session()
+    with patch.object(repository, "get_session_factory", return_value=_Factory(session)):
+        await repository.query_tick_bars(
+            symbol="EURUSD",
+            tick_count=1_000,
+            tf_label="T1000",
+            limit=1_500,
+            max_source_rows=300_000,
+            work_mem_mb=32,
+        )
+
+    assert len(session.calls) == 2
+    assert "SET LOCAL work_mem = '32MB'" in str(session.calls[0][0])
+    assert session.calls[1][1]["source_limit"] == 300_000
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("dt_from", "expected_source_order"),
     [
@@ -148,3 +168,18 @@ async def test_information_bar_tick_source_is_bounded_and_returned_ascending(
     assert expected_source_order in sql
     assert "LIMIT :source_limit" in sql
     assert "ORDER BY time_msc ASC" in sql or "ORDER BY t.time_msc ASC" in sql
+
+
+@pytest.mark.asyncio
+async def test_information_tick_query_applies_local_work_mem() -> None:
+    session = _Session()
+    with patch.object(repository, "get_session_factory", return_value=_Factory(session)):
+        await repository.query_information_bar_ticks(
+            symbol="EURUSD",
+            source_limit=300_000,
+            work_mem_mb=32,
+        )
+
+    assert len(session.calls) == 2
+    assert "SET LOCAL work_mem = '32MB'" in str(session.calls[0][0])
+    assert session.calls[1][1]["source_limit"] == 300_000
