@@ -19,6 +19,7 @@ from src.db.engine import get_engine
 logger = structlog.get_logger(__name__)
 
 SQL_FILE = Path(__file__).resolve().parents[2] / "scripts" / "init_db.sql"
+_TRADING_SCHEMA_MARKER = "-- 11. TRADE COMMANDS"
 
 # Regex to split SQL on semicolons that are NOT inside $$ blocks.
 _STMT_SPLIT_RE = re.compile(
@@ -59,6 +60,25 @@ def _split_sql(sql: str) -> list[str]:
     return parts
 
 
+def _trading_schema_statements(sql: str) -> list[str]:
+    """Return only close-execution DDL without comment-prefixed split loss.
+
+    The legacy splitter intentionally remains unchanged because broad schema
+    replay on a busy database can attempt heavyweight historical indexes.  The
+    execution schema is small and append-only, so it is replayed separately in
+    its own transaction.
+    """
+    marker_index = sql.find(_TRADING_SCHEMA_MARKER)
+    if marker_index < 0:
+        raise RuntimeError("Trading schema marker is missing from init_db.sql")
+    suffix = sql[marker_index:]
+    uncommented = "\n".join(
+        line for line in suffix.splitlines()
+        if not line.strip().startswith("--")
+    )
+    return _split_sql(uncommented)
+
+
 async def init_timescaledb() -> None:
     """Execute the DDL init script inside a transaction."""
     engine = get_engine()
@@ -86,6 +106,12 @@ async def init_timescaledb() -> None:
                 else:
                     logger.error("init_ddl_stmt_fatal", error=str(exc), stmt=clean[:120])
                     raise
+
+    # Apply only the close-execution schema in a separate, strict transaction.
+    # This is the live-safe evolution path for existing Connector databases.
+    async with engine.begin() as conn:
+        for stmt in _trading_schema_statements(sql):
+            await conn.execute(text(stmt))
 
     logger.info("timescaledb_schema_initialized", sql_file=str(SQL_FILE))
 

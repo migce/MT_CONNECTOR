@@ -4,10 +4,11 @@ Pydantic schemas for the API layer — request parameters and response models.
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Generic, Optional, TypeVar
+from datetime import datetime, timezone
+from typing import Any, Generic, Literal, Optional, TypeVar
+from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from src.api.digits import get_digits, normalize_money, normalize_price
 
@@ -144,6 +145,9 @@ class HealthResponse(BaseModel):
     status: str = "ok"
     mt5_connected: bool = False
     trader_connected: bool = False
+    trader_accounts_total: int = 0
+    trader_accounts_healthy: int = 0
+    trader_degraded_account_ids: list[int] = Field(default_factory=list)
     db_connected: bool = False
     redis_connected: bool = False
     uptime_sec: float = 0.0
@@ -317,10 +321,39 @@ class AccountResponse(BaseModel):
     mt5_server: str
     mt5_path: str
     enabled: bool
+    session_required: Optional[bool] = None
+    session_active: bool = True
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
+
+
+class AccountSessionDemandRequest(BaseModel):
+    """Complete desired trading-session set from the Monitor source of truth."""
+
+    account_ids: list[int] = Field(default_factory=list)
+    source_updated_at: datetime
+    snapshot_id: str = Field(min_length=1, max_length=128)
+
+    @field_validator("source_updated_at")
+    @classmethod
+    def require_aware_source_timestamp(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("source_updated_at must include a timezone")
+        return value.astimezone(timezone.utc)
+
+
+class AccountSessionDemandResponse(BaseModel):
+    """Result of applying or ignoring a complete desired-session snapshot."""
+
+    applied: bool
+    changed: bool = False
+    stale: bool = False
+    account_ids: list[int]
+    effective_account_ids: list[int]
+    source_updated_at: datetime
+    snapshot_id: str
 
 
 # ---------------------------------------------------------------
@@ -432,3 +465,89 @@ class AccountInfoResponse(BaseModel):
         self.open_volume_lots = normalize_money(self.open_volume_lots)
         self.has_open_positions = self.open_positions_count > 0
         return self
+
+
+# ---------------------------------------------------------------
+# Protected close-only execution
+# ---------------------------------------------------------------
+
+class TradeCommandCreate(BaseModel):
+    """An idempotent request to close one exact live MT5 position."""
+
+    command_id: UUID
+    account_id: int = Field(gt=0)
+    action: Literal["close_position"] = "close_position"
+    position_ticket: int = Field(gt=0)
+    expected_position_identifier: Optional[int] = Field(default=None, gt=0)
+    expected_symbol: str = Field(min_length=1, max_length=64)
+    expected_type: Literal[0, 1]
+    expected_magic: Optional[int] = None
+    max_volume: float = Field(gt=0)
+    reason: str = Field(min_length=1, max_length=128)
+    correlation_id: Optional[str] = Field(default=None, max_length=255)
+    requested_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+
+
+class TradeCommandResponse(BaseModel):
+    id: UUID
+    account_id: int
+    action: str
+    status: str
+    position_ticket: int
+    expected_position_identifier: Optional[int] = None
+    expected_symbol: str
+    expected_type: int
+    expected_magic: Optional[int] = None
+    max_volume: float
+    reason: str
+    correlation_id: Optional[str] = None
+    requested_by: str
+    requested_at: datetime
+    expires_at: Optional[datetime] = None
+    next_attempt_at: datetime
+    attempt_count: int = 0
+    claimed_at: Optional[datetime] = None
+    submitted_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    last_error: Optional[str] = None
+    result: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class TradeAttemptResponse(BaseModel):
+    id: int
+    command_id: UUID
+    attempt_no: int
+    phase: str
+    retcode: Optional[int] = None
+    message: Optional[str] = None
+    request_payload: dict[str, Any] = Field(default_factory=dict)
+    result_payload: dict[str, Any] = Field(default_factory=dict)
+    started_at: datetime
+    finished_at: datetime
+
+
+class TradeCommandDetail(TradeCommandResponse):
+    attempts: list[TradeAttemptResponse] = Field(default_factory=list)
+
+
+class BrokerPositionEventResponse(BaseModel):
+    id: int
+    account_id: int
+    event_type: str
+    position_ticket: int
+    position_identifier: Optional[int] = None
+    symbol: str
+    position_type: int
+    magic: Optional[int] = None
+    volume_before: float
+    volume_after: float
+    event_time: datetime
+    event_time_msc: Optional[int] = None
+    close_deal_ticket: Optional[int] = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    observed_at: datetime

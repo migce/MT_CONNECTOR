@@ -20,8 +20,10 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 
+from src.api.digits import load_symbol_digits
 from src.api.middleware.request_metrics import RequestMetricsMiddleware
 from src.api.routes import (
+    account_sessions,
     accounts,
     backfill,
     candles,
@@ -34,6 +36,7 @@ from src.api.routes import (
     supervisor,
     symbols,
     ticks,
+    trade_commands,
     trading,
 )
 from src.api.websocket import streams
@@ -41,7 +44,6 @@ from src.config import get_settings
 from src.db.engine import dispose_engine, get_engine
 from src.db.init_timescale import init_timescaledb
 from src.logging_config import setup_logging
-from src.api.digits import load_symbol_digits
 from src.redis_bus.backfill_manager import BackfillRequester
 from src.redis_bus.pool import close_redis_pool
 
@@ -1101,7 +1103,9 @@ def create_app() -> FastAPI:
     app.include_router(coverage.router)
     app.include_router(stats.router)
     app.include_router(accounts.router)
+    app.include_router(account_sessions.router)
     app.include_router(trading.router)
+    app.include_router(trade_commands.router)
     app.include_router(poller.router)
     app.include_router(supervisor.router)
     app.include_router(backfill.router)

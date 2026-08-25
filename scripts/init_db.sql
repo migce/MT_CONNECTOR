@@ -272,3 +272,98 @@ CREATE TABLE IF NOT EXISTS account_info (
 -- ============================================================
 ALTER TABLE trading_accounts
     ADD COLUMN IF NOT EXISTS description VARCHAR(255) NULL;
+
+-- ============================================================
+-- 11. TRADE COMMANDS — durable, idempotent close-only execution
+-- ============================================================
+CREATE TABLE IF NOT EXISTS trade_commands (
+    id                           UUID             PRIMARY KEY,
+    account_id                   INTEGER          NOT NULL REFERENCES trading_accounts(id),
+    action                       TEXT             NOT NULL CHECK (action = 'close_position'),
+    status                       TEXT             NOT NULL DEFAULT 'accepted',
+    position_ticket              BIGINT           NOT NULL,
+    expected_position_identifier BIGINT,
+    expected_symbol              TEXT             NOT NULL,
+    expected_type                INTEGER          NOT NULL CHECK (expected_type IN (0, 1)),
+    expected_magic               BIGINT,
+    max_volume                   DOUBLE PRECISION NOT NULL CHECK (max_volume > 0),
+    reason                       TEXT             NOT NULL,
+    correlation_id               TEXT,
+    requested_by                 TEXT             NOT NULL,
+    requested_at                 TIMESTAMPTZ      NOT NULL,
+    expires_at                   TIMESTAMPTZ,
+    next_attempt_at              TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    attempt_count                INTEGER          NOT NULL DEFAULT 0,
+    claimed_at                   TIMESTAMPTZ,
+    submitted_at                 TIMESTAMPTZ,
+    completed_at                 TIMESTAMPTZ,
+    last_error                   TEXT,
+    result                       JSONB             NOT NULL DEFAULT '{}'::jsonb,
+    created_at                   TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    updated_at                   TIMESTAMPTZ      NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_trade_commands_dispatch
+    ON trade_commands (status, next_attempt_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_trade_commands_account_created
+    ON trade_commands (account_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_trade_commands_account_id
+    ON trade_commands (account_id, id);
+
+CREATE TABLE IF NOT EXISTS trade_attempts (
+    id             BIGSERIAL        PRIMARY KEY,
+    command_id     UUID             NOT NULL REFERENCES trade_commands(id) ON DELETE CASCADE,
+    attempt_no     INTEGER          NOT NULL,
+    phase          TEXT             NOT NULL,
+    retcode        INTEGER,
+    message        TEXT,
+    request_payload JSONB           NOT NULL DEFAULT '{}'::jsonb,
+    result_payload JSONB            NOT NULL DEFAULT '{}'::jsonb,
+    started_at     TIMESTAMPTZ      NOT NULL,
+    finished_at    TIMESTAMPTZ      NOT NULL,
+    created_at     TIMESTAMPTZ      NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_trade_attempts_command
+    ON trade_attempts (command_id, attempt_no, id);
+
+-- ============================================================
+-- 12. BROKER POSITION EVENTS — durable lifecycle cursor for consumers
+-- ============================================================
+CREATE TABLE IF NOT EXISTS broker_position_events (
+    id                  BIGSERIAL        PRIMARY KEY,
+    dedupe_key          TEXT             NOT NULL UNIQUE,
+    account_id          INTEGER          NOT NULL REFERENCES trading_accounts(id),
+    event_type          TEXT             NOT NULL,
+    position_ticket     BIGINT           NOT NULL,
+    position_identifier BIGINT,
+    symbol              TEXT             NOT NULL,
+    position_type       INTEGER          NOT NULL,
+    magic               BIGINT,
+    volume_before       DOUBLE PRECISION NOT NULL,
+    volume_after        DOUBLE PRECISION NOT NULL,
+    event_time          TIMESTAMPTZ      NOT NULL,
+    event_time_msc      BIGINT,
+    close_deal_ticket   BIGINT,
+    payload             JSONB            NOT NULL DEFAULT '{}'::jsonb,
+    observed_at         TIMESTAMPTZ      NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_broker_position_events_cursor
+    ON broker_position_events (account_id, id);
+CREATE INDEX IF NOT EXISTS idx_broker_position_events_time
+    ON broker_position_events (account_id, event_time DESC);
+
+-- ============================================================
+-- 13. TRADING ACCOUNT SESSION DEMAND — Monitor-owned desired set
+-- ============================================================
+ALTER TABLE trading_accounts
+    ADD COLUMN IF NOT EXISTS session_required BOOLEAN NULL;
+
+CREATE TABLE IF NOT EXISTS trading_account_session_demand (
+    singleton_id        SMALLINT         PRIMARY KEY DEFAULT 1 CHECK (singleton_id = 1),
+    source_updated_at   TIMESTAMPTZ      NOT NULL,
+    desired_account_ids INTEGER[]        NOT NULL DEFAULT '{}',
+    snapshot_id         TEXT             NOT NULL,
+    applied_at          TIMESTAMPTZ      NOT NULL DEFAULT NOW()
+);

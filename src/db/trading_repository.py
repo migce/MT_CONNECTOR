@@ -7,9 +7,11 @@ concerns isolated.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
+from uuid import UUID
 
+import orjson
 import structlog
 from sqlalchemy import text
 from tenacity import (
@@ -38,7 +40,13 @@ _db_retry = retry(
 _INSERT_ACCOUNT_SQL = text("""
     INSERT INTO trading_accounts (label, description, mt5_login, mt5_password, mt5_server, mt5_path, enabled)
     VALUES (:label, :description, :mt5_login, :mt5_password, :mt5_server, :mt5_path, :enabled)
-    RETURNING id, label, description, mt5_login, mt5_server, mt5_path, enabled, created_at, updated_at
+    RETURNING id, label, description, mt5_login, mt5_server, mt5_path, enabled,
+              session_required,
+              enabled AND COALESCE(
+                  session_required,
+                  NOT EXISTS (SELECT 1 FROM trading_account_session_demand WHERE singleton_id = 1)
+              ) AS session_active,
+              created_at, updated_at
 """)
 
 _UPDATE_ACCOUNT_SQL = text("""
@@ -52,7 +60,13 @@ _UPDATE_ACCOUNT_SQL = text("""
         enabled      = COALESCE(:enabled, enabled),
         updated_at   = NOW()
     WHERE id = :id
-    RETURNING id, label, description, mt5_login, mt5_server, mt5_path, enabled, created_at, updated_at
+    RETURNING id, label, description, mt5_login, mt5_server, mt5_path, enabled,
+              session_required,
+              enabled AND COALESCE(
+                  session_required,
+                  NOT EXISTS (SELECT 1 FROM trading_account_session_demand WHERE singleton_id = 1)
+              ) AS session_active,
+              created_at, updated_at
 """)
 
 _DELETE_ACCOUNT_SQL = text("""
@@ -60,13 +74,24 @@ _DELETE_ACCOUNT_SQL = text("""
 """)
 
 _SELECT_ACCOUNTS_SQL = text("""
-    SELECT id, label, description, mt5_login, mt5_server, mt5_path, enabled, created_at, updated_at
+    SELECT id, label, description, mt5_login, mt5_server, mt5_path, enabled,
+           session_required,
+           enabled AND COALESCE(
+               session_required,
+               NOT EXISTS (SELECT 1 FROM trading_account_session_demand WHERE singleton_id = 1)
+           ) AS session_active,
+           created_at, updated_at
     FROM trading_accounts
     ORDER BY id
 """)
 
 _SELECT_ACCOUNT_BY_ID_SQL = text("""
     SELECT id, label, description, mt5_login, mt5_password, mt5_server, mt5_path, enabled,
+           session_required,
+           enabled AND COALESCE(
+               session_required,
+               NOT EXISTS (SELECT 1 FROM trading_account_session_demand WHERE singleton_id = 1)
+           ) AS session_active,
            created_at, updated_at
     FROM trading_accounts
     WHERE id = :id
@@ -76,6 +101,44 @@ _SELECT_ENABLED_ACCOUNTS_SQL = text("""
     SELECT id, label, mt5_login, mt5_password, mt5_server, mt5_path
     FROM trading_accounts
     WHERE enabled = TRUE
+      AND COALESCE(
+          session_required,
+          NOT EXISTS (SELECT 1 FROM trading_account_session_demand WHERE singleton_id = 1)
+      )
+    ORDER BY id
+""")
+
+_SELECT_SESSION_DEMAND_SQL = text("""
+    SELECT source_updated_at, desired_account_ids, snapshot_id
+    FROM trading_account_session_demand
+    WHERE singleton_id = 1
+    FOR UPDATE
+""")
+
+_SELECT_KNOWN_ACCOUNT_IDS_SQL = text("""
+    SELECT id FROM trading_accounts ORDER BY id
+""")
+
+_APPLY_SESSION_DEMAND_SQL = text("""
+    UPDATE trading_accounts
+    SET session_required = id = ANY(CAST(:account_ids AS INTEGER[]))
+""")
+
+_UPSERT_SESSION_DEMAND_SQL = text("""
+    INSERT INTO trading_account_session_demand (
+        singleton_id, source_updated_at, desired_account_ids, snapshot_id, applied_at
+    ) VALUES (1, :source_updated_at, CAST(:account_ids AS INTEGER[]), :snapshot_id, NOW())
+    ON CONFLICT (singleton_id) DO UPDATE SET
+        source_updated_at = EXCLUDED.source_updated_at,
+        desired_account_ids = EXCLUDED.desired_account_ids,
+        snapshot_id = EXCLUDED.snapshot_id,
+        applied_at = NOW()
+""")
+
+_SELECT_EFFECTIVE_ACCOUNT_IDS_SQL = text("""
+    SELECT id
+    FROM trading_accounts
+    WHERE enabled = TRUE AND session_required = TRUE
     ORDER BY id
 """)
 
@@ -168,6 +231,74 @@ async def get_enabled_accounts() -> list[dict[str, Any]]:
     async with factory() as session:
         result = await session.execute(_SELECT_ENABLED_ACCOUNTS_SQL)
         return [dict(r) for r in result.mappings().all()]
+
+
+async def reconcile_account_session_demand(
+    *,
+    account_ids: Sequence[int],
+    source_updated_at: datetime,
+    snapshot_id: str,
+) -> dict[str, Any]:
+    """Atomically apply a complete Monitor-owned desired account set.
+
+    Before the first accepted snapshot, ``NULL`` demand retains the legacy
+    enabled-only behaviour. Afterwards new or omitted accounts remain stopped
+    until a newer complete snapshot explicitly requires them.
+    """
+    normalized_ids = sorted({int(account_id) for account_id in account_ids})
+    factory = get_session_factory()
+    async with factory() as session:
+        async with session.begin():
+            current_result = await session.execute(_SELECT_SESSION_DEMAND_SQL)
+            current = current_result.mappings().first()
+            if current is not None and source_updated_at < current["source_updated_at"]:
+                effective_result = await session.execute(_SELECT_EFFECTIVE_ACCOUNT_IDS_SQL)
+                return {
+                    "applied": False,
+                    "changed": False,
+                    "stale": True,
+                    "account_ids": list(current["desired_account_ids"]),
+                    "effective_account_ids": [int(value) for value in effective_result.scalars().all()],
+                    "source_updated_at": current["source_updated_at"],
+                    "snapshot_id": current["snapshot_id"],
+                }
+
+            known_result = await session.execute(_SELECT_KNOWN_ACCOUNT_IDS_SQL)
+            known_ids = {int(value) for value in known_result.scalars().all()}
+            unknown_ids = sorted(set(normalized_ids) - known_ids)
+            if unknown_ids:
+                raise ValueError(f"Unknown trading account IDs: {unknown_ids}")
+
+            changed = (
+                current is None
+                or sorted(int(value) for value in current["desired_account_ids"])
+                != normalized_ids
+            )
+            if changed:
+                await session.execute(
+                    _APPLY_SESSION_DEMAND_SQL,
+                    {"account_ids": normalized_ids},
+                )
+            await session.execute(
+                _UPSERT_SESSION_DEMAND_SQL,
+                {
+                    "account_ids": normalized_ids,
+                    "source_updated_at": source_updated_at,
+                    "snapshot_id": snapshot_id,
+                },
+            )
+            effective_result = await session.execute(_SELECT_EFFECTIVE_ACCOUNT_IDS_SQL)
+            effective_ids = [int(value) for value in effective_result.scalars().all()]
+
+    return {
+        "applied": True,
+        "changed": changed,
+        "stale": False,
+        "account_ids": normalized_ids,
+        "effective_account_ids": effective_ids,
+        "source_updated_at": source_updated_at,
+        "snapshot_id": snapshot_id,
+    }
 
 
 # ---------------------------------------------------------------
@@ -444,3 +575,340 @@ async def get_all_account_info() -> list[dict[str, Any]]:
     async with factory() as session:
         result = await session.execute(_QUERY_ALL_ACCOUNT_INFO_SQL)
         return [dict(r) for r in result.mappings().all()]
+
+
+# ---------------------------------------------------------------
+# Durable close-only trade commands
+# ---------------------------------------------------------------
+
+_TRADE_COMMAND_COLUMNS = """
+    id, account_id, action, status, position_ticket,
+    expected_position_identifier, expected_symbol, expected_type,
+    expected_magic, max_volume, reason, correlation_id, requested_by,
+    requested_at, expires_at, next_attempt_at, attempt_count, claimed_at,
+    submitted_at, completed_at, last_error, result, created_at, updated_at
+"""
+
+_QUALIFIED_TRADE_COMMAND_COLUMNS = """
+    command.id, command.account_id, command.action, command.status,
+    command.position_ticket, command.expected_position_identifier,
+    command.expected_symbol, command.expected_type, command.expected_magic,
+    command.max_volume, command.reason, command.correlation_id,
+    command.requested_by, command.requested_at, command.expires_at,
+    command.next_attempt_at, command.attempt_count, command.claimed_at,
+    command.submitted_at, command.completed_at, command.last_error,
+    command.result, command.created_at, command.updated_at
+"""
+
+
+def _json(value: Any) -> str:
+    return orjson.dumps(value if value is not None else {}).decode()
+
+
+def _uuid(value: UUID | str) -> UUID:
+    return value if isinstance(value, UUID) else UUID(str(value))
+
+
+@_db_retry
+async def create_trade_command(
+    *,
+    command_id: UUID,
+    account_id: int,
+    position_ticket: int,
+    expected_position_identifier: int | None,
+    expected_symbol: str,
+    expected_type: int,
+    expected_magic: int | None,
+    max_volume: float,
+    reason: str,
+    correlation_id: str | None,
+    requested_by: str,
+    requested_at: datetime,
+    expires_at: datetime | None,
+) -> tuple[dict[str, Any], bool]:
+    """Create an idempotent close command and return ``(row, created)``."""
+    insert_sql = text(f"""
+        INSERT INTO trade_commands (
+            id, account_id, action, status, position_ticket,
+            expected_position_identifier, expected_symbol, expected_type,
+            expected_magic, max_volume, reason, correlation_id, requested_by,
+            requested_at, expires_at, next_attempt_at
+        ) VALUES (
+            :id, :account_id, 'close_position', 'accepted', :position_ticket,
+            :expected_position_identifier, :expected_symbol, :expected_type,
+            :expected_magic, :max_volume, :reason, :correlation_id, :requested_by,
+            :requested_at, :expires_at, NOW()
+        )
+        ON CONFLICT (id) DO NOTHING
+        RETURNING {_TRADE_COMMAND_COLUMNS}
+    """)
+    select_sql = text(f"SELECT {_TRADE_COMMAND_COLUMNS} FROM trade_commands WHERE id = :id")
+    params = {
+        "id": command_id,
+        "account_id": account_id,
+        "position_ticket": position_ticket,
+        "expected_position_identifier": expected_position_identifier,
+        "expected_symbol": expected_symbol,
+        "expected_type": expected_type,
+        "expected_magic": expected_magic,
+        "max_volume": max_volume,
+        "reason": reason,
+        "correlation_id": correlation_id,
+        "requested_by": requested_by,
+        "requested_at": requested_at,
+        "expires_at": expires_at,
+    }
+    factory = get_session_factory()
+    async with factory() as session:
+        async with session.begin():
+            inserted = (await session.execute(insert_sql, params)).mappings().first()
+            if inserted is not None:
+                return dict(inserted), True
+            existing = (await session.execute(select_sql, {"id": command_id})).mappings().one()
+            return dict(existing), False
+
+
+@_db_retry
+async def get_trade_command(command_id: UUID | str) -> dict[str, Any] | None:
+    sql = text(f"SELECT {_TRADE_COMMAND_COLUMNS} FROM trade_commands WHERE id = :id")
+    factory = get_session_factory()
+    async with factory() as session:
+        row = (await session.execute(sql, {"id": _uuid(command_id)})).mappings().first()
+    return dict(row) if row else None
+
+
+@_db_retry
+async def list_trade_attempts(command_id: UUID | str) -> list[dict[str, Any]]:
+    sql = text("""
+        SELECT id, command_id, attempt_no, phase, retcode, message,
+               request_payload, result_payload, started_at, finished_at
+        FROM trade_attempts
+        WHERE command_id = :command_id
+        ORDER BY attempt_no, id
+    """)
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(sql, {"command_id": _uuid(command_id)})
+        return [dict(row) for row in result.mappings().all()]
+
+
+@_db_retry
+async def claim_next_trade_command(account_ids: Sequence[int]) -> dict[str, Any] | None:
+    if not account_ids:
+        return None
+    sql = text(f"""
+        WITH candidate AS (
+            SELECT id
+            FROM trade_commands
+            WHERE status IN ('accepted', 'retry_pending')
+              AND next_attempt_at <= NOW()
+              AND (expires_at IS NULL OR expires_at > NOW())
+              AND account_id = ANY(:account_ids)
+            ORDER BY next_attempt_at, created_at
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+        )
+        UPDATE trade_commands AS command
+        SET status = 'claimed',
+            claimed_at = NOW(),
+            attempt_count = command.attempt_count + 1,
+            updated_at = NOW()
+        FROM candidate
+        WHERE command.id = candidate.id
+        RETURNING {_QUALIFIED_TRADE_COMMAND_COLUMNS}
+    """)
+    factory = get_session_factory()
+    async with factory() as session:
+        async with session.begin():
+            row = (
+                await session.execute(sql, {"account_ids": list(account_ids)})
+            ).mappings().first()
+    return dict(row) if row else None
+
+
+@_db_retry
+async def requeue_stale_claimed_commands(timeout_sec: int) -> int:
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=timeout_sec)
+    sql = text("""
+        UPDATE trade_commands
+        SET status = 'retry_pending', claimed_at = NULL, next_attempt_at = NOW(),
+            last_error = 'dispatcher_recovered_stale_claim', updated_at = NOW()
+        WHERE status = 'claimed' AND claimed_at < :cutoff
+    """)
+    factory = get_session_factory()
+    async with factory() as session:
+        async with session.begin():
+            result = await session.execute(sql, {"cutoff": cutoff})
+            return result.rowcount
+
+
+@_db_retry
+async def expire_trade_commands() -> int:
+    sql = text("""
+        UPDATE trade_commands
+        SET status = 'expired', completed_at = NOW(), updated_at = NOW(),
+            last_error = COALESCE(last_error, 'command_expired')
+        WHERE status IN ('accepted', 'retry_pending')
+          AND expires_at IS NOT NULL AND expires_at <= NOW()
+    """)
+    factory = get_session_factory()
+    async with factory() as session:
+        async with session.begin():
+            result = await session.execute(sql)
+            return result.rowcount
+
+
+@_db_retry
+async def append_trade_attempt(
+    *,
+    command_id: UUID | str,
+    attempt_no: int,
+    phase: str,
+    retcode: int | None,
+    message: str | None,
+    request_payload: dict[str, Any],
+    result_payload: dict[str, Any],
+    started_at: datetime,
+    finished_at: datetime,
+) -> None:
+    sql = text("""
+        INSERT INTO trade_attempts (
+            command_id, attempt_no, phase, retcode, message,
+            request_payload, result_payload, started_at, finished_at
+        ) VALUES (
+            :command_id, :attempt_no, :phase, :retcode, :message,
+            CAST(:request_payload AS JSONB), CAST(:result_payload AS JSONB),
+            :started_at, :finished_at
+        )
+    """)
+    factory = get_session_factory()
+    async with factory() as session:
+        async with session.begin():
+            await session.execute(sql, {
+                "command_id": _uuid(command_id),
+                "attempt_no": attempt_no,
+                "phase": phase,
+                "retcode": retcode,
+                "message": message,
+                "request_payload": _json(request_payload),
+                "result_payload": _json(result_payload),
+                "started_at": started_at,
+                "finished_at": finished_at,
+            })
+
+
+@_db_retry
+async def finish_trade_command(
+    command_id: UUID | str,
+    *,
+    status: str,
+    result: dict[str, Any],
+    error: str | None = None,
+) -> None:
+    sql = text("""
+        UPDATE trade_commands
+        SET status = :status, result = CAST(:result AS JSONB), last_error = :error,
+            submitted_at = COALESCE(submitted_at, NOW()), completed_at = NOW(),
+            updated_at = NOW()
+        WHERE id = :id
+    """)
+    factory = get_session_factory()
+    async with factory() as session:
+        async with session.begin():
+            await session.execute(sql, {
+                "id": _uuid(command_id),
+                "status": status,
+                "result": _json(result),
+                "error": error,
+            })
+
+
+@_db_retry
+async def retry_trade_command(
+    command_id: UUID | str,
+    *,
+    result: dict[str, Any],
+    error: str,
+    delay_sec: float,
+) -> None:
+    next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay_sec)
+    sql = text("""
+        UPDATE trade_commands
+        SET status = 'retry_pending', result = CAST(:result AS JSONB),
+            last_error = :error, claimed_at = NULL, next_attempt_at = :next_attempt_at,
+            updated_at = NOW()
+        WHERE id = :id
+    """)
+    factory = get_session_factory()
+    async with factory() as session:
+        async with session.begin():
+            await session.execute(sql, {
+                "id": _uuid(command_id),
+                "result": _json(result),
+                "error": error,
+                "next_attempt_at": next_attempt_at,
+            })
+
+
+# ---------------------------------------------------------------
+# Durable broker position events
+# ---------------------------------------------------------------
+
+@_db_retry
+async def insert_broker_position_event(event: dict[str, Any]) -> int | None:
+    sql = text("""
+        INSERT INTO broker_position_events (
+            dedupe_key, account_id, event_type, position_ticket,
+            position_identifier, symbol, position_type, magic,
+            volume_before, volume_after, event_time, event_time_msc,
+            close_deal_ticket, payload
+        ) VALUES (
+            :dedupe_key, :account_id, :event_type, :position_ticket,
+            :position_identifier, :symbol, :position_type, :magic,
+            :volume_before, :volume_after, :event_time, :event_time_msc,
+            :close_deal_ticket, CAST(:payload AS JSONB)
+        )
+        ON CONFLICT (dedupe_key) DO NOTHING
+        RETURNING id
+    """)
+    params = dict(event)
+    params["payload"] = _json(params.get("payload", {}))
+    factory = get_session_factory()
+    async with factory() as session:
+        async with session.begin():
+            row = (await session.execute(sql, params)).first()
+    return int(row[0]) if row else None
+
+
+@_db_retry
+async def query_broker_position_events(
+    *,
+    after_id: int = 0,
+    account_id: int | None = None,
+    position_ids: Sequence[int] | None = None,
+    limit: int = 1000,
+) -> list[dict[str, Any]]:
+    clauses = ["id > :after_id"]
+    params: dict[str, Any] = {"after_id": after_id, "limit": limit}
+    if account_id is not None:
+        clauses.append("account_id = :account_id")
+        params["account_id"] = account_id
+    normalized_position_ids = sorted({int(value) for value in (position_ids or [])})
+    if normalized_position_ids:
+        clauses.append(
+            "(position_identifier = ANY(:position_ids) OR position_ticket = ANY(:position_ids))"
+        )
+        params["position_ids"] = normalized_position_ids
+    sql = text(f"""
+        SELECT id, account_id, event_type, position_ticket, position_identifier,
+               symbol, position_type, magic, volume_before, volume_after,
+               event_time, event_time_msc, close_deal_ticket, payload, observed_at
+        FROM broker_position_events
+        WHERE {' AND '.join(clauses)}
+        ORDER BY id
+        LIMIT :limit
+    """)
+    factory = get_session_factory()
+    async with factory() as session:
+        result = await session.execute(sql, params)
+        return [dict(row) for row in result.mappings().all()]
