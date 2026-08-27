@@ -71,6 +71,72 @@ class Backfiller:
         """Replace the active symbol set used by gap scan / reconnect."""
         self._active_symbols = list(symbols)
 
+    async def _persist_candle_batches(self, rows: list[dict[str, Any]]) -> int:
+        """Commit historical candles in bounded, retryable transactions."""
+        batch_rows = self._settings.backfill_candle_batch_rows
+        affected = 0
+        for offset in range(0, len(rows), batch_rows):
+            affected += await repo.upsert_candles(rows[offset : offset + batch_rows])
+            await asyncio.sleep(0)
+        return affected
+
+    @staticmethod
+    def _last_completed_open(reference: datetime, timeframe: Timeframe) -> datetime:
+        """Return the open timestamp of the last fully closed native bar."""
+        reference = reference.astimezone(timezone.utc)
+        epoch_seconds = int(reference.timestamp())
+        current_open = epoch_seconds - epoch_seconds % timeframe.seconds
+        return datetime.fromtimestamp(
+            current_open - timeframe.seconds,
+            tz=timezone.utc,
+        )
+
+    async def refresh_settled_candles(
+        self,
+        symbol: str,
+        dt_from: datetime,
+        dt_to: datetime,
+    ) -> dict[str, int]:
+        """Force-refresh completed native bars from base to higher timeframes.
+
+        Existing timestamps are deliberately reread and UPSERTed. This closes
+        the gap left by absence-only scanners when a disconnect persisted a
+        completed candle before its final OHLCV revision arrived.
+        """
+        ordered = sorted(set(self._settings.timeframes), key=lambda item: item.seconds)
+        rows_by_timeframe: dict[str, int] = {}
+        logger.info(
+            "settled_candle_refresh_start",
+            symbol=symbol,
+            range_from=str(dt_from),
+            range_to=str(dt_to),
+            timeframes=[timeframe.value for timeframe in ordered],
+        )
+        for timeframe in ordered:
+            completed_to = min(
+                dt_to.astimezone(timezone.utc),
+                self._last_completed_open(dt_to, timeframe),
+            )
+            if dt_from > completed_to:
+                rows_by_timeframe[timeframe.value] = 0
+                continue
+            self._metrics.set_backfill_phase(
+                "settlement",
+                f"{symbol} {timeframe.value}",
+            )
+            rows_by_timeframe[timeframe.value] = await self.on_demand_candles(
+                symbol,
+                timeframe.value,
+                dt_from,
+                completed_to,
+            )
+        logger.info(
+            "settled_candle_refresh_done",
+            symbol=symbol,
+            rows_by_timeframe=rows_by_timeframe,
+        )
+        return rows_by_timeframe
+
     # ------------------------------------------------------------------
     # Initial backfill (called on startup)
     # ------------------------------------------------------------------
@@ -82,12 +148,20 @@ class Backfiller:
 
         now = datetime.now(timezone.utc)
         default_start = now - timedelta(days=self._settings.backfill_days)
+        settlement_start = max(
+            default_start,
+            now - timedelta(hours=self._settings.candle_settlement_refresh_hours),
+        )
 
         for symbol in self._settings.symbols:
             # --- Candle backfill ---
             for tf in self._settings.timeframes:
                 self._metrics.set_backfill_phase("initial", f"{symbol} {tf.value}")
                 await self._backfill_candles(symbol, tf, default_start, now)
+
+            # Existing completed rows may still be partial after a terminal or
+            # Poller outage. Refresh the overlap even when no timestamp is absent.
+            await self.refresh_settled_candles(symbol, settlement_start, now)
 
             # --- Tick backfill ---
             self._metrics.set_backfill_phase("initial", f"{symbol} ticks")
@@ -157,8 +231,8 @@ class Backfiller:
         gap, so we cannot rely on ``_backfill_candles``/``_backfill_ticks``
         which skip data before ``last_synced_at``.
 
-        Scans ``find_candle_gaps`` per (symbol, tf) to discover the
-        exact missing period and re-downloads only that range.
+        Force-refreshes a bounded completed-candle overlap in ascending native
+        timeframe order, including rows whose timestamps already exist.
         For ticks, re-downloads the last ``backfill_days`` range
         (``insert_ticks`` is idempotent via ON CONFLICT).
         """
@@ -166,36 +240,13 @@ class Backfiller:
         self._metrics.set_backfill_phase("reconnect")
         now = datetime.now(timezone.utc)
         default_start = now - timedelta(days=self._settings.backfill_days)
+        settlement_start = max(
+            default_start,
+            now - timedelta(hours=self._settings.candle_settlement_refresh_hours),
+        )
 
         for symbol in self._active_symbols:
-            # ── Candle gap repair per timeframe (ignores sync_state) ──
-            for tf in self._settings.timeframes:
-                self._metrics.set_backfill_phase("reconnect", f"{symbol} {tf.value}")
-
-                # Look back a generous window for gaps
-                state = await repo.get_sync_state(symbol, tf.value)
-                scan_from = default_start
-                if state and state["last_synced_at"] > default_start:
-                    scan_from = state["last_synced_at"] - timedelta(days=1)
-
-                gaps = await repo.find_candle_gaps(
-                    symbol, tf.value, scan_from, now, tf.seconds,
-                )
-                market_gaps = [g for g in gaps if is_forex_market_open(g)]
-                if not market_gaps:
-                    continue
-
-                range_start = market_gaps[0]
-                range_end = market_gaps[-1] + timedelta(seconds=tf.seconds)
-                logger.warning(
-                    "reconnect_gap_fill",
-                    symbol=symbol,
-                    timeframe=tf.value,
-                    gap_count=len(market_gaps),
-                    range_from=str(range_start),
-                    range_to=str(range_end),
-                )
-                await self.on_demand_candles(symbol, tf.value, range_start, range_end)
+            await self.refresh_settled_candles(symbol, settlement_start, now)
 
             # ── Tick backfill (idempotent) ──
             self._metrics.set_backfill_phase("reconnect", f"{symbol} ticks")
@@ -254,7 +305,7 @@ class Backfiller:
             if bars is None or len(bars) == 0:
                 break
             rows = bars_to_dicts(bars, symbol, tf.value)
-            await repo.upsert_candles(rows)
+            await self._persist_candle_batches(rows)
             total += len(rows)
             cursor = rows[-1]["time"] + timedelta(seconds=tf.seconds)
             if len(bars) < _MAX_BARS_PER_CALL:
@@ -337,7 +388,7 @@ class Backfiller:
                 break
 
             rows = bars_to_dicts(bars, symbol, tf.value)
-            await repo.upsert_candles(rows)
+            await self._persist_candle_batches(rows)
             total_inserted += len(rows)
 
             last_bar_time = rows[-1]["time"]

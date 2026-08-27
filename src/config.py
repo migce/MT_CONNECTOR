@@ -10,13 +10,11 @@ from __future__ import annotations
 import enum
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 from urllib.parse import quote_plus
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
 
 # ---------------------------------------------------------------------------
 # Timeframe mapping helpers
@@ -263,6 +261,21 @@ class Settings(BaseSettings):
     tick_poll_interval_ms: int = Field(default=50)
     candle_poll_interval_sec: int = Field(default=5)
     backfill_days: int = Field(default=30)
+    backfill_candle_batch_rows: int = Field(
+        default=2_000,
+        ge=100,
+        le=10_000,
+        description="Maximum candle rows committed by one backfill transaction.",
+    )
+    candle_settlement_refresh_hours: int = Field(
+        default=24,
+        ge=1,
+        le=168,
+        description=(
+            "Completed native-candle overlap force-refreshed in ascending "
+            "timeframe order after Poller startup and MT5 reconnect."
+        ),
+    )
     gap_scan_interval_min: int = Field(default=15)
     mt5_heartbeat_interval_sec: int = Field(default=10)
 
