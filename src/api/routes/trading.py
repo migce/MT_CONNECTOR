@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import orjson
 from fastapi import APIRouter, HTTPException, Query
 
 from src.api.schemas import (
@@ -18,6 +19,7 @@ from src.api.schemas import (
 )
 from src.config import get_settings
 from src.db import trading_repository as repo
+from src.redis_bus.pool import get_redis_pool
 
 router = APIRouter(prefix="/api/v1/trading", tags=["trading"])
 
@@ -85,6 +87,30 @@ async def get_positions(
         account_id=account_id,
         symbol=symbol,
     )
+
+
+@router.get(
+    "/positions/{account_id}/status",
+    summary="Latest successful open-position snapshot",
+)
+async def get_position_sync_status(account_id: int):
+    """Return Trader-owned proof of a complete MT5 position poll and DB write."""
+    raw = await get_redis_pool().get(f"trader:position_sync:{account_id}")
+    if raw is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"No recent position snapshot for account_id={account_id}. "
+                "The trader position loop may be delayed or unavailable."
+            ),
+        )
+    try:
+        payload = orjson.loads(raw)
+    except orjson.JSONDecodeError as exc:
+        raise HTTPException(status_code=503, detail="Position snapshot status is invalid.") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=503, detail="Position snapshot status is invalid.")
+    return payload
 
 
 @router.get(

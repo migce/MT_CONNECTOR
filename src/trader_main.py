@@ -17,7 +17,6 @@ The process exits gracefully on Ctrl+C / SIGINT / SIGTERM.
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import signal
 import sys
@@ -25,18 +24,17 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import orjson
 import structlog
 
-import orjson
-
 from src.config import get_settings
+from src.db import trading_repository as repo
 from src.db.engine import dispose_engine, get_engine
 from src.db.init_timescale import init_timescaledb
-from src.db import trading_repository as repo
 from src.logging_config import setup_logging
-from src.mt5.trading import AccountSession, verify_credentials
 from src.mt5.portable import ensure_portable_terminal
-from src.redis_bus.pool import get_redis_pool, close_redis_pool
+from src.mt5.trading import AccountSession, verify_credentials
+from src.redis_bus.pool import close_redis_pool, get_redis_pool
 
 logger = structlog.get_logger(__name__)
 
@@ -44,6 +42,7 @@ logger = structlog.get_logger(__name__)
 _LOCK_FILE = ".trader.lock"
 _EPOCH = datetime(2000, 1, 1, tzinfo=timezone.utc)
 _DEAL_SYNC_STATUS_TTL_SEC = 7 * 24 * 3600
+_POSITION_SYNC_STATUS_TTL_SEC = 120
 
 
 def _select_deal_sync_window(
@@ -123,6 +122,47 @@ async def _publish_deal_sync_status(
     except Exception:
         logger.debug(
             "deal_sync_status_publish_failed",
+            account_id=session.account_id,
+            exc_info=True,
+        )
+
+
+async def _publish_position_sync_status(
+    session: AccountSession,
+    *,
+    positions: list[dict[str, Any]],
+    started_at: datetime,
+    interval_sec: float,
+) -> None:
+    """Publish proof that one complete MT5 position snapshot was persisted."""
+    try:
+        completed_at = datetime.now(timezone.utc)
+        payload = {
+            "account_id": session.account_id,
+            "login": session.login,
+            "status": "ok",
+            "position_count": len(positions),
+            "tickets": sorted(
+                int(position["ticket"])
+                for position in positions
+                if position.get("ticket") is not None
+            ),
+            "started_at": started_at.isoformat(),
+            "last_success_at": completed_at.isoformat(),
+            "duration_ms": round(
+                max(0.0, (completed_at - started_at).total_seconds()) * 1000,
+                1,
+            ),
+            "interval_sec": float(interval_sec),
+        }
+        await get_redis_pool().set(
+            f"trader:position_sync:{session.account_id}",
+            orjson.dumps(payload),
+            ex=_POSITION_SYNC_STATUS_TTL_SEC,
+        )
+    except Exception:
+        logger.debug(
+            "position_sync_status_publish_failed",
             account_id=session.account_id,
             exc_info=True,
         )
@@ -303,13 +343,20 @@ async def _sync_deals(
 
 async def _sync_positions(
     session: AccountSession,
-    interval_sec: int = 10,
+    interval_sec: float = 1.0,
 ) -> None:
     """Periodically snapshot open positions."""
     while True:
         try:
+            started_at = datetime.now(timezone.utc)
             positions = await session.get_positions()
             await repo.sync_positions(session.account_id, positions)
+            await _publish_position_sync_status(
+                session,
+                positions=positions,
+                started_at=started_at,
+                interval_sec=interval_sec,
+            )
             logger.debug(
                 "positions_synced",
                 account_id=session.account_id,
@@ -408,13 +455,17 @@ async def _run_account(session: AccountSession) -> None:
                 )
                 return
 
+    settings = get_settings()
     tasks = [
         asyncio.create_task(
             _sync_deals(session),
             name=f"deals-{session.login}",
         ),
         asyncio.create_task(
-            _sync_positions(session),
+            _sync_positions(
+                session,
+                interval_sec=settings.trader_position_sync_interval_sec,
+            ),
             name=f"positions-{session.login}",
         ),
         asyncio.create_task(
