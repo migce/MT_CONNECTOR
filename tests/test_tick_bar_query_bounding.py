@@ -46,6 +46,12 @@ class _Factory:
     [
         (None, None, "ORDER BY t.time_msc DESC", "ORDER BY t.time_msc DESC"),
         (
+            None,
+            datetime(2026, 8, 2, tzinfo=UTC),
+            "ORDER BY t.time_msc DESC",
+            "ORDER BY t.time_msc DESC",
+        ),
+        (
             datetime(2026, 8, 1, tzinfo=UTC),
             datetime(2026, 8, 2, tzinfo=UTC),
             "ORDER BY t.time_msc ASC",
@@ -83,6 +89,29 @@ async def test_tick_bar_query_bounds_source_before_windowing(
     assert source_order in sql[source_start:numbered_start]
     assert number_order in sql[numbered_start:]
     assert "(t.bid + t.ask) / 2.0" in sql[source_start:numbered_start]
+
+
+@pytest.mark.asyncio
+async def test_tick_bar_to_only_cursor_keeps_latest_before_semantics() -> None:
+    session = _Session()
+    cursor = datetime(2026, 8, 2, tzinfo=UTC)
+    with patch.object(repository, "get_session_factory", return_value=_Factory(session)):
+        await repository.query_tick_bars(
+            symbol="EURUSD",
+            tick_count=500,
+            tf_label="T500",
+            dt_to=cursor,
+            limit=600,
+            max_source_rows=300_000,
+        )
+
+    assert session.params is not None
+    assert session.params["dt_to"] == cursor
+    assert session.params["source_limit"] == 300_000
+    sql = str(session.statement)
+    assert "t.time_msc <= :dt_to" in sql
+    assert "ORDER BY t.time_msc DESC" in sql
+    assert "SELECT * FROM bars ORDER BY time ASC" in sql
 
 
 @pytest.mark.asyncio

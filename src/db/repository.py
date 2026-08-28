@@ -608,7 +608,9 @@ async def query_tick_bars(
     tf_label : str
         Label written into the ``timeframe`` field (e.g. "T100").
     dt_from / dt_to : datetime, optional
-        Time range filter (applied **before** grouping).
+        Time range filter (applied **before** grouping).  ``dt_from`` starts an
+        explicit oldest-first range.  ``dt_to`` on its own is a latest-before
+        cursor and keeps the newest-first bounded source query.
     limit : int
         Maximum number of bars to return.
     price_field : str
@@ -652,8 +654,8 @@ async def query_tick_bars(
     where = " AND ".join(clauses)
     having = "" if include_incomplete else "HAVING COUNT(*) = :tick_count"
 
-    if dt_from or dt_to:
-        # Explicit range — oldest-first
+    if dt_from:
+        # An explicit lower boundary is a forward range — oldest-first.
         sql = text(f"""
             WITH source_ticks AS (
                 SELECT
@@ -694,7 +696,8 @@ async def query_tick_bars(
             LIMIT :limit
         """)
     else:
-        # No range — return the LATEST N bars in ascending order
+        # No lower boundary (with or without a ``to`` cursor) — return the
+        # LATEST N bars at or before the cursor in ascending display order.
         sql = text(f"""
             WITH source_ticks AS (
                 SELECT
