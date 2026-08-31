@@ -272,3 +272,79 @@ CREATE TABLE IF NOT EXISTS account_info (
 -- ============================================================
 ALTER TABLE trading_accounts
     ADD COLUMN IF NOT EXISTS description VARCHAR(255) NULL;
+
+-- ============================================================
+-- Symbol Management — Connector-owned catalogue and job queue
+-- ============================================================
+CREATE TABLE IF NOT EXISTS managed_symbols (
+    symbol TEXT PRIMARY KEY,
+    description TEXT NOT NULL DEFAULT '',
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    source TEXT NOT NULL DEFAULT 'connector',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS custom_timeframes (
+    code TEXT PRIMARY KEY,
+    unit TEXT NOT NULL CHECK (unit IN ('M','H','D','W','T')),
+    value INTEGER NOT NULL CHECK (value > 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS symbol_timeframe_bindings (
+    symbol TEXT NOT NULL REFERENCES managed_symbols(symbol) ON DELETE CASCADE,
+    timeframe TEXT NOT NULL REFERENCES custom_timeframes(code) ON DELETE CASCADE,
+    mode TEXT NOT NULL CHECK (mode IN ('virtual','materialized')),
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (symbol, timeframe)
+);
+
+CREATE TABLE IF NOT EXISTS connector_runtime_settings (
+    key TEXT PRIMARY KEY,
+    value JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO connector_runtime_settings(key, value)
+VALUES ('tick_retention_days', to_jsonb(90::integer))
+ON CONFLICT (key) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS backfill_jobs (
+    id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    target_type TEXT NOT NULL
+        CHECK (target_type IN ('candles','ticks','custom')),
+    timeframe TEXT,
+    source_type TEXT NOT NULL
+        CHECK (source_type IN ('candles','ticks','custom')),
+    source_timeframe TEXT,
+    mode TEXT NOT NULL CHECK (mode IN ('fill_missing','refresh')),
+    range_from TIMESTAMPTZ NOT NULL,
+    range_to TIMESTAMPTZ NOT NULL,
+    status TEXT NOT NULL
+        CHECK (status IN (
+            'queued','running','succeeded','partial','failed',
+            'cancelling','cancelled'
+        )),
+    progress NUMERIC(6,5) NOT NULL DEFAULT 0,
+    covered_to TIMESTAMPTZ,
+    rows_read BIGINT NOT NULL DEFAULT 0,
+    rows_written BIGINT NOT NULL DEFAULT 0,
+    error TEXT,
+    requested_by TEXT,
+    request_id TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_backfill_jobs_status_created
+    ON backfill_jobs(status, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_backfill_jobs_symbol_created
+    ON backfill_jobs(symbol, created_at DESC);

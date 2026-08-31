@@ -28,6 +28,7 @@ import os
 import signal
 import sys
 import time
+from datetime import UTC, datetime, timedelta
 
 import structlog
 
@@ -39,7 +40,7 @@ from src.metrics import PollerMetrics
 from src.mt5.backfill import Backfiller
 from src.mt5.collector import Collector
 from src.mt5.connection import MT5Connection, fetch_symbol_digits
-from src.redis_bus.backfill_manager import BackfillListener
+from src.redis_bus.backfill_manager import BackfillListener, BackfillRequester
 from src.redis_bus.pool import close_redis_pool, get_redis_pool
 from src.redis_bus.publisher import RedisPublisher
 
@@ -85,8 +86,8 @@ async def _active_symbols_refresh_loop(
 ) -> None:
     """Periodically refresh the active symbol set from Redis.
 
-    Merges ``symbol:active:*`` keys (set by API on each request) with
-    the baseline ``SYMBOLS`` from config.  New symbols are selected in
+    Merges short-lived ``symbol:active:*`` keys with the persistent Symbol
+    Management registry. New symbols are selected in
     MT5, their digits are fetched, and the collector starts polling them.
     """
     from src.active_symbols import get_active_symbols
@@ -95,7 +96,8 @@ async def _active_symbols_refresh_loop(
         try:
             await asyncio.sleep(interval_sec)
             api_symbols = await get_active_symbols()
-            baseline = set(settings.symbols)
+            from src.db.symbol_management import active_managed_symbol_names
+            baseline = set(await active_managed_symbol_names())
             merged = sorted(baseline | api_symbols)
 
             # Quick‐check: nothing changed?
@@ -117,6 +119,42 @@ async def _active_symbols_refresh_loop(
             break
         except Exception:
             logger.exception("active_symbols_refresh_error")
+            await asyncio.sleep(10)
+
+
+async def _materialized_timeframes_loop(interval_sec: int = 30) -> None:
+    """Incrementally refresh enabled custom timeframes from native bars."""
+    from src.config import parse_custom_timeframe
+    from src.db import symbol_management as sm
+
+    while True:
+        try:
+            await asyncio.sleep(interval_sec)
+            now = datetime.now(UTC)
+            for binding in await sm.materialized_bindings():
+                parsed = parse_custom_timeframe(binding["timeframe"])
+                # Rebuild a short overlap so the currently forming aggregate
+                # and the previously closed aggregate both converge as their
+                # source M1/H1 bars are updated.
+                source_timeframe = (
+                    "H1"
+                    if parsed.seconds >= 3600 and parsed.seconds % 3600 == 0
+                    else "M1"
+                )
+                lookback = max(parsed.seconds * 3, 3600)
+                await sm.materialize_timeframe(
+                    symbol=binding["symbol"],
+                    timeframe=binding["timeframe"],
+                    bucket_seconds=parsed.seconds,
+                    source_timeframe=source_timeframe,
+                    dt_from=now - timedelta(seconds=lookback),
+                    dt_to=now,
+                    refresh=True,
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception("materialized_timeframes_refresh_error")
             await asyncio.sleep(10)
 
 
@@ -633,6 +671,11 @@ async def main(dashboard: bool = False) -> None:
     except Exception:
         logger.warning("timescaledb_init_skipped_will_retry", exc_info=True)
 
+    from src.db.symbol_management import ensure_schema as ensure_symbol_management_schema
+    from src.db.symbol_management import recover_interrupted_jobs
+    await ensure_symbol_management_schema(settings.symbols)
+    await recover_interrupted_jobs()
+
     # --- Restore today's baseline counters from DB ---
     try:
         from src.db import repository as repo
@@ -684,8 +727,10 @@ async def main(dashboard: bool = False) -> None:
     # --- MT5 ---
     connection = MT5Connection(settings)
     await connection.connect()
-    await connection.select_symbols(settings.symbols)
-    await fetch_symbol_digits(settings.symbols)
+    from src.db.symbol_management import active_managed_symbol_names
+    initial_symbols = await active_managed_symbol_names()
+    await connection.select_symbols(initial_symbols)
+    await fetch_symbol_digits(initial_symbols)
 
     # Publish full MT5 symbol catalogue to Redis for the API process
     from src.mt5.connection import publish_mt5_symbols
@@ -693,6 +738,7 @@ async def main(dashboard: bool = False) -> None:
 
     # --- Backfill ---
     backfiller = Backfiller(connection, settings)
+    backfiller.update_symbols(initial_symbols)
 
     # --- On-demand backfill listener (API → Poller via Redis) ---
     # Start BEFORE initial backfill so API requests are served during startup
@@ -703,10 +749,18 @@ async def main(dashboard: bool = False) -> None:
         name="backfill_listener",
     )
 
+    from src.db.symbol_management import queued_jobs
+    recovery_requester = BackfillRequester(settings)
+    await recovery_requester.connect()
+    for recovered_job in await queued_jobs():
+        await recovery_requester.enqueue_job(recovered_job)
+    await recovery_requester.close()
+
     await backfiller.run_initial_backfill()
 
     # --- Collector ---
     collector = Collector(connection, publisher, settings)
+    collector.update_symbols(initial_symbols)
     await collector.start()
 
     # --- Background tasks ---
@@ -726,6 +780,10 @@ async def main(dashboard: bool = False) -> None:
         ),
         name="active_symbols_refresh",
     )
+    materialized_timeframes_task = asyncio.create_task(
+        _materialized_timeframes_loop(),
+        name="materialized_timeframes",
+    )
 
     logger.info(
         "poller_running",
@@ -738,6 +796,7 @@ async def main(dashboard: bool = False) -> None:
         "gap_scan": gap_scan_task,
         "backfill_listener": backfill_listener_task,
         "active_symbols_refresh": active_symbols_task,
+        "materialized_timeframes": materialized_timeframes_task,
         # collector tasks are internal but we reference them by name
     }
     # Register collector sub-tasks
@@ -825,11 +884,14 @@ async def main(dashboard: bool = False) -> None:
     uptime_summary_task.cancel()
     heartbeat_task.cancel()
     gap_scan_task.cancel()
+    active_symbols_task.cancel()
+    materialized_timeframes_task.cancel()
     backfill_listener_task.cancel()
     cancel_tasks = [
         kb_task, monitor_task, health_checker_task, stats_flusher_task,
         uptime_flusher_task, uptime_summary_task,
-        heartbeat_task, gap_scan_task, backfill_listener_task,
+        heartbeat_task, gap_scan_task, active_symbols_task,
+        materialized_timeframes_task, backfill_listener_task,
     ]
     if dashboard_task:
         cancel_tasks.insert(0, dashboard_task)

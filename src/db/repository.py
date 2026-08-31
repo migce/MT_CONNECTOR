@@ -86,6 +86,14 @@ _UPSERT_CANDLES_SQL = text("""
         spread      = EXCLUDED.spread
 """)
 
+_INSERT_CANDLES_SQL = text("""
+    INSERT INTO candles (time, symbol, timeframe, open, high, low, close,
+                         tick_volume, real_volume, spread)
+    VALUES (:time, :symbol, :timeframe, :open, :high, :low, :close,
+            :tick_volume, :real_volume, :spread)
+    ON CONFLICT (symbol, timeframe, time) DO NOTHING
+""")
+
 
 @_db_retry
 async def upsert_candles(rows: list[dict[str, Any]]) -> int:
@@ -99,6 +107,36 @@ async def upsert_candles(rows: list[dict[str, Any]]) -> int:
             affected = result.rowcount  # type: ignore[union-attr]
     logger.debug("candles_upserted", count=affected, total=len(rows))
     return affected
+
+
+@_db_retry
+async def insert_candles(rows: list[dict[str, Any]]) -> int:
+    """Insert only absent candles, preserving canonical stored rows."""
+    if not rows:
+        return 0
+    factory = get_session_factory()
+    async with factory() as session, session.begin():
+        result = await session.execute(_INSERT_CANDLES_SQL, rows)
+        return int(result.rowcount or 0)  # type: ignore[union-attr]
+
+
+_UPSERT_TICKS_SQL = text("""
+    INSERT INTO ticks (time_msc, symbol, bid, ask, last, volume, flags)
+    VALUES (:time_msc, :symbol, :bid, :ask, :last, :volume, :flags)
+    ON CONFLICT (symbol, time_msc) DO UPDATE SET
+        bid=EXCLUDED.bid, ask=EXCLUDED.ask, last=EXCLUDED.last,
+        volume=EXCLUDED.volume, flags=EXCLUDED.flags
+""")
+
+
+@_db_retry
+async def upsert_ticks(rows: list[dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    factory = get_session_factory()
+    async with factory() as session, session.begin():
+        result = await session.execute(_UPSERT_TICKS_SQL, rows)
+        return int(result.rowcount or 0)  # type: ignore[union-attr]
 
 
 @_db_retry

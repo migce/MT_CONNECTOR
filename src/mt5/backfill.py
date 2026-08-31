@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import structlog
 
@@ -77,6 +77,14 @@ class Backfiller:
         affected = 0
         for offset in range(0, len(rows), batch_rows):
             affected += await repo.upsert_candles(rows[offset : offset + batch_rows])
+            await asyncio.sleep(0)
+        return affected
+
+    async def _persist_missing_candle_batches(self, rows: list[dict[str, Any]]) -> int:
+        batch_rows = self._settings.backfill_candle_batch_rows
+        affected = 0
+        for offset in range(0, len(rows), batch_rows):
+            affected += await repo.insert_candles(rows[offset : offset + batch_rows])
             await asyncio.sleep(0)
         return affected
 
@@ -299,6 +307,8 @@ class Backfiller:
         dt_to: datetime,
         *,
         repair_from_ticks: bool = False,
+        preserve_existing: bool = False,
+        progress_callback: Callable[[datetime, int], Awaitable[None]] | None = None,
     ) -> int:
         """
         Download candles for an explicit range, **ignoring sync_state**.
@@ -328,9 +338,14 @@ class Backfiller:
             if bars is None or len(bars) == 0:
                 break
             rows = bars_to_dicts(bars, symbol, tf.value)
-            await self._persist_candle_batches(rows)
-            total += len(rows)
+            affected = (
+                await self._persist_missing_candle_batches(rows)
+                if preserve_existing else await self._persist_candle_batches(rows)
+            )
+            total += affected
             cursor = rows[-1]["time"] + timedelta(seconds=tf.seconds)
+            if progress_callback is not None:
+                await progress_callback(min(cursor, dt_to), total)
             if len(bars) < _MAX_BARS_PER_CALL:
                 break
 
@@ -370,6 +385,9 @@ class Backfiller:
         symbol: str,
         dt_from: datetime,
         dt_to: datetime,
+        *,
+        refresh_existing: bool = False,
+        progress_callback: Callable[[datetime, int], Awaitable[None]] | None = None,
     ) -> int:
         """
         Download ticks for an explicit range, **ignoring sync_state**.
@@ -392,10 +410,15 @@ class Backfiller:
             if ticks is None or len(ticks) == 0:
                 break
             rows = ticks_to_dicts(ticks, symbol)
-            inserted = await repo.insert_ticks(rows)
+            inserted = (
+                await repo.upsert_ticks(rows)
+                if refresh_existing else await repo.insert_ticks(rows)
+            )
             total += inserted
             last_msc = int(ticks[-1]["time_msc"])
             cursor = datetime.fromtimestamp(last_msc / 1000.0, tz=timezone.utc) + timedelta(milliseconds=1)
+            if progress_callback is not None:
+                await progress_callback(min(cursor, dt_to), total)
             if len(ticks) < _MAX_TICKS_PER_CALL:
                 break
 

@@ -20,6 +20,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 
+from src.api.digits import load_symbol_digits
 from src.api.middleware.request_metrics import RequestMetricsMiddleware
 from src.api.routes import (
     accounts,
@@ -32,6 +33,7 @@ from src.api.routes import (
     spread,
     stats,
     supervisor,
+    symbol_management,
     symbols,
     ticks,
     trading,
@@ -41,7 +43,6 @@ from src.config import get_settings
 from src.db.engine import dispose_engine, get_engine
 from src.db.init_timescale import init_timescaledb
 from src.logging_config import setup_logging
-from src.api.digits import load_symbol_digits
 from src.redis_bus.backfill_manager import BackfillRequester
 from src.redis_bus.pool import close_redis_pool
 
@@ -146,6 +147,10 @@ async def _lifespan(app: FastAPI):
         await init_timescaledb()
     except Exception:
         logger.warning("timescaledb_init_skipped", exc_info=True)
+
+    from src.db.symbol_management import ensure_schema as ensure_symbol_management_schema
+
+    await ensure_symbol_management_schema(settings.symbols)
 
     # Load symbol digits cache from Redis (written by poller)
     await load_symbol_digits()
@@ -1101,6 +1106,7 @@ def create_app() -> FastAPI:
     app.include_router(poller.router)
     app.include_router(supervisor.router)
     app.include_router(backfill.router)
+    app.include_router(symbol_management.router)
 
     # ---- WebSocket routes ----
     app.include_router(streams.router)
