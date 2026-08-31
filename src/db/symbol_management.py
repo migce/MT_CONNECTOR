@@ -323,25 +323,28 @@ async def recover_interrupted_jobs() -> int:
 
 
 async def coverage_tree() -> list[dict[str, Any]]:
+    """Return navigation watermarks without scanning the full history.
+
+    Exact counts, first timestamps, and storage size remain in
+    ``coverage_detail`` and are calculated only for the selected branch.
+    """
     factory = get_session_factory()
     async with factory() as session:
         result = await session.execute(text("""
             WITH symbols AS (
                 SELECT symbol FROM managed_symbols
-                UNION SELECT DISTINCT symbol FROM candles
-                UNION SELECT DISTINCT symbol FROM ticks
-            ), candle_bounds AS (
-                SELECT symbol, timeframe, MIN(time) first_at, MAX(time) last_at
-                FROM candles GROUP BY symbol, timeframe
-            ), tick_bounds AS (
-                SELECT symbol, MIN(time_msc) first_at, MAX(time_msc) last_at
-                FROM ticks GROUP BY symbol
+                UNION SELECT DISTINCT symbol FROM sync_state
+            ), watermarks AS (
+                SELECT symbol, data_type, last_synced_at
+                FROM sync_state
             )
             SELECT s.symbol, COALESCE(m.active, FALSE) active, COALESCE(m.description, '') description,
                 COALESCE((SELECT json_agg(json_build_object(
-                    'timeframe', c.timeframe, 'first_at', c.first_at, 'last_at', c.last_at
-                ) ORDER BY c.timeframe) FROM candle_bounds c WHERE c.symbol=s.symbol), '[]'::json) timeframes,
-                (SELECT row_to_json(t) FROM tick_bounds t WHERE t.symbol=s.symbol) ticks
+                    'timeframe', w.data_type, 'first_at', NULL, 'last_at', w.last_synced_at
+                ) ORDER BY w.data_type) FROM watermarks w
+                    WHERE w.symbol=s.symbol AND w.data_type <> 'tick'), '[]'::json) timeframes,
+                (SELECT json_build_object('first_at', NULL, 'last_at', w.last_synced_at)
+                    FROM watermarks w WHERE w.symbol=s.symbol AND w.data_type='tick') ticks
             FROM symbols s LEFT JOIN managed_symbols m USING(symbol)
             ORDER BY s.symbol
         """))
