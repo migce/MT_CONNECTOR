@@ -54,9 +54,15 @@ INFLIGHT_PREFIX = "backfill:inflight:"
 INFLIGHT_TTL = 120  # seconds
 
 
-def _inflight_key(symbol: str, data_type: str, timeframe: str | None) -> str:
+def _inflight_key(
+    symbol: str,
+    data_type: str,
+    timeframe: str | None,
+    repair_from_ticks: bool = False,
+) -> str:
     tf_part = timeframe or "tick"
-    return f"{INFLIGHT_PREFIX}{symbol}:{data_type}:{tf_part}"
+    repair_part = ":tick-repair" if repair_from_ticks else ""
+    return f"{INFLIGHT_PREFIX}{symbol}:{data_type}:{tf_part}{repair_part}"
 
 
 # -----------------------------------------------------------------------
@@ -75,6 +81,7 @@ def make_request(
     dt_from: datetime,
     dt_to: datetime,
     timeframe: str | None = None,
+    repair_from_ticks: bool = False,
 ) -> dict[str, Any]:
     """Create a backfill request payload."""
     return {
@@ -84,6 +91,7 @@ def make_request(
         "timeframe": timeframe,
         "from": dt_from.isoformat(),
         "to": dt_to.isoformat(),
+        "repair_from_ticks": repair_from_ticks,
     }
 
 
@@ -119,6 +127,7 @@ class BackfillRequester:
         dt_to: datetime,
         timeframe: str | None = None,
         timeout: float = 60.0,
+        repair_from_ticks: bool = False,
     ) -> dict[str, Any] | None:
         """
         Send a backfill request and wait up to *timeout* seconds for the
@@ -131,7 +140,12 @@ class BackfillRequester:
             logger.warning("backfill_requester_not_connected")
             return None
 
-        inflight = _inflight_key(symbol, data_type, timeframe)
+        inflight = _inflight_key(
+            symbol,
+            data_type,
+            timeframe,
+            repair_from_ticks,
+        )
 
         # Check if an identical request is already in-flight
         existing_id = await self._redis.get(inflight)
@@ -141,7 +155,14 @@ class BackfillRequester:
             logger.info("backfill_dedup_waiting", request_id=req_id)
             return await self._wait_for_response(req_id, timeout)
 
-        req = make_request(symbol, data_type, dt_from, dt_to, timeframe)
+        req = make_request(
+            symbol,
+            data_type,
+            dt_from,
+            dt_to,
+            timeframe,
+            repair_from_ticks,
+        )
         req_id = req["request_id"]
 
         # Mark in-flight (NX = only if not exists, race-safe)
@@ -269,6 +290,7 @@ class BackfillListener:
         symbol = req["symbol"]
         data_type = req["data_type"]
         timeframe = req.get("timeframe")
+        repair_from_ticks = bool(req.get("repair_from_ticks", False))
         dt_from = datetime.fromisoformat(req["from"])
         dt_to = datetime.fromisoformat(req["to"])
 
@@ -288,7 +310,11 @@ class BackfillListener:
         try:
             if data_type == "candles" and timeframe:
                 rows = await self._backfiller.on_demand_candles(
-                    symbol, timeframe, dt_from, dt_to,
+                    symbol,
+                    timeframe,
+                    dt_from,
+                    dt_to,
+                    repair_from_ticks=repair_from_ticks,
                 )
             elif data_type == "ticks":
                 rows = await self._backfiller.on_demand_ticks(
@@ -315,7 +341,12 @@ class BackfillListener:
         self._metrics.set_backfill_phase("")
 
         # Clear in-flight marker
-        inflight = _inflight_key(symbol, data_type, timeframe)
+        inflight = _inflight_key(
+            symbol,
+            data_type,
+            timeframe,
+            repair_from_ticks,
+        )
         await self._redis.delete(inflight)
 
         # Publish done

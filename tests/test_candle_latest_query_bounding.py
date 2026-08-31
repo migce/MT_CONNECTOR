@@ -12,6 +12,7 @@ from src.db import repository
 class _Rows:
     def __init__(self, rows: list[dict[str, object]]) -> None:
         self._rows = [SimpleNamespace(_mapping=row) for row in rows]
+        self.rowcount = len(rows)
 
     def all(self) -> list[SimpleNamespace]:
         return self._rows
@@ -28,6 +29,9 @@ class _Session:
     async def __aexit__(self, *_args: object) -> None:
         return None
 
+    def begin(self) -> _Session:
+        return self
+
     async def execute(self, statement: object, params: dict[str, object]) -> _Rows:
         self.calls.append((str(statement), dict(params)))
         return _Rows(self.responses.pop(0))
@@ -43,6 +47,37 @@ class _Factory:
 
 def _row(hour: int) -> dict[str, object]:
     return {"time": datetime(2026, 8, 22, hour, tzinfo=UTC)}
+
+
+@pytest.mark.asyncio
+async def test_tick_candle_repair_inserts_only_missing_closed_buckets() -> None:
+    session = _Session([[{"time": datetime(2026, 8, 31, 11, 7, tzinfo=UTC)}]])
+    start = datetime(2026, 8, 31, 11, 6, tzinfo=UTC)
+    end = datetime(2026, 8, 31, 11, 13, tzinfo=UTC)
+
+    with patch.object(repository, "get_session_factory", return_value=_Factory(session)):
+        inserted = await repository.insert_missing_candles_from_ticks(
+            "EURUSD",
+            "M1",
+            60,
+            start,
+            end,
+            100_000,
+        )
+
+    assert inserted == 1
+    sql, params = session.calls[0]
+    assert "FROM ticks t" in sql
+    assert "t.time_msc < :dt_to" in sql
+    assert "ON CONFLICT (symbol, timeframe, time) DO NOTHING" in sql
+    assert params == {
+        "symbol": "EURUSD",
+        "timeframe": "M1",
+        "bucket_seconds": 60,
+        "dt_from": start,
+        "dt_to": end,
+        "spread_scale": 100_000,
+    }
 
 
 @pytest.mark.asyncio

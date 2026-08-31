@@ -445,6 +445,7 @@ class TestBackfillEndpoint:
             req = BackfillRequest(
                 symbol="EURUSD",
                 timeframe="M1",
+                repair_from_ticks=True,
                 **{"from": datetime(2025, 7, 1, tzinfo=timezone.utc),
                    "to": datetime(2025, 8, 1, tzinfo=timezone.utc)},
             )
@@ -453,6 +454,7 @@ class TestBackfillEndpoint:
         assert result.status == "ok"
         assert result.rows == 5000
         assert result.symbol == "EURUSD"
+        assert mock_requester.request_and_wait.call_args.kwargs["repair_from_ticks"] is True
 
     async def test_backfill_timeout(self):
         from src.api.routes.backfill import trigger_backfill, BackfillRequest
@@ -511,6 +513,36 @@ class TestBackfillEndpoint:
             await trigger_backfill(req)
 
         assert exc_info.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_backfill_listener_propagates_tick_repair_mode() -> None:
+    from src.redis_bus.backfill_manager import BackfillListener
+
+    backfiller = MagicMock()
+    backfiller.on_demand_candles = AsyncMock(return_value=6)
+    listener = BackfillListener(backfiller, settings=MagicMock())
+    listener._redis = AsyncMock()
+    start = datetime(2026, 8, 31, 11, 6, tzinfo=timezone.utc)
+    end = datetime(2026, 8, 31, 11, 13, tzinfo=timezone.utc)
+
+    await listener._handle_request({
+        "request_id": "tail-repair",
+        "symbol": "EURUSD",
+        "data_type": "candles",
+        "timeframe": "M1",
+        "from": start.isoformat(),
+        "to": end.isoformat(),
+        "repair_from_ticks": True,
+    })
+
+    backfiller.on_demand_candles.assert_awaited_once_with(
+        "EURUSD",
+        "M1",
+        start,
+        end,
+        repair_from_ticks=True,
+    )
 
 
 # ---------------------------------------------------------------------------

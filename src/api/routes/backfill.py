@@ -44,6 +44,13 @@ class BackfillRequest(BaseModel):
         alias="to",
         description="End datetime (ISO 8601, inclusive)",
     )
+    repair_from_ticks: bool = Field(
+        default=False,
+        description=(
+            "Fill still-missing closed candles from actual source ticks after "
+            "the native MT5 candle request completes. Existing candles are preserved."
+        ),
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -127,6 +134,7 @@ async def trigger_backfill(body: BackfillRequest) -> BackfillResponse:
         dt_to=dt_to,
         timeframe=tf_str,
         timeout=120.0,
+        repair_from_ticks=body.repair_from_ticks,
     )
 
     if result is None:

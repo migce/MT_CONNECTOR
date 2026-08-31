@@ -102,6 +102,80 @@ async def upsert_candles(rows: list[dict[str, Any]]) -> int:
 
 
 @_db_retry
+async def insert_missing_candles_from_ticks(
+    symbol: str,
+    timeframe: str,
+    bucket_seconds: int,
+    dt_from: datetime,
+    dt_to: datetime,
+    spread_scale: int,
+) -> int:
+    """Build only absent closed candles from persisted source ticks.
+
+    This is a recovery path for a terminal candle-history tail that did not
+    advance after a Connector interruption. Existing native MT5 candles are
+    never overwritten; every OHLCV value is aggregated from actual bid ticks.
+    ``dt_to`` is exclusive so the currently forming bucket is not persisted.
+    """
+    if dt_from >= dt_to:
+        return 0
+
+    sql = text("""
+        INSERT INTO candles (
+            time, symbol, timeframe, open, high, low, close,
+            tick_volume, real_volume, spread
+        )
+        SELECT
+            time_bucket(
+                make_interval(secs => CAST(:bucket_seconds AS double precision)),
+                t.time_msc
+            )                                                     AS time,
+            :symbol                                               AS symbol,
+            :timeframe                                            AS timeframe,
+            (ARRAY_AGG(t.bid ORDER BY t.time_msc ASC))[1]         AS open,
+            MAX(t.bid)                                            AS high,
+            MIN(t.bid)                                            AS low,
+            (ARRAY_AGG(t.bid ORDER BY t.time_msc DESC))[1]        AS close,
+            COUNT(*)::bigint                                      AS tick_volume,
+            0::bigint                                             AS real_volume,
+            ROUND(AVG(GREATEST(t.ask - t.bid, 0)) * :spread_scale)::integer AS spread
+        FROM ticks t
+        WHERE t.symbol = :symbol
+          AND t.time_msc >= :dt_from
+          AND t.time_msc < :dt_to
+          AND t.bid > 0
+          AND t.ask >= t.bid
+        GROUP BY time_bucket(
+            make_interval(secs => CAST(:bucket_seconds AS double precision)),
+            t.time_msc
+        )
+        ON CONFLICT (symbol, timeframe, time) DO NOTHING
+        RETURNING time
+    """)
+    params = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "bucket_seconds": bucket_seconds,
+        "dt_from": dt_from,
+        "dt_to": dt_to,
+        "spread_scale": spread_scale,
+    }
+    factory = get_session_factory()
+    async with factory() as session, session.begin():
+        result = await session.execute(sql, params)
+        inserted = len(result.all())
+    logger.info(
+        "missing_candles_rebuilt_from_ticks",
+        symbol=symbol,
+        timeframe=timeframe,
+        inserted=inserted,
+        range_from=str(dt_from),
+        range_to=str(dt_to),
+    )
+    return inserted
+
+
+@_db_retry
 async def upsert_candles_and_sync(
     rows: list[dict[str, Any]],
     sync_rows: list[dict[str, Any]],

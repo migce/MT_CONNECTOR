@@ -23,7 +23,7 @@ import structlog
 from src.config import Settings, Timeframe, get_settings
 from src.db import repository as repo
 from src.metrics import PollerMetrics
-from src.mt5.connection import MT5Connection, run_in_mt5
+from src.mt5.connection import MT5Connection, get_digits, run_in_mt5
 from src.mt5.converters import bars_to_dicts, ticks_to_dicts
 
 logger = structlog.get_logger(__name__)
@@ -89,6 +89,27 @@ class Backfiller:
         return datetime.fromtimestamp(
             current_open - timeframe.seconds,
             tz=timezone.utc,
+        )
+
+    @staticmethod
+    def _closed_tick_repair_range(
+        dt_from: datetime,
+        dt_to: datetime,
+        timeframe: Timeframe,
+    ) -> tuple[datetime, datetime] | None:
+        """Align an arbitrary request to fully observable candle buckets."""
+        interval = timeframe.seconds
+        start_seconds = int(dt_from.astimezone(timezone.utc).timestamp())
+        end_seconds = int(dt_to.astimezone(timezone.utc).timestamp())
+        start_remainder = start_seconds % interval
+        if start_remainder:
+            start_seconds += interval - start_remainder
+        end_seconds -= end_seconds % interval
+        if start_seconds >= end_seconds:
+            return None
+        return (
+            datetime.fromtimestamp(start_seconds, tz=timezone.utc),
+            datetime.fromtimestamp(end_seconds, tz=timezone.utc),
         )
 
     async def refresh_settled_candles(
@@ -276,6 +297,8 @@ class Backfiller:
         timeframe: str,
         dt_from: datetime,
         dt_to: datetime,
+        *,
+        repair_from_ticks: bool = False,
     ) -> int:
         """
         Download candles for an explicit range, **ignoring sync_state**.
@@ -311,7 +334,35 @@ class Backfiller:
             if len(bars) < _MAX_BARS_PER_CALL:
                 break
 
-        logger.info("on_demand_candles_done", symbol=symbol, timeframe=timeframe, rows=total)
+        tick_repair_rows = 0
+        if repair_from_ticks:
+            repair_range = self._closed_tick_repair_range(dt_from, dt_to, tf)
+            if repair_range is not None:
+                repair_from, repair_to = repair_range
+                # Re-query actual MT5 ticks first. The database may itself have
+                # a hole if the whole Connector was offline during the range.
+                await self.on_demand_ticks(symbol, repair_from, repair_to)
+                tick_repair_rows = await repo.insert_missing_candles_from_ticks(
+                    symbol=symbol,
+                    timeframe=tf.value,
+                    bucket_seconds=tf.seconds,
+                    dt_from=repair_from,
+                    dt_to=repair_to,
+                    spread_scale=10 ** get_digits(symbol),
+                )
+                if tick_repair_rows:
+                    latest = await repo.get_latest_candle_time(symbol, tf.value)
+                    if latest is not None:
+                        await repo.update_sync_state(symbol, tf.value, latest)
+                total += tick_repair_rows
+
+        logger.info(
+            "on_demand_candles_done",
+            symbol=symbol,
+            timeframe=timeframe,
+            rows=total,
+            tick_repair_rows=tick_repair_rows,
+        )
         return total
 
     async def on_demand_ticks(

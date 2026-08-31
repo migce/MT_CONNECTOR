@@ -45,6 +45,67 @@ def test_last_completed_open_excludes_every_developing_timeframe() -> None:
     )
 
 
+def test_tick_repair_range_excludes_partial_edge_buckets() -> None:
+    result = Backfiller._closed_tick_repair_range(
+        datetime(2026, 8, 31, 11, 6, 15, tzinfo=timezone.utc),
+        datetime(2026, 8, 31, 11, 13, 8, tzinfo=timezone.utc),
+        Timeframe.M1,
+    )
+
+    assert result == (
+        datetime(2026, 8, 31, 11, 7, tzinfo=timezone.utc),
+        datetime(2026, 8, 31, 11, 13, tzinfo=timezone.utc),
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_tick_repair_rebuilds_only_absent_closed_candles() -> None:
+    backfiller = Backfiller(MagicMock(), settings=_settings())
+    backfiller.on_demand_ticks = AsyncMock(return_value=600)
+    start = datetime(2026, 8, 31, 11, 6, tzinfo=timezone.utc)
+    end = datetime(2026, 8, 31, 11, 13, tzinfo=timezone.utc)
+
+    with (
+        patch("src.mt5.backfill.run_in_mt5", new=AsyncMock(return_value=None)),
+        patch("src.mt5.backfill.get_digits", return_value=5),
+        patch(
+            "src.mt5.backfill.repo.insert_missing_candles_from_ticks",
+            new=AsyncMock(return_value=6),
+        ) as rebuild,
+        patch(
+            "src.mt5.backfill.repo.get_latest_candle_time",
+            new=AsyncMock(return_value=datetime(2026, 8, 31, 11, 12, tzinfo=timezone.utc)),
+        ),
+        patch(
+            "src.mt5.backfill.repo.update_sync_state",
+            new=AsyncMock(),
+        ) as update_sync,
+    ):
+        rows = await backfiller.on_demand_candles(
+            "EURUSD",
+            "M1",
+            start,
+            end,
+            repair_from_ticks=True,
+        )
+
+    assert rows == 6
+    backfiller.on_demand_ticks.assert_awaited_once_with("EURUSD", start, end)
+    rebuild.assert_awaited_once_with(
+        symbol="EURUSD",
+        timeframe="M1",
+        bucket_seconds=60,
+        dt_from=start,
+        dt_to=end,
+        spread_scale=100_000,
+    )
+    update_sync.assert_awaited_once_with(
+        "EURUSD",
+        "M1",
+        datetime(2026, 8, 31, 11, 12, tzinfo=timezone.utc),
+    )
+
+
 @pytest.mark.asyncio
 async def test_settlement_refresh_is_base_first_and_rereads_existing_range() -> None:
     backfiller = Backfiller(MagicMock(), settings=_settings())
