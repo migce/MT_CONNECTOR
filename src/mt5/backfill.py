@@ -104,6 +104,27 @@ class Backfiller:
             await asyncio.sleep(0)
         return affected
 
+    async def _persist_tick_batches(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        refresh_existing: bool = False,
+        progress_callback: Callable[[list[dict[str, Any]], int], Awaitable[None]] | None = None,
+    ) -> int:
+        """Commit broker ticks in bounded transactions with cancellation points."""
+        batch_rows = self._settings.backfill_tick_batch_rows
+        affected = 0
+        processed = 0
+        persist = repo.upsert_ticks if refresh_existing else repo.insert_ticks
+        for offset in range(0, len(rows), batch_rows):
+            batch = rows[offset : offset + batch_rows]
+            affected += await persist(batch)
+            processed += len(batch)
+            if progress_callback is not None:
+                await progress_callback(batch, processed)
+            await asyncio.sleep(0)
+        return affected
+
     async def _persist_missing_candle_batches(self, rows: list[dict[str, Any]]) -> int:
         batch_rows = self._settings.backfill_candle_batch_rows
         affected = 0
@@ -441,11 +462,29 @@ class Backfiller:
                     await scan_progress_callback(cursor, rows_read)
                 continue
             rows = ticks_to_dicts(ticks, symbol)
-            rows_read += len(rows)
-            inserted = (
-                await repo.upsert_ticks(rows)
-                if refresh_existing else await repo.insert_ticks(rows)
+            rows_before_chunk = rows_read
+
+            async def _batch_progress(
+                batch: list[dict[str, Any]],
+                processed: int,
+            ) -> None:
+                if progress_callback is None:
+                    return
+                batch_to = datetime.fromtimestamp(
+                    int(batch[-1]["time_msc"]) / 1000.0,
+                    tz=timezone.utc,
+                ) + timedelta(milliseconds=1)
+                await progress_callback(
+                    min(batch_to, dt_to),
+                    rows_before_chunk + processed,
+                )
+
+            inserted = await self._persist_tick_batches(
+                rows,
+                refresh_existing=refresh_existing,
+                progress_callback=_batch_progress,
             )
+            rows_read += len(rows)
             total += inserted
             last_msc = int(ticks[-1]["time_msc"])
             next_cursor = datetime.fromtimestamp(
@@ -454,8 +493,6 @@ class Backfiller:
             ) + timedelta(milliseconds=1)
             if next_cursor <= cursor:
                 next_cursor = cursor + timedelta(milliseconds=1)
-            if progress_callback is not None:
-                await progress_callback(min(next_cursor, dt_to), rows_read)
             cursor = (
                 chunk_to
                 if len(ticks) < _MAX_TICKS_PER_CALL
@@ -594,7 +631,7 @@ class Backfiller:
                 break
 
             rows = ticks_to_dicts(ticks, symbol)
-            inserted = await repo.insert_ticks(rows)
+            inserted = await self._persist_tick_batches(rows)
             total_inserted += inserted
 
             # Advance cursor past last tick

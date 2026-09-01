@@ -59,6 +59,36 @@ async def test_listener_recycles_poller_after_publishing_history_timeout() -> No
 
 
 @pytest.mark.asyncio
+async def test_tick_history_is_persisted_in_bounded_batches() -> None:
+    from src.mt5.backfill import Backfiller
+
+    settings = MagicMock()
+    settings.backfill_tick_batch_rows = 2
+    backfiller = Backfiller(MagicMock(), settings=settings)
+    rows = [
+        {"time_msc": index, "symbol": "USTEC"}
+        for index in range(5)
+    ]
+    progress: list[tuple[int, int]] = []
+
+    async def report(batch, processed):
+        progress.append((len(batch), processed))
+
+    with patch(
+        "src.mt5.backfill.repo.insert_ticks",
+        new=AsyncMock(side_effect=lambda batch: len(batch)),
+    ) as insert:
+        affected = await backfiller._persist_tick_batches(
+            rows,
+            progress_callback=report,
+        )
+
+    assert affected == 5
+    assert [len(call.args[0]) for call in insert.await_args_list] == [2, 2, 1]
+    assert progress == [(2, 2), (2, 4), (1, 5)]
+
+
+@pytest.mark.asyncio
 async def test_cannot_enable_symbol_outside_broker_catalog() -> None:
     with (
         patch(

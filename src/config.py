@@ -267,6 +267,12 @@ class Settings(BaseSettings):
         le=10_000,
         description="Maximum candle rows committed by one backfill transaction.",
     )
+    backfill_tick_batch_rows: int = Field(
+        default=5_000,
+        ge=500,
+        le=20_000,
+        description="Maximum tick rows committed by one backfill transaction.",
+    )
     backfill_job_timeout_sec: float = Field(
         default=1_800.0,
         ge=30.0,
