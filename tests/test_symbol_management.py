@@ -66,7 +66,10 @@ async def test_tick_history_is_persisted_in_bounded_batches() -> None:
     settings.backfill_tick_batch_rows = 2
     backfiller = Backfiller(MagicMock(), settings=settings)
     rows = [
-        {"time_msc": index, "symbol": "USTEC"}
+        {
+            "time_msc": datetime.fromtimestamp(index / 1000, tz=UTC),
+            "symbol": "USTEC",
+        }
         for index in range(5)
     ]
     progress: list[tuple[int, int]] = []

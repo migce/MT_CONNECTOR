@@ -470,9 +470,14 @@ class Backfiller:
             ) -> None:
                 if progress_callback is None:
                     return
-                batch_to = datetime.fromtimestamp(
-                    int(batch[-1]["time_msc"]) / 1000.0,
-                    tz=timezone.utc,
+                batch_time = batch[-1]["time_msc"]
+                batch_to = (
+                    batch_time
+                    if isinstance(batch_time, datetime)
+                    else datetime.fromtimestamp(
+                        int(batch_time) / 1000.0,
+                        tz=timezone.utc,
+                    )
                 ) + timedelta(milliseconds=1)
                 await progress_callback(
                     min(batch_to, dt_to),
