@@ -9,12 +9,15 @@ from fastapi import HTTPException
 
 from src.api.routes.symbol_management import (
     BackfillJobCreate,
+    CustomTimeframeCreate,
     CustomTimeframeBinding,
     ManagedSymbolUpdate,
     bind_timeframe,
     create_job,
+    create_timeframe,
     update_symbol,
 )
+from src.config import custom_timeframe_source
 from src.mt5.backfill import MT5HistoryCallTimeoutError, _await_history_call
 from src.redis_bus.backfill_manager import BackfillListener
 
@@ -130,6 +133,112 @@ async def test_tick_timeframes_cannot_be_materialized() -> None:
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail == "Tick bars are virtual-only"
+
+
+@pytest.mark.parametrize(
+    ("timeframe", "source"),
+    [
+        ("M7", "M1"),
+        ("M10", "M5"),
+        ("M30", "M15"),
+        ("H6", "H1"),
+        ("H8", "H4"),
+        ("D2", "D1"),
+        ("W1", "D1"),
+        ("T500", None),
+    ],
+)
+def test_custom_timeframe_uses_coarsest_exact_source(
+    timeframe: str,
+    source: str | None,
+) -> None:
+    assert custom_timeframe_source(timeframe) == source
+
+
+@pytest.mark.asyncio
+async def test_custom_timeframe_type_must_match_code() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        await create_timeframe(CustomTimeframeCreate(code="T500", kind="time"))
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Timeframe type does not match its code"
+
+
+@pytest.mark.asyncio
+async def test_custom_timeframe_response_exposes_source_contract() -> None:
+    with patch(
+        "src.api.routes.symbol_management.sm.upsert_custom_timeframe",
+        new=AsyncMock(return_value={"code": "M10", "unit": "M", "value": 10}),
+    ):
+        result = await create_timeframe(CustomTimeframeCreate(code="M10", kind="time"))
+
+    assert result["kind"] == "time"
+    assert result["source_type"] == "candles"
+    assert result["source_timeframe"] == "M5"
+
+
+@pytest.mark.asyncio
+async def test_custom_job_uses_same_exact_source_contract() -> None:
+    now = datetime.now(UTC)
+    requester = MagicMock()
+    requester.enqueue_job = AsyncMock(return_value="request-custom")
+
+    async def capture(values):
+        return ({"id": "job-custom", **values}, True)
+
+    with (
+        patch("src.api.routes.symbol_management.validate_symbol", return_value="EURUSD"),
+        patch(
+            "src.api.routes.symbol_management.get_all_mt5_symbols",
+            return_value={"EURUSD": "Euro vs US Dollar"},
+        ),
+        patch(
+            "src.api.routes.symbol_management.sm.create_job",
+            new=AsyncMock(side_effect=capture),
+        ),
+        patch("src.api.app.get_backfill_requester", return_value=requester),
+    ):
+        result = await create_job(BackfillJobCreate(
+            symbol="EURUSD",
+            target_type="custom",
+            timeframe="M10",
+            mode="fill_missing",
+            **{"from": now - timedelta(days=1), "to": now - timedelta(hours=1)},
+        ))
+
+    assert result["source_type"] == "candles"
+    assert result["source_timeframe"] == "M5"
+
+
+@pytest.mark.asyncio
+async def test_custom_candle_query_uses_same_exact_source_contract() -> None:
+    from src.api.routes.custom_candles import get_custom_candles
+
+    with (
+        patch("src.api.routes.custom_candles.validate_symbol", return_value="EURUSD"),
+        patch(
+            "src.api.routes.custom_candles.maybe_backfill_candles",
+            new=AsyncMock(return_value=[]),
+        ) as backfill,
+        patch(
+            "src.api.routes.custom_candles.repo.query_custom_tf_candles",
+            new=AsyncMock(return_value=[]),
+        ) as query,
+    ):
+        result = await get_custom_candles(
+            symbol="EURUSD",
+            timeframe="M10",
+            from_dt=None,
+            to_dt=None,
+            limit=100,
+            bars=None,
+            price="bid",
+            include_incomplete=False,
+        )
+
+    assert result.count == 0
+    assert backfill.await_args.kwargs["timeframe"] == "M5"
+    assert query.await_args.kwargs["source_tf"] == "M5"
 
 
 @pytest.mark.asyncio

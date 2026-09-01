@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from src.api.services.validation import validate_symbol
 from src.api.symbol_registry import get_all_mt5_symbols
-from src.config import Timeframe, parse_custom_timeframe
+from src.config import Timeframe, custom_timeframe_source, parse_custom_timeframe
 from src.db import symbol_management as sm
 
 router = APIRouter(prefix="/api/v1/symbol-management", tags=["symbol-management"])
@@ -22,6 +22,7 @@ class ManagedSymbolUpdate(BaseModel):
 
 class CustomTimeframeCreate(BaseModel):
     code: str = Field(min_length=2, max_length=16)
+    kind: Literal["time", "tick"] | None = None
 
 
 class CustomTimeframeBinding(BaseModel):
@@ -61,10 +62,20 @@ def _available_symbol(raw: str) -> tuple[str, str]:
     return normalized, catalog[normalized]
 
 
+def _timeframe_metadata(item: dict) -> dict:
+    parsed = parse_custom_timeframe(str(item["code"]))
+    return {
+        **item,
+        "kind": "tick" if parsed.is_tick_bar else "time",
+        "source_type": "ticks" if parsed.is_tick_bar else "candles",
+        "source_timeframe": custom_timeframe_source(parsed),
+    }
+
+
 @router.get("/tree")
 async def get_tree():
     rows = await sm.coverage_tree()
-    custom = await sm.list_custom_timeframes()
+    custom = [_timeframe_metadata(item) for item in await sm.list_custom_timeframes()]
     definitions = {item["code"]: item for item in custom}
     for row in rows:
         bindings = await sm.symbol_bindings(row["symbol"])
@@ -119,7 +130,7 @@ async def get_symbol_detail(
 
 @router.get("/timeframes")
 async def get_timeframes():
-    return await sm.list_custom_timeframes()
+    return [_timeframe_metadata(item) for item in await sm.list_custom_timeframes()]
 
 
 @router.post("/timeframes", status_code=201)
@@ -133,9 +144,12 @@ async def create_timeframe(body: CustomTimeframeCreate):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if parsed.is_tick_bar and parsed.tick_count < 2:
         raise HTTPException(status_code=400, detail="Tick bar size must be at least 2")
+    parsed_kind = "tick" if parsed.is_tick_bar else "time"
+    if body.kind is not None and body.kind != parsed_kind:
+        raise HTTPException(status_code=400, detail="Timeframe type does not match its code")
     unit = code[0]
     value = parsed.tick_count if parsed.is_tick_bar else int(code[1:])
-    return await sm.upsert_custom_timeframe(code, unit, value)
+    return _timeframe_metadata(await sm.upsert_custom_timeframe(code, unit, value))
 
 
 @router.put("/symbols/{symbol}/timeframes/{timeframe}")
@@ -189,11 +203,7 @@ async def create_job(body: BackfillJobCreate):
         source_type = "ticks" if parsed.is_tick_bar else "candles"
         source_timeframe = None
         if not parsed.is_tick_bar:
-            source_timeframe = (
-                "H1"
-                if parsed.seconds >= 3600 and parsed.seconds % 3600 == 0
-                else "M1"
-            )
+            source_timeframe = custom_timeframe_source(parsed)
     else:
         timeframe = None
         retention = await sm.get_retention_days()

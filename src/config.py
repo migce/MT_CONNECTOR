@@ -93,6 +93,14 @@ _UNIT_MULTIPLIER = {
 # Standard timeframes that we already store pre-built
 _STANDARD_SECONDS = {tf.seconds for tf in Timeframe}
 
+# Prefer the largest stored period that divides a custom bucket exactly.  This
+# keeps aggregation efficient without changing candle boundaries or inventing
+# data.  Tick bars deliberately do not participate: their only source is the
+# raw tick stream.
+_TIMEFRAME_SOURCE_CANDIDATES = tuple(
+    sorted(Timeframe, key=lambda timeframe: timeframe.seconds, reverse=True)
+)
+
 
 @dataclass(frozen=True)
 class CustomTimeframe:
@@ -142,6 +150,22 @@ def parse_custom_timeframe(raw: str) -> CustomTimeframe:
 
     seconds = _UNIT_MULTIPLIER[unit] * value
     return CustomTimeframe(raw=raw, is_tick_bar=False, seconds=seconds, tick_count=0)
+
+
+def custom_timeframe_source(raw: str | CustomTimeframe) -> str | None:
+    """Return the canonical stored source for a custom timeframe.
+
+    Time buckets use the coarsest standard candle period that divides the
+    requested interval exactly.  Tick bars always return ``None`` because they
+    are generated directly from raw ticks.
+    """
+    parsed = raw if isinstance(raw, CustomTimeframe) else parse_custom_timeframe(raw)
+    if parsed.is_tick_bar:
+        return None
+    for timeframe in _TIMEFRAME_SOURCE_CANDIDATES:
+        if parsed.seconds >= timeframe.seconds and parsed.seconds % timeframe.seconds == 0:
+            return timeframe.value
+    return Timeframe.M1.value
 
 
 def is_standard_timeframe(tf_str: str) -> bool:

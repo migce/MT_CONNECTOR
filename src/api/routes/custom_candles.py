@@ -4,8 +4,8 @@ REST endpoint: ``/api/v1/candles/custom/{symbol}``
 Serves **non-standard timeframe candles** built on-the-fly from stored data:
 
 * **Time-based** custom TFs (``M2``, ``M3``, ``M7``, ``H2``, ``H6``, ``H12``,
-  ``D2``, ``W1``, …) — aggregated from M1 candles via TimescaleDB
-  ``time_bucket``.
+  ``D2``, ``W1``, …) — aggregated from the coarsest exactly dividing stored
+  timeframe via TimescaleDB ``time_bucket``.
 * **Tick bars** (``T100``, ``T500``, ``T1000``, …) — each bar contains
   exactly *N* ticks, built on-the-fly from the raw ``ticks`` hypertable.
 
@@ -31,26 +31,13 @@ from src.api.services.backfill_helper import (
 from src.api.services.validation import validate_symbol
 from src.config import (
     Timeframe,
+    custom_timeframe_source,
     is_standard_timeframe,
     parse_custom_timeframe,
 )
 from src.db import repository as repo
 
 router = APIRouter(prefix="/api/v1", tags=["custom-candles"])
-
-
-def _choose_source_tf(bucket_seconds: int) -> str:
-    """
-    Pick the coarsest stored timeframe that still fits evenly into the
-    requested bucket for faster aggregation.
-
-    Rules:
-        bucket >= 3600 s *and* divisible by 3600  → source H1
-        otherwise                                 → source M1
-    """
-    if bucket_seconds >= 3600 and bucket_seconds % 3600 == 0:
-        return "H1"
-    return "M1"
 
 
 @router.get(
@@ -182,9 +169,11 @@ async def get_custom_candles(
             ),
         )
 
-    source_tf = _choose_source_tf(ctf.seconds)
+    source_tf = custom_timeframe_source(ctf)
+    if source_tf is None:  # Defensive: the tick branch returns above.
+        raise HTTPException(status_code=400, detail="Tick bars require raw tick history")
 
-    # Ensure source candles (M1 or H1) are available for the range
+    # Ensure the exact-divisor source candles are available for the range.
     await maybe_backfill_candles(
         symbol=symbol,
         timeframe=source_tf,
