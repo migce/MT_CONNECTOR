@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
+from collections.abc import Callable
 from typing import Any
 
 import orjson
@@ -269,11 +270,13 @@ class BackfillListener:
         self,
         backfiller: Any,  # src.mt5.backfill.Backfiller (avoid circular import)
         settings: Settings | None = None,
+        fatal_history_timeout: Callable[[], None] | None = None,
     ) -> None:
         self._backfiller = backfiller
         self._settings = settings or get_settings()
         self._redis: aioredis.Redis | None = None
         self._metrics = PollerMetrics()
+        self._fatal_history_timeout = fatal_history_timeout
 
     async def connect(self) -> None:
         self._redis = get_redis_pool(self._settings)
@@ -392,6 +395,7 @@ class BackfillListener:
                 rows_read=last_rows_read,
             )
 
+        fatal_history_timeout = False
         try:
             if data_type == "candles" and timeframe:
                 candle_options: dict[str, Any] = {
@@ -485,9 +489,12 @@ class BackfillListener:
                     finished_at=datetime.now(UTC),
                 )
         except Exception as exc:
+            from src.mt5.backfill import MT5HistoryCallTimeoutError
+
             logger.exception("backfill_on_demand_error", request_id=request_id)
             response["status"] = "error"
             response["error"] = str(exc)
+            fatal_history_timeout = isinstance(exc, MT5HistoryCallTimeoutError)
             self._metrics.record_error("backfill")
             if job_id:
                 from src.db import symbol_management as sm
@@ -527,3 +534,5 @@ class BackfillListener:
             status=response["status"],
             rows=response["rows"],
         )
+        if fatal_history_timeout and self._fatal_history_timeout is not None:
+            self._fatal_history_timeout()

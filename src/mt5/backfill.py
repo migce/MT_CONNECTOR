@@ -34,6 +34,29 @@ _MAX_TICKS_PER_CALL = 100_000
 _TICK_PROGRESS_CHUNK = timedelta(hours=4)
 
 
+class MT5HistoryCallTimeoutError(TimeoutError):
+    """The MT5 IPC call did not return and its worker must be recycled."""
+
+
+async def _await_history_call(awaitable: Awaitable[Any], timeout: float) -> Any:
+    """Bound a history IPC call without waiting for a stuck executor thread.
+
+    ``asyncio.wait_for`` waits for cancellation to finish.  A running
+    ``ThreadPoolExecutor`` call cannot be cancelled, so that pattern can leave
+    the poller frozen well past the requested timeout.  ``asyncio.wait`` lets
+    the listener persist an explicit failure before the supervisor recycles
+    the poller process and its MT5 executor.
+    """
+    task = asyncio.ensure_future(awaitable)
+    done, _pending = await asyncio.wait({task}, timeout=timeout)
+    if task not in done:
+        task.cancel()
+        raise MT5HistoryCallTimeoutError(
+            f"MT5 tick history chunk timed out after {timeout:g} seconds"
+        )
+    return task.result()
+
+
 def is_forex_market_open(dt: datetime) -> bool:
     """Return True if *dt* falls within forex market hours.
 
@@ -408,16 +431,10 @@ class Backfiller:
         cursor = dt_from
         while cursor < dt_to:
             chunk_to = min(cursor + _TICK_PROGRESS_CHUNK, dt_to)
-            try:
-                ticks = await asyncio.wait_for(
-                    run_in_mt5(self._copy_ticks_range, symbol, cursor, chunk_to),
-                    timeout=self._TICKS_IPC_TIMEOUT,
-                )
-            except TimeoutError as exc:
-                raise TimeoutError(
-                    f"MT5 tick history chunk timed out after "
-                    f"{self._TICKS_IPC_TIMEOUT} seconds"
-                ) from exc
+            ticks = await _await_history_call(
+                run_in_mt5(self._copy_ticks_range, symbol, cursor, chunk_to),
+                timeout=self._TICKS_IPC_TIMEOUT,
+            )
             if ticks is None or len(ticks) == 0:
                 cursor = chunk_to
                 if scan_progress_callback is not None:

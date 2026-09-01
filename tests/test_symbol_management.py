@@ -1,5 +1,6 @@
 """Focused contracts for Connector-owned Symbol Management."""
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,7 +15,47 @@ from src.api.routes.symbol_management import (
     create_job,
     update_symbol,
 )
+from src.mt5.backfill import MT5HistoryCallTimeoutError, _await_history_call
 from src.redis_bus.backfill_manager import BackfillListener
+
+
+@pytest.mark.asyncio
+async def test_history_timeout_returns_without_waiting_for_cancelled_worker() -> None:
+    blocked = asyncio.Future()
+
+    with pytest.raises(MT5HistoryCallTimeoutError):
+        await _await_history_call(blocked, timeout=0.01)
+
+    assert blocked.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_listener_recycles_poller_after_publishing_history_timeout() -> None:
+    backfiller = MagicMock()
+    backfiller.on_demand_ticks = AsyncMock(
+        side_effect=MT5HistoryCallTimeoutError("history IPC timeout")
+    )
+    recycle = MagicMock()
+    listener = BackfillListener(
+        backfiller,
+        settings=MagicMock(),
+        fatal_history_timeout=recycle,
+    )
+    listener._redis = MagicMock()
+    listener._redis.delete = AsyncMock()
+    listener._redis.publish = AsyncMock()
+    now = datetime.now(UTC)
+
+    await listener._handle_request({
+        "request_id": "request-timeout",
+        "symbol": "USTEC",
+        "data_type": "ticks",
+        "from": (now - timedelta(hours=1)).isoformat(),
+        "to": now.isoformat(),
+    })
+
+    listener._redis.publish.assert_awaited_once()
+    recycle.assert_called_once_with()
 
 
 @pytest.mark.asyncio

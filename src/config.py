@@ -267,6 +267,15 @@ class Settings(BaseSettings):
         le=10_000,
         description="Maximum candle rows committed by one backfill transaction.",
     )
+    backfill_job_timeout_sec: float = Field(
+        default=1_800.0,
+        ge=30.0,
+        le=3_600.0,
+        description=(
+            "Maximum wall time of one Poller-side on-demand backfill request. "
+            "Month-scale tick jobs report bounded progress while they run."
+        ),
+    )
     candle_settlement_refresh_hours: int = Field(
         default=24,
         ge=1,
