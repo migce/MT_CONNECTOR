@@ -31,6 +31,7 @@ logger = structlog.get_logger(__name__)
 # Maximum bars MT5 returns per single call
 _MAX_BARS_PER_CALL = 50_000
 _MAX_TICKS_PER_CALL = 100_000
+_TICK_PROGRESS_CHUNK = timedelta(hours=4)
 
 
 def is_forex_market_open(dt: datetime) -> bool:
@@ -388,6 +389,7 @@ class Backfiller:
         *,
         refresh_existing: bool = False,
         progress_callback: Callable[[datetime, int], Awaitable[None]] | None = None,
+        scan_progress_callback: Callable[[datetime, int], Awaitable[None]] | None = None,
     ) -> int:
         """
         Download ticks for an explicit range, **ignoring sync_state**.
@@ -402,27 +404,55 @@ class Backfiller:
         )
 
         total = 0
+        rows_read = 0
         cursor = dt_from
         while cursor < dt_to:
-            ticks = await run_in_mt5(
-                self._copy_ticks_range, symbol, cursor, dt_to,
-            )
+            chunk_to = min(cursor + _TICK_PROGRESS_CHUNK, dt_to)
+            try:
+                ticks = await asyncio.wait_for(
+                    run_in_mt5(self._copy_ticks_range, symbol, cursor, chunk_to),
+                    timeout=self._TICKS_IPC_TIMEOUT,
+                )
+            except TimeoutError as exc:
+                raise TimeoutError(
+                    f"MT5 tick history chunk timed out after "
+                    f"{self._TICKS_IPC_TIMEOUT} seconds"
+                ) from exc
             if ticks is None or len(ticks) == 0:
-                break
+                cursor = chunk_to
+                if scan_progress_callback is not None:
+                    await scan_progress_callback(cursor, rows_read)
+                continue
             rows = ticks_to_dicts(ticks, symbol)
+            rows_read += len(rows)
             inserted = (
                 await repo.upsert_ticks(rows)
                 if refresh_existing else await repo.insert_ticks(rows)
             )
             total += inserted
             last_msc = int(ticks[-1]["time_msc"])
-            cursor = datetime.fromtimestamp(last_msc / 1000.0, tz=timezone.utc) + timedelta(milliseconds=1)
+            next_cursor = datetime.fromtimestamp(
+                last_msc / 1000.0,
+                tz=timezone.utc,
+            ) + timedelta(milliseconds=1)
+            if next_cursor <= cursor:
+                next_cursor = cursor + timedelta(milliseconds=1)
             if progress_callback is not None:
-                await progress_callback(min(cursor, dt_to), total)
-            if len(ticks) < _MAX_TICKS_PER_CALL:
-                break
+                await progress_callback(min(next_cursor, dt_to), rows_read)
+            cursor = (
+                chunk_to
+                if len(ticks) < _MAX_TICKS_PER_CALL
+                else min(next_cursor, chunk_to)
+            )
+            if scan_progress_callback is not None:
+                await scan_progress_callback(cursor, rows_read)
 
-        logger.info("on_demand_ticks_done", symbol=symbol, rows=total)
+        logger.info(
+            "on_demand_ticks_done",
+            symbol=symbol,
+            rows_read=rows_read,
+            rows_written=total,
+        )
         return total
 
     # ------------------------------------------------------------------

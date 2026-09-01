@@ -61,7 +61,7 @@ async def insert_ticks(rows: list[dict[str, Any]]) -> int:
     async with factory() as session:
         async with session.begin():
             result = await session.execute(_INSERT_TICKS_SQL, rows)
-            inserted = result.rowcount  # type: ignore[union-attr]
+            inserted = max(int(result.rowcount or 0), 0)  # type: ignore[union-attr]
     logger.debug("ticks_inserted", count=inserted, total=len(rows))
     return inserted
 
@@ -104,7 +104,9 @@ async def upsert_candles(rows: list[dict[str, Any]]) -> int:
     async with factory() as session:
         async with session.begin():
             result = await session.execute(_UPSERT_CANDLES_SQL, rows)
-            affected = result.rowcount  # type: ignore[union-attr]
+            affected = int(result.rowcount or 0)  # type: ignore[union-attr]
+            if affected < 0:
+                affected = len(rows)
     logger.debug("candles_upserted", count=affected, total=len(rows))
     return affected
 
@@ -117,7 +119,7 @@ async def insert_candles(rows: list[dict[str, Any]]) -> int:
     factory = get_session_factory()
     async with factory() as session, session.begin():
         result = await session.execute(_INSERT_CANDLES_SQL, rows)
-        return int(result.rowcount or 0)  # type: ignore[union-attr]
+        return max(int(result.rowcount or 0), 0)  # type: ignore[union-attr]
 
 
 _UPSERT_TICKS_SQL = text("""
@@ -136,7 +138,8 @@ async def upsert_ticks(rows: list[dict[str, Any]]) -> int:
     factory = get_session_factory()
     async with factory() as session, session.begin():
         result = await session.execute(_UPSERT_TICKS_SQL, rows)
-        return int(result.rowcount or 0)  # type: ignore[union-attr]
+        affected = int(result.rowcount or 0)  # type: ignore[union-attr]
+        return len(rows) if affected < 0 else affected
 
 
 @_db_retry
@@ -232,7 +235,9 @@ async def upsert_candles_and_sync(
         affected = 0
         if rows:
             result = await session.execute(_UPSERT_CANDLES_SQL, rows)
-            affected = result.rowcount  # type: ignore[union-attr]
+            affected = int(result.rowcount or 0)  # type: ignore[union-attr]
+            if affected < 0:
+                affected = len(rows)
         if sync_rows:
             await session.execute(_UPSERT_SYNC_SQL, sync_rows)
 

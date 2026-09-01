@@ -156,6 +156,64 @@ async def test_listener_marks_short_broker_result_partial() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tick_job_reports_scanned_progress_and_downloaded_rows() -> None:
+    now = datetime.now(UTC)
+    start = now - timedelta(days=1)
+    midpoint = start + timedelta(hours=12)
+    backfiller = MagicMock()
+
+    async def ticking_result(
+        *_args,
+        progress_callback=None,
+        scan_progress_callback=None,
+        **_kwargs,
+    ):
+        assert progress_callback is not None
+        assert scan_progress_callback is not None
+        await progress_callback(midpoint, 250)
+        await scan_progress_callback(midpoint, 250)
+        await progress_callback(now, 500)
+        await scan_progress_callback(now, 500)
+        return 480
+
+    backfiller.on_demand_ticks = AsyncMock(side_effect=ticking_result)
+    listener = BackfillListener(backfiller, settings=MagicMock())
+    listener._redis = MagicMock()
+    listener._redis.delete = AsyncMock()
+    listener._redis.publish = AsyncMock()
+    updates: list[dict] = []
+
+    async def update_job(_job_id, **changes):
+        updates.append(changes)
+        return changes
+
+    with (
+        patch(
+            "src.db.symbol_management.get_job",
+            new=AsyncMock(return_value={"id": "job-ticks", "status": "queued"}),
+        ),
+        patch("src.db.symbol_management.update_job", new=update_job),
+    ):
+        await listener._handle_request({
+            "request_id": "request-ticks",
+            "job_id": "job-ticks",
+            "symbol": "USTEC",
+            "data_type": "ticks",
+            "target_type": "ticks",
+            "mode": "fill_missing",
+            "from": start.isoformat(),
+            "to": now.isoformat(),
+        })
+
+    progress_updates = [item for item in updates if "progress" in item and item.get("status") is None]
+    assert any(float(item["progress"]) >= 0.49 for item in progress_updates)
+    terminal = updates[-1]
+    assert terminal["status"] == "succeeded"
+    assert terminal["rows_read"] == 500
+    assert terminal["rows_written"] == 480
+
+
+@pytest.mark.asyncio
 async def test_listener_ignores_duplicate_nonqueued_job() -> None:
     listener = BackfillListener(MagicMock(), settings=MagicMock())
     listener._redis = MagicMock()

@@ -351,10 +351,13 @@ class BackfillListener:
         response: dict[str, Any] = {"request_id": request_id, "status": "ok", "rows": 0, "error": None}
         _t0 = _time.monotonic()
         last_covered_to: datetime | None = None
+        last_processed_to: datetime | None = None
+        last_rows_read = 0
 
         async def _job_progress(covered_to: datetime, rows: int) -> None:
-            nonlocal last_covered_to
+            nonlocal last_covered_to, last_rows_read
             last_covered_to = covered_to
+            last_rows_read = max(last_rows_read, rows)
             if not job_id:
                 return
             from src.db import symbol_management as sm
@@ -368,7 +371,25 @@ class BackfillListener:
                 progress=progress,
                 covered_to=covered_to,
                 rows_read=rows,
-                rows_written=rows,
+            )
+
+        async def _job_scan_progress(processed_to: datetime, rows: int) -> None:
+            nonlocal last_processed_to, last_rows_read
+            last_processed_to = processed_to
+            last_rows_read = max(last_rows_read, rows)
+            if not job_id:
+                return
+            from src.db import symbol_management as sm
+            current = await sm.get_job(job_id)
+            if current and current["status"] == "cancelling":
+                raise BackfillJobCancelledError()
+            duration = max((dt_to - dt_from).total_seconds(), 1.0)
+            progress = min(max((processed_to - dt_from).total_seconds() / duration, 0.0), 0.99)
+            await sm.update_job(
+                job_id,
+                progress=progress,
+                covered_to=last_covered_to,
+                rows_read=last_rows_read,
             )
 
         try:
@@ -390,6 +411,7 @@ class BackfillListener:
                     tick_options.update({
                         "refresh_existing": req.get("mode") == "refresh",
                         "progress_callback": _job_progress,
+                        "scan_progress_callback": _job_scan_progress,
                     })
                 rows = await self._backfiller.on_demand_ticks(
                     symbol, dt_from, dt_to, **tick_options
@@ -444,8 +466,8 @@ class BackfillListener:
                         )
                     ),
                     covered_to=last_covered_to,
-                    rows_read=response["rows"],
-                    rows_written=response["rows"],
+                    rows_read=max(last_rows_read, response["rows"], 0),
+                    rows_written=max(response["rows"], 0),
                     error=None if covered else (
                         "Broker returned only part of the requested range"
                         if last_covered_to else

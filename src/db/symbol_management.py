@@ -95,6 +95,12 @@ async def ensure_schema(configured_symbols: list[str] | None = None) -> None:
     async with get_engine().begin() as conn:
         for statement in statements:
             await conn.execute(text(statement))
+        await conn.execute(text("""
+            UPDATE backfill_jobs
+            SET rows_read=GREATEST(rows_read, 0),
+                rows_written=GREATEST(rows_written, 0)
+            WHERE rows_read < 0 OR rows_written < 0
+        """))
         await conn.execute(
             text("""
                 INSERT INTO connector_runtime_settings(key, value)
