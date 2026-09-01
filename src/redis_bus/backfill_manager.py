@@ -324,6 +324,9 @@ class BackfillListener:
         repair_from_ticks = bool(req.get("repair_from_ticks", False))
         dt_from = datetime.fromisoformat(req["from"])
         dt_to = datetime.fromisoformat(req["to"])
+        work_from = dt_from
+        recovered_covered_to: datetime | None = None
+        recovered_rows_read = 0
 
         if job_id:
             from src.db import symbol_management as sm
@@ -333,11 +336,19 @@ class BackfillListener:
             # The single listener accepts only a job that is still queued.
             if job is None or job["status"] != "queued":
                 return
+            recovered_covered_to = job.get("covered_to")
+            recovered_rows_read = max(int(job.get("rows_read") or 0), 0)
+            if (
+                req.get("mode") != "refresh"
+                and recovered_covered_to is not None
+                and dt_from <= recovered_covered_to < dt_to
+            ):
+                work_from = recovered_covered_to + timedelta(milliseconds=1)
             await sm.update_job(
                 job_id,
                 status="running",
                 started_at=datetime.now(UTC),
-                progress=0,
+                progress=max(float(job.get("progress") or 0), 0),
                 error=None,
             )
 
@@ -353,9 +364,9 @@ class BackfillListener:
 
         response: dict[str, Any] = {"request_id": request_id, "status": "ok", "rows": 0, "error": None}
         _t0 = _time.monotonic()
-        last_covered_to: datetime | None = None
+        last_covered_to: datetime | None = recovered_covered_to
         last_processed_to: datetime | None = None
-        last_rows_read = 0
+        last_rows_read = recovered_rows_read
 
         async def _job_progress(covered_to: datetime, rows: int) -> None:
             nonlocal last_covered_to, last_rows_read
@@ -407,7 +418,7 @@ class BackfillListener:
                         "progress_callback": _job_progress,
                     })
                 rows = await self._backfiller.on_demand_candles(
-                    symbol, timeframe, dt_from, dt_to, **candle_options
+                    symbol, timeframe, work_from, dt_to, **candle_options
                 )
             elif data_type == "ticks":
                 tick_options: dict[str, Any] = {}
@@ -418,7 +429,7 @@ class BackfillListener:
                         "scan_progress_callback": _job_scan_progress,
                     })
                 rows = await self._backfiller.on_demand_ticks(
-                    symbol, dt_from, dt_to, **tick_options
+                    symbol, work_from, dt_to, **tick_options
                 )
             else:
                 raise ValueError(f"Unknown data_type={data_type}")

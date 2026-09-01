@@ -303,3 +303,44 @@ async def test_listener_ignores_duplicate_nonqueued_job() -> None:
         })
 
     listener._backfiller.on_demand_candles.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recovered_fill_job_resumes_after_last_committed_tick() -> None:
+    now = datetime.now(UTC)
+    start = now - timedelta(days=2)
+    covered = now - timedelta(days=1)
+    backfiller = MagicMock()
+    backfiller.on_demand_ticks = AsyncMock(return_value=0)
+    listener = BackfillListener(backfiller, settings=MagicMock())
+    listener._redis = MagicMock()
+    listener._redis.delete = AsyncMock()
+    listener._redis.publish = AsyncMock()
+
+    with (
+        patch(
+            "src.db.symbol_management.get_job",
+            new=AsyncMock(return_value={
+                "id": "job-resume",
+                "status": "queued",
+                "covered_to": covered,
+                "rows_read": 12_000,
+                "progress": 0.5,
+            }),
+        ),
+        patch("src.db.symbol_management.update_job", new=AsyncMock()),
+    ):
+        await listener._handle_request({
+            "request_id": "request-resume",
+            "job_id": "job-resume",
+            "symbol": "USTEC",
+            "data_type": "ticks",
+            "target_type": "ticks",
+            "mode": "fill_missing",
+            "from": start.isoformat(),
+            "to": now.isoformat(),
+        })
+
+    assert backfiller.on_demand_ticks.await_args.args[1] == (
+        covered + timedelta(milliseconds=1)
+    )
