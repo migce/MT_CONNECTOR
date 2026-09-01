@@ -156,9 +156,9 @@ SELECT add_retention_policy('service_uptime_log', INTERVAL '90 days', if_not_exi
 
 -- ============================================================
 -- 6. RETENTION POLICY — auto-drop old raw ticks (configurable)
---    Default: 90 days.  Candles are kept indefinitely.
+--    Default: 365 days.  Candles are kept indefinitely.
 -- ============================================================
-SELECT add_retention_policy('ticks', INTERVAL '90 days', if_not_exists => TRUE);
+SELECT add_retention_policy('ticks', INTERVAL '365 days', if_not_exists => TRUE);
 
 -- ============================================================
 -- 7. TRADING_ACCOUNTS — MT5 accounts managed via admin API
@@ -310,7 +310,7 @@ CREATE TABLE IF NOT EXISTS connector_runtime_settings (
 );
 
 INSERT INTO connector_runtime_settings(key, value)
-VALUES ('tick_retention_days', to_jsonb(90::integer))
+VALUES ('tick_retention_days', to_jsonb(365::integer))
 ON CONFLICT (key) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS backfill_jobs (

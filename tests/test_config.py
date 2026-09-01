@@ -10,10 +10,15 @@ import pytest
 
 from src.config import (
     CustomTimeframe,
+    Settings,
     Timeframe,
     is_standard_timeframe,
     parse_custom_timeframe,
 )
+
+
+def test_raw_tick_retention_defaults_to_one_year():
+    assert Settings.model_fields["tick_retention_days"].default == 365
 
 
 class TestTimeframe:

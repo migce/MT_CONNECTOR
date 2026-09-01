@@ -333,7 +333,7 @@ class Settings(BaseSettings):
     )
 
     # --- Data Retention ---
-    tick_retention_days: int = Field(default=90)
+    tick_retention_days: int = Field(default=365)
     tick_compression_days: int = Field(default=7)
     candle_compression_days: int = Field(default=30)
 

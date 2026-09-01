@@ -970,4 +970,4 @@ Key variables:
 | `TIMEFRAMES` | `M1,M5,M15,H1,H4,D1` | Timeframes to store |
 | `BACKFILL_DAYS` | `30` | Days of history to load on startup |
 | `TICK_POLL_INTERVAL_MS` | `50` | Tick polling frequency |
-| `TICK_RETENTION_DAYS` | `90` | Auto-delete ticks older than N days |
+| `TICK_RETENTION_DAYS` | `365` | Auto-delete ticks older than N days |

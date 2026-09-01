@@ -104,7 +104,7 @@ async def ensure_schema(configured_symbols: list[str] | None = None) -> None:
         await conn.execute(
             text("""
                 INSERT INTO connector_runtime_settings(key, value)
-                VALUES ('tick_retention_days', to_jsonb(90::integer))
+                VALUES ('tick_retention_days', to_jsonb(365::integer))
                 ON CONFLICT (key) DO NOTHING
             """)
         )
@@ -407,7 +407,7 @@ async def get_retention_days() -> int:
             "WHERE key='tick_retention_days'"
         ))
         value = result.scalar_one_or_none()
-        return int(value if value is not None else 90)
+        return int(value if value is not None else 365)
 
 
 async def apply_retention_days(days: int) -> int:
