@@ -315,7 +315,6 @@ async def recover_interrupted_jobs() -> int:
         result = await session.execute(text("""
             UPDATE backfill_jobs
             SET status=CASE WHEN status='cancelling' THEN 'cancelled' ELSE 'queued' END,
-                progress=CASE WHEN status='cancelling' THEN progress ELSE 0 END,
                 started_at=CASE WHEN status='cancelling' THEN started_at ELSE NULL END,
                 finished_at=CASE WHEN status='cancelling' THEN NOW() ELSE NULL END,
                 error=CASE

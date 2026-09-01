@@ -344,3 +344,25 @@ async def test_recovered_fill_job_resumes_after_last_committed_tick() -> None:
     assert backfiller.on_demand_ticks.await_args.args[1] == (
         covered + timedelta(milliseconds=1)
     )
+
+
+@pytest.mark.asyncio
+async def test_recovery_preserves_committed_progress() -> None:
+    from src.db import symbol_management as sm
+
+    session = AsyncMock()
+    session.execute = AsyncMock(return_value=MagicMock(rowcount=1))
+    transaction = AsyncMock()
+    transaction.__aenter__ = AsyncMock(return_value=None)
+    transaction.__aexit__ = AsyncMock(return_value=None)
+    session.begin = MagicMock(return_value=transaction)
+    session_context = AsyncMock()
+    session_context.__aenter__ = AsyncMock(return_value=session)
+    session_context.__aexit__ = AsyncMock(return_value=None)
+    factory = MagicMock(return_value=session_context)
+
+    with patch("src.db.symbol_management.get_session_factory", return_value=factory):
+        assert await sm.recover_interrupted_jobs() == 1
+
+    statement = str(session.execute.await_args.args[0])
+    assert "progress=" not in statement.replace(" ", "")
