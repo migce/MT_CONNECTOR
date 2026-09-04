@@ -521,7 +521,7 @@ async def test_backfill_listener_propagates_tick_repair_mode() -> None:
 
     backfiller = MagicMock()
     backfiller.on_demand_candles = AsyncMock(return_value=6)
-    listener = BackfillListener(backfiller, settings=MagicMock())
+    listener = BackfillListener(backfiller, settings=MagicMock(backfill_job_timeout_sec=30))
     listener._redis = AsyncMock()
     start = datetime(2026, 8, 31, 11, 6, tzinfo=timezone.utc)
     end = datetime(2026, 8, 31, 11, 13, tzinfo=timezone.utc)

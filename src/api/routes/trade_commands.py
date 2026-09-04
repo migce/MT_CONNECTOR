@@ -40,16 +40,25 @@ def _same_command(existing: dict, body: TradeCommandCreate) -> bool:
         abs(float(existing.get("max_volume") or 0) - body.max_volume) < 1e-9,
         existing.get("reason") == body.reason.strip(),
         existing.get("correlation_id") == body.correlation_id,
+        body.expires_at is None or (
+            existing.get("expires_at") is not None
+            and _utc(existing["expires_at"]) == _utc(body.expires_at)
+        ),
     ))
 
 
 @router.get("/trade-commands/readiness")
 async def trade_readiness(_caller: InternalCaller):
     settings = get_settings()
+    try:
+        blocked = await repo.execution_blocked_accounts()
+    except Exception as exc:
+        raise HTTPException(503, "Command journal readiness unavailable.") from exc
     return {
         "execution_enabled": settings.trading_execution_enabled,
         "account_allowlist": sorted(settings.trading_account_allowlist),
         "mode": "close_only",
+        "requires_broker_reconciliation": blocked,
     }
 
 
@@ -75,7 +84,21 @@ async def create_trade_command(
             detail=f"Account {body.account_id} is not enabled for trading execution.",
         )
 
-    account = await repo.get_account(body.account_id)
+    # A retry acknowledges existing durable authority; it must neither extend
+    # its TTL nor reject its result merely because the original TTL elapsed.
+    existing = await repo.get_trade_command(body.command_id)
+    if existing is not None:
+        if not _same_command(existing, body):
+            raise HTTPException(status.HTTP_409_CONFLICT, "command_id payload conflict.")
+        response.status_code = status.HTTP_200_OK
+        return existing
+
+    if body.account_id in await repo.execution_blocked_accounts():
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Account has an unresolved broker outcome; reconciliation is required before new commands.",
+        )
+    account = await repo.get_execution_account(body.account_id)
     if account is None or not account.get("enabled"):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Enabled trading account was not found.")
 

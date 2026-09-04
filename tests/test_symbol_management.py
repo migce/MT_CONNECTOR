@@ -1,6 +1,5 @@
 """Focused contracts for Connector-owned Symbol Management."""
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,8 +8,8 @@ from fastapi import HTTPException
 
 from src.api.routes.symbol_management import (
     BackfillJobCreate,
-    CustomTimeframeCreate,
     CustomTimeframeBinding,
+    CustomTimeframeCreate,
     ManagedSymbolUpdate,
     bind_timeframe,
     create_job,
@@ -18,80 +17,11 @@ from src.api.routes.symbol_management import (
     update_symbol,
 )
 from src.config import custom_timeframe_source
-from src.mt5.backfill import MT5HistoryCallTimeoutError, _await_history_call
 from src.redis_bus.backfill_manager import BackfillListener
 
-
-@pytest.mark.asyncio
-async def test_history_timeout_returns_without_waiting_for_cancelled_worker() -> None:
-    blocked = asyncio.Future()
-
-    with pytest.raises(MT5HistoryCallTimeoutError):
-        await _await_history_call(blocked, timeout=0.01)
-
-    assert blocked.cancelled()
-
-
-@pytest.mark.asyncio
-async def test_listener_recycles_poller_after_publishing_history_timeout() -> None:
-    backfiller = MagicMock()
-    backfiller.on_demand_ticks = AsyncMock(
-        side_effect=MT5HistoryCallTimeoutError("history IPC timeout")
-    )
-    recycle = MagicMock()
-    listener = BackfillListener(
-        backfiller,
-        settings=MagicMock(),
-        fatal_history_timeout=recycle,
-    )
-    listener._redis = MagicMock()
-    listener._redis.delete = AsyncMock()
-    listener._redis.publish = AsyncMock()
-    now = datetime.now(UTC)
-
-    await listener._handle_request({
-        "request_id": "request-timeout",
-        "symbol": "USTEC",
-        "data_type": "ticks",
-        "from": (now - timedelta(hours=1)).isoformat(),
-        "to": now.isoformat(),
-    })
-
-    listener._redis.publish.assert_awaited_once()
-    recycle.assert_called_once_with()
-
-
-@pytest.mark.asyncio
-async def test_tick_history_is_persisted_in_bounded_batches() -> None:
-    from src.mt5.backfill import Backfiller
-
-    settings = MagicMock()
-    settings.backfill_tick_batch_rows = 2
-    backfiller = Backfiller(MagicMock(), settings=settings)
-    rows = [
-        {
-            "time_msc": datetime.fromtimestamp(index / 1000, tz=UTC),
-            "symbol": "USTEC",
-        }
-        for index in range(5)
-    ]
-    progress: list[tuple[int, int]] = []
-
-    async def report(batch, processed):
-        progress.append((len(batch), processed))
-
-    with patch(
-        "src.mt5.backfill.repo.insert_ticks",
-        new=AsyncMock(side_effect=lambda batch: len(batch)),
-    ) as insert:
-        affected = await backfiller._persist_tick_batches(
-            rows,
-            progress_callback=report,
-        )
-
-    assert affected == 5
-    assert [len(call.args[0]) for call in insert.await_args_list] == [2, 2, 1]
-    assert progress == [(2, 2), (2, 4), (1, 5)]
+# Native timeout/cancellation contracts now live in test_native_budget.py and
+# test_actor_generation.py. SQL batching/count contracts run against PostgreSQL
+# in test_reliability_command_db.py, not the retired self-recycling prototype.
 
 
 @pytest.mark.asyncio
@@ -299,8 +229,8 @@ async def test_listener_marks_short_broker_result_partial() -> None:
         return 120
 
     backfiller.on_demand_candles = AsyncMock(side_effect=short_result)
-    listener = BackfillListener(backfiller, settings=MagicMock())
-    listener._redis = MagicMock()
+    listener = BackfillListener(backfiller, settings=MagicMock(backfill_job_timeout_sec=30))
+    listener._redis = AsyncMock()
     listener._redis.delete = AsyncMock()
     listener._redis.publish = AsyncMock()
     updates: list[dict] = []
@@ -310,10 +240,8 @@ async def test_listener_marks_short_broker_result_partial() -> None:
         return changes
 
     with (
-        patch(
-            "src.db.symbol_management.get_job",
-            new=AsyncMock(return_value={"id": "job-1", "status": "queued"}),
-        ),
+        patch("src.db.symbol_management.claim_queued_job", new=AsyncMock(return_value={"id": "job-1", "status": "running"})),
+        patch("src.db.symbol_management.get_job", new=AsyncMock(return_value={"id": "job-1", "status": "running"})),
         patch(
             "src.db.symbol_management.update_job",
             new=update_job,
@@ -360,8 +288,8 @@ async def test_tick_job_reports_scanned_progress_and_downloaded_rows() -> None:
         return 480
 
     backfiller.on_demand_ticks = AsyncMock(side_effect=ticking_result)
-    listener = BackfillListener(backfiller, settings=MagicMock())
-    listener._redis = MagicMock()
+    listener = BackfillListener(backfiller, settings=MagicMock(backfill_job_timeout_sec=30))
+    listener._redis = AsyncMock()
     listener._redis.delete = AsyncMock()
     listener._redis.publish = AsyncMock()
     updates: list[dict] = []
@@ -371,10 +299,8 @@ async def test_tick_job_reports_scanned_progress_and_downloaded_rows() -> None:
         return changes
 
     with (
-        patch(
-            "src.db.symbol_management.get_job",
-            new=AsyncMock(return_value={"id": "job-ticks", "status": "queued"}),
-        ),
+        patch("src.db.symbol_management.claim_queued_job", new=AsyncMock(return_value={"id": "job-ticks", "status": "running"})),
+        patch("src.db.symbol_management.get_job", new=AsyncMock(return_value={"id": "job-ticks", "status": "running"})),
         patch("src.db.symbol_management.update_job", new=update_job),
     ):
         await listener._handle_request({
@@ -398,11 +324,11 @@ async def test_tick_job_reports_scanned_progress_and_downloaded_rows() -> None:
 
 @pytest.mark.asyncio
 async def test_listener_ignores_duplicate_nonqueued_job() -> None:
-    listener = BackfillListener(MagicMock(), settings=MagicMock())
-    listener._redis = MagicMock()
+    listener = BackfillListener(MagicMock(), settings=MagicMock(backfill_job_timeout_sec=30))
+    listener._redis = AsyncMock()
     with patch(
-        "src.db.symbol_management.get_job",
-        new=AsyncMock(return_value={"id": "job-1", "status": "running"}),
+        "src.db.symbol_management.claim_queued_job",
+        new=AsyncMock(return_value=None),
     ):
         await listener._handle_request({
             "request_id": "request-duplicate",
@@ -418,20 +344,20 @@ async def test_listener_ignores_duplicate_nonqueued_job() -> None:
 
 
 @pytest.mark.asyncio
-async def test_recovered_fill_job_resumes_after_last_committed_tick() -> None:
+async def test_recovered_fill_job_replays_idempotently_without_assuming_cursor_inclusivity() -> None:
     now = datetime.now(UTC)
     start = now - timedelta(days=2)
     covered = now - timedelta(days=1)
     backfiller = MagicMock()
     backfiller.on_demand_ticks = AsyncMock(return_value=0)
-    listener = BackfillListener(backfiller, settings=MagicMock())
-    listener._redis = MagicMock()
+    listener = BackfillListener(backfiller, settings=MagicMock(backfill_job_timeout_sec=30))
+    listener._redis = AsyncMock()
     listener._redis.delete = AsyncMock()
     listener._redis.publish = AsyncMock()
 
     with (
         patch(
-            "src.db.symbol_management.get_job",
+            "src.db.symbol_management.claim_queued_job",
             new=AsyncMock(return_value={
                 "id": "job-resume",
                 "status": "queued",
@@ -453,9 +379,9 @@ async def test_recovered_fill_job_resumes_after_last_committed_tick() -> None:
             "to": now.isoformat(),
         })
 
-    assert backfiller.on_demand_ticks.await_args.args[1] == (
-        covered + timedelta(milliseconds=1)
-    )
+    # The legacy coverage watermark does not prove an inclusive cursor.
+    # Re-read the range; INSERT conflict handling provides idempotence.
+    assert backfiller.on_demand_ticks.await_args.args[1] == start
 
 
 @pytest.mark.asyncio

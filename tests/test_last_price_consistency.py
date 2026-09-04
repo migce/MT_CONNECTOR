@@ -13,10 +13,21 @@ Usage:
 
 from __future__ import annotations
 
+import os
+from urllib.parse import urlparse
+
 import httpx
 import pytest
 
-BASE = "http://localhost:9000/api/v1"
+if os.environ.get("CONNECTOR_ENABLE_LIVE_FIXTURE_TESTS") != "1":
+    pytest.skip("Opt-in isolated API fixture required; never target production", allow_module_level=True)
+
+_fixture_url = os.environ["CONNECTOR_TEST_API_URL"].rstrip("/")
+_fixture_parts = urlparse(_fixture_url)
+if (_fixture_parts.hostname not in {"127.0.0.1", "localhost"}
+        or _fixture_parts.port in {None, 9000} or _fixture_parts.scheme != "http"):
+    raise RuntimeError("Tests require a dedicated localhost API on a non-production port")
+BASE = _fixture_url + ""
 TIMEOUT = 30.0
 SYMBOL = "EURUSD"
 

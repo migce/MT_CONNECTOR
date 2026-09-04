@@ -21,7 +21,7 @@ from tenacity import (
     wait_exponential,
 )
 
-from src.db.engine import get_session_factory
+from src.db.engine import get_command_session_factory, get_session_factory
 
 logger = structlog.get_logger(__name__)
 
@@ -658,7 +658,7 @@ async def create_trade_command(
         "requested_at": requested_at,
         "expires_at": expires_at,
     }
-    factory = get_session_factory()
+    factory = get_command_session_factory()
     async with factory() as session:
         async with session.begin():
             inserted = (await session.execute(insert_sql, params)).mappings().first()
@@ -671,10 +671,28 @@ async def create_trade_command(
 @_db_retry
 async def get_trade_command(command_id: UUID | str) -> dict[str, Any] | None:
     sql = text(f"SELECT {_TRADE_COMMAND_COLUMNS} FROM trade_commands WHERE id = :id")
-    factory = get_session_factory()
+    factory = get_command_session_factory()
     async with factory() as session:
         row = (await session.execute(sql, {"id": _uuid(command_id)})).mappings().first()
     return dict(row) if row else None
+
+
+async def execution_blocked_accounts() -> list[int]:
+    factory = get_command_session_factory()
+    async with factory() as session:
+        result = await session.execute(text(
+            "SELECT DISTINCT account_id FROM trade_commands WHERE status='unknown' ORDER BY account_id"
+        ))
+        return list(result.scalars())
+
+
+async def get_execution_account(account_id: int) -> dict[str, Any] | None:
+    factory = get_command_session_factory()
+    async with factory() as session:
+        row = (await session.execute(text(
+            "SELECT id, enabled FROM trading_accounts WHERE id=:id"
+        ), {"id": account_id})).mappings().first()
+        return dict(row) if row else None
 
 
 @_db_retry
@@ -686,7 +704,7 @@ async def list_trade_attempts(command_id: UUID | str) -> list[dict[str, Any]]:
         WHERE command_id = :command_id
         ORDER BY attempt_no, id
     """)
-    factory = get_session_factory()
+    factory = get_command_session_factory()
     async with factory() as session:
         result = await session.execute(sql, {"command_id": _uuid(command_id)})
         return [dict(row) for row in result.mappings().all()]
@@ -696,14 +714,21 @@ async def list_trade_attempts(command_id: UUID | str) -> list[dict[str, Any]]:
 async def claim_next_trade_command(account_ids: Sequence[int]) -> dict[str, Any] | None:
     if not account_ids:
         return None
+    if len(account_ids) != 1:
+        raise ValueError("Claim commands through one account lane at a time")
     sql = text(f"""
         WITH candidate AS (
             SELECT id
-            FROM trade_commands
+            FROM trade_commands AS pending
             WHERE status IN ('accepted', 'retry_pending')
               AND next_attempt_at <= NOW()
-              AND (expires_at IS NULL OR expires_at > NOW())
+              AND expires_at > NOW()
               AND account_id = ANY(:account_ids)
+              AND NOT EXISTS (
+                  SELECT 1 FROM trade_commands AS unresolved
+                  WHERE unresolved.account_id = pending.account_id
+                    AND unresolved.status IN ('claimed', 'unknown')
+              )
             ORDER BY next_attempt_at, created_at
             FOR UPDATE SKIP LOCKED
             LIMIT 1
@@ -717,9 +742,17 @@ async def claim_next_trade_command(account_ids: Sequence[int]) -> dict[str, Any]
         WHERE command.id = candidate.id
         RETURNING {_QUALIFIED_TRADE_COMMAND_COLUMNS}
     """)
-    factory = get_session_factory()
+    factory = get_command_session_factory()
     async with factory() as session:
         async with session.begin():
+            # Acquire the account lock in a separate statement, so the next
+            # READ COMMITTED snapshot sees the previous owner's committed claim.
+            locked = await session.execute(
+                text("SELECT pg_try_advisory_xact_lock(771205, :account_id)"),
+                {"account_id": int(account_ids[0])},
+            )
+            if not locked.scalar_one():
+                return None
             row = (
                 await session.execute(sql, {"account_ids": list(account_ids)})
             ).mappings().first()
@@ -727,15 +760,16 @@ async def claim_next_trade_command(account_ids: Sequence[int]) -> dict[str, Any]
 
 
 @_db_retry
-async def requeue_stale_claimed_commands(timeout_sec: int) -> int:
+async def quarantine_stale_claimed_commands(timeout_sec: int) -> int:
+    """A stale claim may have reached the broker: never automatically replay it."""
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=timeout_sec)
     sql = text("""
         UPDATE trade_commands
-        SET status = 'retry_pending', claimed_at = NULL, next_attempt_at = NOW(),
-            last_error = 'dispatcher_recovered_stale_claim', updated_at = NOW()
+        SET status = 'unknown', completed_at = NOW(),
+            last_error = 'stale_claim_requires_broker_reconciliation', updated_at = NOW()
         WHERE status = 'claimed' AND claimed_at < :cutoff
     """)
-    factory = get_session_factory()
+    factory = get_command_session_factory()
     async with factory() as session:
         async with session.begin():
             result = await session.execute(sql, {"cutoff": cutoff})
@@ -749,9 +783,9 @@ async def expire_trade_commands() -> int:
         SET status = 'expired', completed_at = NOW(), updated_at = NOW(),
             last_error = COALESCE(last_error, 'command_expired')
         WHERE status IN ('accepted', 'retry_pending')
-          AND expires_at IS NOT NULL AND expires_at <= NOW()
+          AND (expires_at IS NULL OR expires_at <= NOW())
     """)
-    factory = get_session_factory()
+    factory = get_command_session_factory()
     async with factory() as session:
         async with session.begin():
             result = await session.execute(sql)
@@ -781,7 +815,7 @@ async def append_trade_attempt(
             :started_at, :finished_at
         )
     """)
-    factory = get_session_factory()
+    factory = get_command_session_factory()
     async with factory() as session:
         async with session.begin():
             await session.execute(sql, {
@@ -804,19 +838,21 @@ async def finish_trade_command(
     status: str,
     result: dict[str, Any],
     error: str | None = None,
+    expected_attempt: int,
 ) -> None:
     sql = text("""
         UPDATE trade_commands
         SET status = :status, result = CAST(:result AS JSONB), last_error = :error,
             submitted_at = COALESCE(submitted_at, NOW()), completed_at = NOW(),
             updated_at = NOW()
-        WHERE id = :id
+        WHERE id = :id AND status = 'claimed' AND attempt_count = :expected_attempt
     """)
-    factory = get_session_factory()
+    factory = get_command_session_factory()
     async with factory() as session:
         async with session.begin():
             await session.execute(sql, {
                 "id": _uuid(command_id),
+                "expected_attempt": expected_attempt,
                 "status": status,
                 "result": _json(result),
                 "error": error,
@@ -830,6 +866,7 @@ async def retry_trade_command(
     result: dict[str, Any],
     error: str,
     delay_sec: float,
+    expected_attempt: int,
 ) -> None:
     next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay_sec)
     sql = text("""
@@ -837,13 +874,14 @@ async def retry_trade_command(
         SET status = 'retry_pending', result = CAST(:result AS JSONB),
             last_error = :error, claimed_at = NULL, next_attempt_at = :next_attempt_at,
             updated_at = NOW()
-        WHERE id = :id
+        WHERE id = :id AND status = 'claimed' AND attempt_count = :expected_attempt
     """)
-    factory = get_session_factory()
+    factory = get_command_session_factory()
     async with factory() as session:
         async with session.begin():
             await session.execute(sql, {
                 "id": _uuid(command_id),
+                "expected_attempt": expected_attempt,
                 "result": _json(result),
                 "error": error,
                 "next_attempt_at": next_attempt_at,

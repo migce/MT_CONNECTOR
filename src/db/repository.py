@@ -13,7 +13,8 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
 import structlog
-from sqlalchemy import text
+from sqlalchemy import column, func, literal_column, select, table, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -56,13 +57,7 @@ _INSERT_TICKS_SQL = text("""
 @_db_retry
 async def insert_ticks(rows: list[dict[str, Any]]) -> int:
     """Batch-insert tick rows.  Returns number of rows actually inserted."""
-    if not rows:
-        return 0
-    factory = get_session_factory()
-    async with factory() as session:
-        async with session.begin():
-            result = await session.execute(_INSERT_TICKS_SQL, rows)
-            inserted = max(int(result.rowcount or 0), 0)  # type: ignore[union-attr]
+    inserted = await _write_tick_batches(rows, refresh=False)
     logger.debug("ticks_inserted", count=inserted, total=len(rows))
     return inserted
 
@@ -134,13 +129,35 @@ _UPSERT_TICKS_SQL = text("""
 
 @_db_retry
 async def upsert_ticks(rows: list[dict[str, Any]]) -> int:
+    return await _write_tick_batches(rows, refresh=True)
+
+
+async def _write_tick_batches(rows: list[dict[str, Any]], *, refresh: bool) -> int:
+    """Count committed rows explicitly; asyncpg executemany rowcount can be -1."""
     if not rows:
         return 0
+    columns = ("time_msc", "symbol", "bid", "ask", "last", "volume", "flags")
+    ticks = table("ticks", *(column(name) for name in columns))
+    affected = 0
     factory = get_session_factory()
     async with factory() as session, session.begin():
-        result = await session.execute(_UPSERT_TICKS_SQL, rows)
-        affected = int(result.rowcount or 0)  # type: ignore[union-attr]
-        return len(rows) if affected < 0 else affected
+        for offset in range(0, len(rows), 1000):
+            # PostgreSQL cannot update one conflict key twice in one statement.
+            # Keep the last source revision in refresh mode.
+            batch = {(row["symbol"], row["time_msc"]): {key: row[key] for key in columns}
+                     for row in rows[offset:offset + 1000]}
+            statement = pg_insert(ticks).values(list(batch.values()))
+            if refresh:
+                statement = statement.on_conflict_do_update(
+                    index_elements=["symbol", "time_msc"],
+                    set_={key: getattr(statement.excluded, key) for key in columns[2:]},
+                )
+            else:
+                statement = statement.on_conflict_do_nothing(index_elements=["symbol", "time_msc"])
+            changed = statement.returning(literal_column("1")).cte("affected")
+            result = await session.execute(select(func.count()).select_from(changed))
+            affected += result.scalar_one()
+    return affected
 
 
 @_db_retry

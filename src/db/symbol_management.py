@@ -265,13 +265,27 @@ async def list_jobs(limit: int = 50) -> list[dict[str, Any]]:
         return [dict(row._mapping) for row in result]
 
 
-async def queued_jobs() -> list[dict[str, Any]]:
+async def queued_jobs(limit: int | None = None) -> list[dict[str, Any]]:
     factory = get_session_factory()
     async with factory() as session:
         result = await session.execute(
-            text("SELECT * FROM backfill_jobs WHERE status='queued' ORDER BY created_at")
+            text("SELECT * FROM backfill_jobs WHERE status='queued' ORDER BY created_at LIMIT :limit"),
+            {"limit": limit},
         )
         return [dict(row._mapping) for row in result]
+
+
+async def claim_queued_job(job_id: str, request_id: str) -> dict[str, Any] | None:
+    """A duplicate Redis hint must not execute a durable job twice."""
+    factory = get_session_factory()
+    async with factory() as session, session.begin():
+        result = await session.execute(text("""
+            UPDATE backfill_jobs SET status='running', started_at=NOW(),
+                updated_at=NOW(), progress=0, error=NULL, request_id=:request_id
+            WHERE id=:id AND status='queued' RETURNING *
+        """), {"id": job_id, "request_id": request_id})
+        row = result.first()
+        return dict(row._mapping) if row else None
 
 
 async def update_job(job_id: str, **changes: Any) -> dict[str, Any] | None:

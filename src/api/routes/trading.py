@@ -18,6 +18,7 @@ from src.api.schemas import (
     PositionResponse,
 )
 from src.config import get_settings
+from src.api.services.position_snapshot import validate_position_snapshot
 from src.db import trading_repository as repo
 from src.redis_bus.pool import get_redis_pool
 
@@ -111,6 +112,17 @@ async def get_position_sync_status(account_id: int):
     if not isinstance(payload, dict):
         raise HTTPException(status_code=503, detail="Position snapshot status is invalid.")
     return payload
+
+
+@router.get("/positions/{account_id}/snapshot", summary="Atomic complete position snapshot")
+async def get_complete_position_snapshot(account_id: int):
+    # Data and freshness proof come from ONE Redis value, not a DB/Redis join
+    # that can mix different polling generations. No legacy fallback for trades.
+    raw = await get_redis_pool().get(f"trader:position_sync:{account_id}")
+    try:
+        return validate_position_snapshot(orjson.loads(raw), account_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=503, detail="Complete fresh position snapshot unavailable.")
 
 
 @router.get(

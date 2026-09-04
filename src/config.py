@@ -10,6 +10,7 @@ from __future__ import annotations
 import enum
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 from urllib.parse import quote_plus
 
@@ -336,6 +337,9 @@ class Settings(BaseSettings):
 
     # --- Poller ---
     tick_poll_interval_ms: int = Field(default=50)
+    tick_spool_enabled: bool = True
+    tick_spool_path: str = str(Path(__file__).resolve().parents[1] / ".runtime" / "ticks-spool.sqlite3")
+    tick_spool_max_bytes: int = Field(default=256 * 1024 * 1024, ge=1024 * 1024)
     candle_poll_interval_sec: int = Field(default=5)
     backfill_days: int = Field(default=30)
     backfill_candle_batch_rows: int = Field(

@@ -25,6 +25,7 @@ from src.db import repository as repo
 from src.metrics import PollerMetrics
 from src.mt5.connection import MT5Connection, get_digits, run_in_mt5
 from src.mt5.converters import bars_to_dicts
+from src.mt5.tick_spool import TickSpool
 from src.redis_bus.publisher import RedisPublisher
 
 logger = structlog.get_logger(__name__)
@@ -86,6 +87,7 @@ class Collector:
         self._tick_buffer: deque[dict[str, Any]] = deque(maxlen=_TICK_BUFFER_MAXLEN)
         self._last_flush_ts: float = 0.0
         self._consecutive_flush_errors: int = 0
+        self._spool: TickSpool | None = None
 
         # Background tasks
         self._tasks: list[asyncio.Task] = []
@@ -106,6 +108,13 @@ class Collector:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
+        if self._settings.tick_spool_enabled:
+            self._spool = await asyncio.to_thread(
+                TickSpool, self._settings.tick_spool_path,
+                max_bytes=self._settings.tick_spool_max_bytes,
+            )
+            pending = await asyncio.to_thread(self._spool.stats)
+            self._metrics.set_tick_buffer_depth(pending["pending"])
         self._running = True
         self._tasks = [
             asyncio.create_task(self._tick_loop(), name="tick_loop"),
@@ -138,8 +147,13 @@ class Collector:
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
-        # Final flush
-        await self._flush_tick_buffer()
+        # Unacknowledged records survive even if this final DB write fails.
+        try:
+            await self._flush_tick_buffer()
+        finally:
+            if self._spool is not None:
+                await asyncio.to_thread(self._spool.close)
+                self._spool = None
         logger.info("collector_stopped")
 
     # ------------------------------------------------------------------
@@ -159,8 +173,6 @@ class Collector:
                     if tick_msc <= self._last_tick_msc[symbol]:
                         continue  # duplicate
 
-                    self._last_tick_msc[symbol] = tick_msc
-
                     d = get_digits(symbol)
                     tick_dict = {
                         "time_msc": datetime.fromtimestamp(
@@ -173,11 +185,22 @@ class Collector:
                         "volume": int(tick.volume),
                         "flags": int(tick.flags),
                     }
-                    self._tick_buffer.append(tick_dict)
+                    if self._spool is not None:
+                        # Persist acceptance before advancing the seen cursor or
+                        # publishing to realtime consumers. Cancellation can at
+                        # worst replay this key; it cannot silently acknowledge it.
+                        buf_len = await asyncio.to_thread(self._spool.append, tick_dict)
+                    else:
+                        capacity = self._tick_buffer.maxlen or _TICK_BUFFER_MAXLEN
+                        if len(self._tick_buffer) + getattr(self, "_tick_inflight", 0) >= capacity:
+                            raise BufferError("Tick memory buffer full")
+                        self._tick_buffer.append(tick_dict)
+                        buf_len = len(self._tick_buffer)
+                    self._last_tick_msc[symbol] = tick_msc
+                    self._metrics.set_tick_buffer_depth(buf_len)
                     self._metrics.record_tick(symbol, tick_dict["bid"], tick_dict["ask"])
 
                     # Warn if buffer is approaching capacity
-                    buf_len = len(self._tick_buffer)
                     if buf_len >= _TICK_BUFFER_MAXLEN * _TICK_BUFFER_WARN_THRESHOLD:
                         logger.warning(
                             "tick_buffer_near_capacity",
@@ -190,7 +213,8 @@ class Collector:
                     # Publish to Redis (fire-and-forget)
                     await self._pub.publish_tick(symbol, tick_dict)
 
-                self._metrics.set_tick_buffer_depth(len(self._tick_buffer))
+                if self._spool is None:
+                    self._metrics.set_tick_buffer_depth(len(self._tick_buffer))
                 await asyncio.sleep(interval)
 
             except asyncio.CancelledError:
@@ -331,6 +355,20 @@ class Collector:
                 await asyncio.sleep(backoff)
 
     async def _flush_tick_buffer(self) -> None:
+        spool = getattr(self, "_spool", None)
+        if spool is not None:
+            last_id, batch = await asyncio.to_thread(spool.peek, _TICK_BUFFER_MAX)
+            if last_id is None:
+                return
+            started = time.monotonic()
+            inserted = await repo.insert_ticks(batch)
+            await self._persist_tick_watermarks(batch)
+            # ACK only after committed rows and watermarks. Failure or cancellation
+            # before this point retains the entire durable batch for idempotent retry.
+            pending = await asyncio.to_thread(spool.acknowledge, last_id)
+            self._metrics.set_tick_buffer_depth(pending)
+            self._metrics.record_ticks_flushed(inserted, (time.monotonic() - started) * 1000)
+            return
         if not self._tick_buffer:
             return
 
@@ -338,12 +376,15 @@ class Collector:
         batch: list[dict[str, Any]] = []
         while self._tick_buffer:
             batch.append(self._tick_buffer.popleft())
+        self._tick_inflight = len(batch)
 
         self._metrics.set_tick_buffer_depth(0)
         _t0 = time.monotonic()
         try:
             inserted = await repo.insert_ticks(batch)
-        except Exception:
+            await self._persist_tick_watermarks(batch)
+        except BaseException:
+            # Cancellation during a DB await is also an unacknowledged write.
             # Re-enqueue so ticks are not lost on transient DB errors.
             # New ticks may have arrived while we awaited insert_ticks;
             # save them, prepend the failed batch, then re-add new ticks.
@@ -353,13 +394,15 @@ class Collector:
 
             dropped = 0
             total_to_restore = len(batch) + len(new_arrivals)
-            if total_to_restore > self._TICK_BUFFER_MAXLEN:
-                # Drop oldest from batch to make room
-                dropped = total_to_restore - self._TICK_BUFFER_MAXLEN
-                batch = batch[dropped:]
+            capacity = self._tick_buffer.maxlen or _TICK_BUFFER_MAXLEN
+            if total_to_restore > capacity:
+                # Unexpected producer bypassed admission. Retain already
+                # accepted data and stop admitting new ticks; do not evict it.
+                self._tick_buffer = deque()
 
             self._tick_buffer.extend(batch)
             self._tick_buffer.extend(new_arrivals)
+            self._tick_inflight = 0
             self._metrics.set_tick_buffer_depth(len(self._tick_buffer))
             logger.exception(
                 "tick_flush_db_error",
@@ -368,10 +411,12 @@ class Collector:
                 new_arrivals=len(new_arrivals),
             )
             raise
+        self._tick_inflight = 0
         _elapsed_ms = (time.monotonic() - _t0) * 1000
         self._metrics.record_ticks_flushed(inserted, _elapsed_ms)
         logger.debug("ticks_flushed", count=inserted, buffered=len(batch))
 
+    async def _persist_tick_watermarks(self, batch: list[dict[str, Any]]) -> None:
         # Update sync state for tick data
         # Group by symbol, track the latest tick_msc per symbol
         latest_by_symbol: dict[str, datetime] = {}

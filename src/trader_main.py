@@ -214,6 +214,9 @@ async def _publish_position_sync_status(
             "account_id": session.account_id,
             "login": session.login,
             "status": "ok",
+            "complete": True,
+            "generation": session.generation,
+            "positions": positions,
             "position_count": len(positions),
             "tickets": sorted(
                 int(position["ticket"])
@@ -715,10 +718,45 @@ def _attempt_time(value: Any, fallback: datetime) -> datetime:
 
 
 async def _trade_command_dispatcher(sessions: dict[int, AccountSession]) -> None:
+    """Independent per-account lanes, with continuous conservative recovery."""
+    settings = get_settings()
+    workers: dict[int, asyncio.Task] = {}
+    try:
+        while True:
+            try:
+                quarantined = await repo.quarantine_stale_claimed_commands(
+                    settings.trader_command_claim_timeout_sec
+                )
+                if quarantined:
+                    logger.error("trade_commands_require_reconciliation", count=quarantined)
+                await repo.expire_trade_commands()
+                for account_id in set(sessions) & set(settings.trading_account_allowlist):
+                    if account_id not in workers or workers[account_id].done():
+                        workers[account_id] = asyncio.create_task(
+                            _account_trade_command_dispatcher(sessions, account_id),
+                            name=f"trade-dispatch-{account_id}",
+                        )
+                for account_id in list(workers):
+                    if account_id not in sessions or account_id not in settings.trading_account_allowlist:
+                        workers[account_id].cancel()
+                        await asyncio.gather(workers.pop(account_id), return_exceptions=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("trade_command_recovery_error")
+            await asyncio.sleep(1)
+    finally:
+        for task in workers.values():
+            task.cancel()
+        await asyncio.gather(*workers.values(), return_exceptions=True)
+
+
+async def _account_trade_command_dispatcher(
+    sessions: dict[int, AccountSession], account_id: int,
+) -> None:
     """Claim persisted close commands and execute them in account actors."""
     settings = get_settings()
     poll_sec = settings.trader_command_poll_interval_ms / 1000.0
-    await repo.requeue_stale_claimed_commands(settings.trader_command_claim_timeout_sec)
     logger.info("trade_command_dispatcher_started")
 
     while True:
@@ -727,14 +765,13 @@ async def _trade_command_dispatcher(sessions: dict[int, AccountSession]) -> None
                 await asyncio.sleep(max(1.0, poll_sec))
                 continue
 
-            await repo.expire_trade_commands()
             allowed_ids = settings.trading_account_allowlist
             ready_account_ids = [
                 account_id
                 for account_id, session in sessions.items()
                 if account_id in allowed_ids and session.connected
             ]
-            command = await repo.claim_next_trade_command(ready_account_ids)
+            command = await repo.claim_next_trade_command([account_id] if account_id in ready_account_ids else [])
             if command is None:
                 await asyncio.sleep(poll_sec)
                 continue
@@ -747,10 +784,19 @@ async def _trade_command_dispatcher(sessions: dict[int, AccountSession]) -> None
                     result={},
                     error="account_session_not_ready",
                     delay_sec=settings.trader_close_retry_delay_sec,
+                    expected_attempt=int(command["attempt_count"]),
                 )
                 continue
 
             started_at = datetime.now(timezone.utc)
+            # Persist an attempt boundary before entering the broker adapter.
+            # If this write fails, no native command is submitted.
+            await repo.append_trade_attempt(
+                command_id=command_id, attempt_no=int(command["attempt_count"]),
+                phase="dispatch_started", retcode=None, message=None,
+                request_payload={}, result_payload={},
+                started_at=started_at, finished_at=started_at,
+            )
             result = await session.close_position(
                 command_id=command_id,
                 position_ticket=int(command["position_ticket"]),
@@ -762,6 +808,7 @@ async def _trade_command_dispatcher(sessions: dict[int, AccountSession]) -> None
                 deviation_points=settings.trader_close_deviation_points,
                 send_attempts=settings.trader_close_send_attempts,
                 reconcile_timeout_sec=settings.trader_close_reconcile_timeout_sec,
+                expires_at=command["expires_at"],
             )
             finished_at = datetime.now(timezone.utc)
             for attempt in result.get("attempts", []):
@@ -782,6 +829,7 @@ async def _trade_command_dispatcher(sessions: dict[int, AccountSession]) -> None
             if outcome in {"confirmed", "already_satisfied"}:
                 await repo.finish_trade_command(
                     command_id,
+                    expected_attempt=int(command["attempt_count"]),
                     status=outcome,
                     result=result,
                     error=None,
@@ -791,6 +839,7 @@ async def _trade_command_dispatcher(sessions: dict[int, AccountSession]) -> None
                 if expires_at is not None and expires_at <= finished_at:
                     await repo.finish_trade_command(
                         command_id,
+                        expected_attempt=int(command["attempt_count"]),
                         status="expired",
                         result=result,
                         error=error or "command_expired",
@@ -801,11 +850,13 @@ async def _trade_command_dispatcher(sessions: dict[int, AccountSession]) -> None
                         result=result,
                         error=error or outcome,
                         delay_sec=settings.trader_close_retry_delay_sec,
+                        expected_attempt=int(command["attempt_count"]),
                     )
             else:
                 await repo.finish_trade_command(
                     command_id,
-                    status=outcome if outcome in {"rejected", "unknown"} else "unknown",
+                    expected_attempt=int(command["attempt_count"]),
+                    status=outcome if outcome in {"rejected", "unknown", "expired"} else "unknown",
                     result=result,
                     error=error or outcome,
                 )

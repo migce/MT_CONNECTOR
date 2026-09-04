@@ -139,6 +139,16 @@ def make_request(
     }
 
 
+def durable_job_request(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "request_id": uuid.uuid4().hex, "job_id": job["id"],
+        "symbol": job["symbol"], "data_type": job["source_type"],
+        "timeframe": job.get("source_timeframe"), "target_type": job["target_type"],
+        "target_timeframe": job.get("timeframe"), "mode": job["mode"],
+        "from": job["range_from"].isoformat(), "to": job["range_to"].isoformat(),
+    }
+
+
 # -----------------------------------------------------------------------
 # API-side: send request and wait for response
 # -----------------------------------------------------------------------
@@ -167,19 +177,8 @@ class BackfillRequester:
         """Queue a durable Symbol Management job without waiting for it."""
         if self._redis is None:
             raise RuntimeError("Backfill requester is not connected")
-        request_id = uuid.uuid4().hex
-        payload = {
-            "request_id": request_id,
-            "job_id": job["id"],
-            "symbol": job["symbol"],
-            "data_type": job["source_type"],
-            "timeframe": job.get("source_timeframe"),
-            "target_type": job["target_type"],
-            "target_timeframe": job.get("timeframe"),
-            "mode": job["mode"],
-            "from": job["range_from"].isoformat(),
-            "to": job["range_to"].isoformat(),
-        }
+        payload = durable_job_request(job)
+        request_id = payload["request_id"]
         from src.db import symbol_management as sm
         await sm.update_job(job["id"], request_id=request_id)
         await self._redis.rpush(QUEUE_KEY, orjson.dumps(payload))
@@ -360,6 +359,15 @@ class BackfillListener:
 
         while True:
             try:
+                # Redis is only a wake-up hint for durable jobs. Re-read the
+                # authoritative queue continuously, including after eviction or
+                # a failed enqueue, without accumulating duplicate hints.
+                from src.db import symbol_management as sm
+                async with asyncio.timeout(3):
+                    pending = await sm.queued_jobs(limit=1)
+                if pending:
+                    await self._handle_request(durable_job_request(pending[0]))
+                    continue
                 # BLPOP blocks for up to 5 s, then loops (so we can be cancelled)
                 item = await self._redis.blpop(QUEUE_KEY, timeout=5)
                 if item is None:
@@ -399,19 +407,12 @@ class BackfillListener:
 
         if job_id:
             from src.db import symbol_management as sm
-            job = await sm.get_job(job_id)
+            job = await sm.claim_queued_job(job_id, request_id)
             # Redis is at-least-once here: after a poller restart the durable
             # queued rows are re-enqueued and an older message may still exist.
             # The single listener accepts only a job that is still queued.
-            if job is None or job["status"] != "queued":
+            if job is None:
                 return
-            await sm.update_job(
-                job_id,
-                status="running",
-                started_at=datetime.now(UTC),
-                progress=0,
-                error=None,
-            )
 
         logger.info(
             "backfill_on_demand_start",

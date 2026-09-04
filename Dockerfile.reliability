@@ -1,0 +1,11 @@
+# Retain the exact inspected production dependency layer.
+# Verified base image id: 70fd50694485b1b0cd30d42f730132d7311b6e8dadeccf818915bf6c86243c51.
+ARG CONNECTOR_RUNTIME_BASE=mt-connector-runtime:reliability-base-70fd5069
+FROM ${CONNECTOR_RUNTIME_BASE}
+COPY src/config.py /app/src/config.py
+COPY src/db/engine.py src/db/repository.py src/db/symbol_management.py src/db/trading_repository.py /app/src/db/
+COPY src/api/routes/trading.py src/api/routes/trade_commands.py /app/src/api/routes/
+COPY src/api/services/position_snapshot.py /app/src/api/services/position_snapshot.py
+COPY src/redis_bus/backfill_manager.py /app/src/redis_bus/backfill_manager.py
+COPY src/mt5/collector.py src/mt5/connection.py src/mt5/native_budget.py src/mt5/tick_spool.py src/mt5/trading.py /app/src/mt5/
+COPY src/trader_main.py /app/src/trader_main.py

@@ -8,10 +8,21 @@ Requires: API container running, trader_main running, DB accessible.
 
 from __future__ import annotations
 
+import os
+from urllib.parse import urlparse
+
 import httpx
 import pytest
 
-BASE = "http://localhost:9000/api/v1/admin/accounts"
+if os.environ.get("CONNECTOR_ENABLE_LIVE_FIXTURE_TESTS") != "1":
+    pytest.skip("Opt-in isolated API fixture required; never target production", allow_module_level=True)
+
+_fixture_url = os.environ["CONNECTOR_TEST_API_URL"].rstrip("/")
+_fixture_parts = urlparse(_fixture_url)
+if (_fixture_parts.hostname not in {"127.0.0.1", "localhost"}
+        or _fixture_parts.port in {None, 9000} or _fixture_parts.scheme != "http"):
+    raise RuntimeError("Tests require a dedicated localhost API on a non-production port")
+BASE = _fixture_url + "/admin/accounts"
 TIMEOUT = httpx.Timeout(90.0)  # verify can take up to 60s
 
 
@@ -31,9 +42,9 @@ class TestVerify:
     async def test_verify_valid_credentials(self, client: httpx.AsyncClient):
         """Known good account should return ok=true with account info."""
         resp = await client.post(f"{BASE}/verify", json={
-            "mt5_login": 5052841,
-            "mt5_password": "!p27ed4U",
-            "mt5_server": "OneRoyal-Server",
+            "mt5_login": int(os.environ["CONNECTOR_TEST_ACCOUNT_LOGIN"]),
+            "mt5_password": os.environ["CONNECTOR_TEST_ACCOUNT_PASSWORD"],
+            "mt5_server": os.environ["CONNECTOR_TEST_ACCOUNT_SERVER"],
         })
         assert resp.status_code == 200
         data = resp.json()
@@ -47,9 +58,9 @@ class TestVerify:
     async def test_verify_invalid_password(self, client: httpx.AsyncClient):
         """Wrong password should return 400."""
         resp = await client.post(f"{BASE}/verify", json={
-            "mt5_login": 5052841,
+            "mt5_login": int(os.environ["CONNECTOR_TEST_ACCOUNT_LOGIN"]),
             "mt5_password": "WRONG_PASSWORD",
-            "mt5_server": "OneRoyal-Server",
+            "mt5_server": os.environ["CONNECTOR_TEST_ACCOUNT_SERVER"],
         })
         assert resp.status_code == 400
         assert "Invalid MT5 credentials" in resp.json()["detail"]
@@ -60,7 +71,7 @@ class TestVerify:
         resp = await client.post(f"{BASE}/verify", json={
             "mt5_login": 9999999,
             "mt5_password": "anything",
-            "mt5_server": "OneRoyal-Server",
+            "mt5_server": os.environ["CONNECTOR_TEST_ACCOUNT_SERVER"],
         })
         assert resp.status_code == 400
 
@@ -73,9 +84,9 @@ class TestVerify:
 
         # Run verify (valid creds)
         await client.post(f"{BASE}/verify", json={
-            "mt5_login": 5052841,
-            "mt5_password": "!p27ed4U",
-            "mt5_server": "OneRoyal-Server",
+            "mt5_login": int(os.environ["CONNECTOR_TEST_ACCOUNT_LOGIN"]),
+            "mt5_password": os.environ["CONNECTOR_TEST_ACCOUNT_PASSWORD"],
+            "mt5_server": os.environ["CONNECTOR_TEST_ACCOUNT_SERVER"],
         })
 
         # Account count should be unchanged
@@ -86,9 +97,9 @@ class TestVerify:
     async def test_verify_with_account_id_context(self, client: httpx.AsyncClient):
         """Passing account_id is accepted (context only, no side effects)."""
         resp = await client.post(f"{BASE}/verify", json={
-            "mt5_login": 5052841,
-            "mt5_password": "!p27ed4U",
-            "mt5_server": "OneRoyal-Server",
+            "mt5_login": int(os.environ["CONNECTOR_TEST_ACCOUNT_LOGIN"]),
+            "mt5_password": os.environ["CONNECTOR_TEST_ACCOUNT_PASSWORD"],
+            "mt5_server": os.environ["CONNECTOR_TEST_ACCOUNT_SERVER"],
             "account_id": 1,
         })
         assert resp.status_code == 200
@@ -234,7 +245,7 @@ class TestVerifyUpdate:
         """Verify-update with correct new password returns ok=true."""
         # Account 1 is the known good account (5052841)
         resp = await client.post(f"{BASE}/1/verify-update", json={
-            "mt5_password": "!p27ed4U",  # same valid password
+            "mt5_password": os.environ["CONNECTOR_TEST_ACCOUNT_PASSWORD"],  # same valid password
         })
         assert resp.status_code == 200
         assert resp.json()["ok"] is True
@@ -272,7 +283,7 @@ class TestVerifyUpdate:
         # Verify-update with a different label
         await client.post(f"{BASE}/1/verify-update", json={
             "label": "ChangedLabel",
-            "mt5_password": "!p27ed4U",
+            "mt5_password": os.environ["CONNECTOR_TEST_ACCOUNT_PASSWORD"],
         })
 
         # Account should be unchanged

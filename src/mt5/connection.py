@@ -11,7 +11,6 @@ exposed by this module, because the MetaTrader5 package is NOT thread-safe.
 from __future__ import annotations
 
 import asyncio
-import functools
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, TypeVar
@@ -20,22 +19,24 @@ import structlog
 
 from src.config import Settings, get_settings
 from src.metrics import PollerMetrics
+from src.mt5.native_budget import NativeCallBudget
 
 logger = structlog.get_logger(__name__)
 
 # Single-thread executor — all MT5 calls are serialised here.
 _mt5_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mt5")
+_native_budget = NativeCallBudget(_mt5_executor)
 
 T = TypeVar("T")
 
 
 async def run_in_mt5(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     """Schedule *func* in the dedicated MT5 thread and await the result."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        _mt5_executor,
-        functools.partial(func, *args, **kwargs),
-    )
+    try:
+        return await _native_budget.run(func, *args, **kwargs)
+    except (TimeoutError, asyncio.CancelledError):
+        PollerMetrics().set_mt5_connected(False)
+        raise
 
 
 class MT5Connection:
@@ -100,6 +101,8 @@ class MT5Connection:
         """
         info = await run_in_mt5(self._terminal_info)
         if info is not None:
+            self._connected = True
+            self._metrics.set_mt5_connected(True)
             return False  # still connected, no gap
 
         logger.warning("mt5_connection_lost")
