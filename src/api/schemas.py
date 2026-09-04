@@ -30,6 +30,7 @@ class PaginatedResponse(BaseModel, Generic[T]):
     """
 
     data: list[T]
+    meta: dict | None = None
     count: int = Field(description="Number of items in `data`.")
     has_more: bool = Field(
         description="True if more rows exist beyond the requested limit.",

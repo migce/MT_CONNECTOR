@@ -274,6 +274,8 @@ class Settings(BaseSettings):
     )
     db_pool_min: int = Field(default=2)
     db_pool_max: int = Field(default=10)
+    history_max_source_rows: int = Field(default=300_000, ge=1_000, le=1_000_000)
+    history_statement_timeout_sec: int = Field(default=15, ge=1, le=60)
 
     # --- Redis ---
     redis_host: str = Field(default="localhost")

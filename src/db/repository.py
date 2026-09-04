@@ -23,6 +23,7 @@ from tenacity import (
 
 from src.config import Timeframe
 from src.db.engine import get_session_factory
+from src.db.heavy_reads import heavy_read_session, validate_source_budget
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -385,6 +386,7 @@ async def query_ticks(
     limit: int = 5000,
 ) -> list[dict[str, Any]]:
     """Retrieve raw ticks for a given symbol."""
+    validate_source_budget(limit)
     clauses = ["symbol = :symbol"]
     params: dict[str, Any] = {"symbol": symbol, "limit": limit}
 
@@ -410,8 +412,7 @@ async def query_ticks(
             f") sub ORDER BY time_msc ASC"
         )
 
-    factory = get_session_factory()
-    async with factory() as session:
+    async with heavy_read_session() as session:
         result = await session.execute(sql, params)
         return [dict(r._mapping) for r in result.all()]
 
@@ -459,6 +460,7 @@ async def query_spread_from_ticks(
     limit: int = 5000,
 ) -> list[dict[str, Any]]:
     """Return computed spread (ask − bid) from raw ticks."""
+    validate_source_budget(limit)
     clauses = ["symbol = :symbol", "ask IS NOT NULL", "bid IS NOT NULL"]
     params: dict[str, Any] = {"symbol": symbol, "limit": limit}
 
@@ -475,8 +477,7 @@ async def query_spread_from_ticks(
         f"FROM ticks WHERE {where} ORDER BY time_msc ASC LIMIT :limit"
     )
 
-    factory = get_session_factory()
-    async with factory() as session:
+    async with heavy_read_session() as session:
         result = await session.execute(sql, params)
         return [dict(r._mapping) for r in result.all()]
 
@@ -709,6 +710,8 @@ async def query_tick_bars(
     limit: int = 1000,
     price_field: Literal["bid", "ask", "last", "mid"] = "bid",
     include_incomplete: bool = False,
+    max_source_rows: int | None = None,
+    work_mem_mb: int | None = None,
 ) -> list[dict[str, Any]]:
     """
     Build OHLCV bars where each bar is formed from exactly *tick_count*
@@ -723,7 +726,9 @@ async def query_tick_bars(
     tf_label : str
         Label written into the ``timeframe`` field (e.g. "T100").
     dt_from / dt_to : datetime, optional
-        Time range filter (applied **before** grouping).
+        Time range filter (applied **before** grouping).  ``dt_from`` starts an
+        explicit oldest-first range.  ``dt_to`` on its own is a latest-before
+        cursor and keeps the newest-first bounded source query.
     limit : int
         Maximum number of bars to return.
     price_field : str
@@ -741,6 +746,13 @@ async def query_tick_bars(
         raise ValueError(f"Unknown price_field '{price_field}'. Use bid/ask/last/mid.")
 
     clauses = ["t.symbol = :symbol"]
+    requested_source_rows = tick_count * limit
+    source_limit = (
+        min(requested_source_rows, max_source_rows)
+        if max_source_rows is not None
+        else requested_source_rows
+    )
+    validate_source_budget(source_limit)
     params: dict[str, Any] = {
         "symbol": symbol,
         "tick_count": tick_count,
@@ -749,7 +761,7 @@ async def query_tick_bars(
         # The result can consume at most this many source rows.  Bounding the
         # indexed tick scan before ROW_NUMBER/GROUP BY avoids sorting and
         # spilling the symbol's complete history for every T<n> request.
-        "source_limit": tick_count * limit,
+        "source_limit": max(1, source_limit),
     }
     if dt_from:
         clauses.append("t.time_msc >= :dt_from")
@@ -761,8 +773,8 @@ async def query_tick_bars(
     where = " AND ".join(clauses)
     having = "" if include_incomplete else "HAVING COUNT(*) = :tick_count"
 
-    if dt_from or dt_to:
-        # Explicit range — oldest-first
+    if dt_from:
+        # An explicit lower boundary is a forward range — oldest-first.
         sql = text(f"""
             WITH source_ticks AS (
                 SELECT
@@ -803,7 +815,8 @@ async def query_tick_bars(
             LIMIT :limit
         """)
     else:
-        # No range — return the LATEST N bars in ascending order
+        # No lower boundary (with or without a ``to`` cursor) — return the
+        # LATEST N bars at or before the cursor in ascending display order.
         sql = text(f"""
             WITH source_ticks AS (
                 SELECT
@@ -847,8 +860,78 @@ async def query_tick_bars(
             SELECT * FROM bars ORDER BY time ASC
         """)
 
-    factory = get_session_factory()
-    async with factory() as session:
+    async with heavy_read_session() as session:
+        if work_mem_mb is not None:
+            bounded_work_mem = max(1, min(256, int(work_mem_mb)))
+            await session.execute(
+                text(f"SET LOCAL work_mem = '{bounded_work_mem}MB'"),
+                {},
+            )
+        result = await session.execute(sql, params)
+        return [dict(r._mapping) for r in result.all()]
+
+
+# ---------------------------------------------------------------
+# Information bars — bounded ordered tick source for Python builder
+# ---------------------------------------------------------------
+
+async def query_information_bar_ticks(
+    symbol: str,
+    *,
+    dt_from: datetime | None = None,
+    dt_to: datetime | None = None,
+    source_limit: int = 1_000_000,
+    work_mem_mb: int | None = None,
+) -> list[dict[str, Any]]:
+    """Return a bounded ascending tick prefix for adaptive aggregation.
+
+    With ``dt_from`` the prefix starts at that explicit boundary.  Without it,
+    the latest bounded source window is selected in descending index order and
+    then returned ascending for deterministic causal replay.  ``dt_to`` acts as
+    the latest-window anchor in both cases.
+    """
+    validate_source_budget(source_limit)
+    clauses = ["t.symbol = :symbol"]
+    params: dict[str, Any] = {
+        "symbol": symbol,
+        "source_limit": max(1, source_limit),
+    }
+    if dt_from is not None:
+        clauses.append("t.time_msc >= :dt_from")
+        params["dt_from"] = dt_from
+    if dt_to is not None:
+        clauses.append("t.time_msc <= :dt_to")
+        params["dt_to"] = dt_to
+    where = " AND ".join(clauses)
+
+    columns = "t.time_msc, t.symbol, t.bid, t.ask, t.last, t.volume, t.flags"
+    if dt_from is not None:
+        sql = text(f"""
+            SELECT {columns}
+            FROM ticks t
+            WHERE {where}
+            ORDER BY t.time_msc ASC
+            LIMIT :source_limit
+        """)
+    else:
+        sql = text(f"""
+            SELECT * FROM (
+                SELECT {columns}
+                FROM ticks t
+                WHERE {where}
+                ORDER BY t.time_msc DESC
+                LIMIT :source_limit
+            ) source_ticks
+            ORDER BY time_msc ASC
+        """)
+
+    async with heavy_read_session() as session:
+        if work_mem_mb is not None:
+            bounded_work_mem = max(1, min(256, int(work_mem_mb)))
+            await session.execute(
+                text(f"SET LOCAL work_mem = '{bounded_work_mem}MB'"),
+                {},
+            )
         result = await session.execute(sql, params)
         return [dict(r._mapping) for r in result.all()]
 
@@ -962,8 +1045,7 @@ async def query_tick_bounds() -> list[dict[str, Any]]:
         WHERE s.data_type = 'tick'
         ORDER BY s.symbol
     """)
-    factory = get_session_factory()
-    async with factory() as session:
+    async with heavy_read_session() as session:
         result = await session.execute(sql)
         return [dict(r._mapping) for r in result.all()]
 
