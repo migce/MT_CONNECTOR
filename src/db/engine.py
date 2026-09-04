@@ -36,6 +36,16 @@ def get_engine(settings: Settings | None = None) -> AsyncEngine:
         max_overflow=settings.db_pool_max - settings.db_pool_min,
         pool_pre_ping=True,
         pool_recycle=600,
+        connect_args={
+            "command_timeout": settings.db_command_timeout_sec,
+            "server_settings": {
+                "application_name": "mt_connector",
+                "statement_timeout": f"{settings.db_statement_timeout_ms}ms",
+                "idle_in_transaction_session_timeout": (
+                    f"{settings.db_idle_in_transaction_timeout_ms}ms"
+                ),
+            },
+        },
         echo=False,
     )
     logger.info(

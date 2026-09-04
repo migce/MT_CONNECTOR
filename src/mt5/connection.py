@@ -153,11 +153,17 @@ class MT5Connection:
 
     def _try_connect(self) -> bool:
         import MetaTrader5 as mt5
-        from src.mt5.portable import minimize_terminal_window, prepare_terminal
+
+        from src.mt5.portable import (
+            minimize_terminal_window,
+            prepare_terminal,
+            start_terminal_protected,
+        )
 
         s = self._settings
         # Write chart-less terminal.ini before mt5.initialize launches it
         prepare_terminal(s.mt5_path)
+        start_terminal_protected(s.mt5_path, portable=False)
         if not mt5.initialize(
             path=s.mt5_path,
             login=s.mt5_login,

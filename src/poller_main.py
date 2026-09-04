@@ -740,26 +740,9 @@ async def main(dashboard: bool = False) -> None:
     backfiller = Backfiller(connection, settings)
     backfiller.update_symbols(initial_symbols)
 
-    await backfiller.run_initial_backfill()
-
-    # --- Collector ---
-    collector = Collector(connection, publisher, settings)
-    collector.update_symbols(initial_symbols)
-    await collector.start()
-
     # --- On-demand backfill listener (API → Poller via Redis) ---
-    # Initial settlement refresh shares the single MT5 executor.  Finish it
-    # before accepting long-running operator jobs so their per-chunk timeout
-    # measures broker IPC time rather than startup queue contention.
-    def _recycle_after_history_timeout() -> None:
-        logger.critical("mt5_history_worker_stuck_recycling_poller")
-        os._exit(70)
-
-    backfill_listener = BackfillListener(
-        backfiller,
-        settings,
-        fatal_history_timeout=_recycle_after_history_timeout,
-    )
+    # Start BEFORE initial backfill so API requests are served during startup
+    backfill_listener = BackfillListener(backfiller, settings)
     await backfill_listener.connect()
     backfill_listener_task = asyncio.create_task(
         backfill_listener.run_forever(),
@@ -772,6 +755,13 @@ async def main(dashboard: bool = False) -> None:
     for recovered_job in await queued_jobs():
         await recovery_requester.enqueue_job(recovered_job)
     await recovery_requester.close()
+
+    await backfiller.run_initial_backfill()
+
+    # --- Collector ---
+    collector = Collector(connection, publisher, settings)
+    collector.update_symbols(initial_symbols)
+    await collector.start()
 
     # --- Background tasks ---
     heartbeat_task = asyncio.create_task(

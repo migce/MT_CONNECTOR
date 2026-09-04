@@ -23,7 +23,7 @@ import structlog
 from src.config import Settings, Timeframe, get_settings
 from src.db import repository as repo
 from src.metrics import PollerMetrics
-from src.mt5.connection import MT5Connection, run_in_mt5, get_digits
+from src.mt5.connection import MT5Connection, get_digits, run_in_mt5
 from src.mt5.converters import bars_to_dicts
 from src.redis_bus.publisher import RedisPublisher
 
@@ -36,6 +36,24 @@ _TICK_FLUSH_INTERVAL = 1.0
 # Buffer capacity warning threshold (fraction of maxlen)
 _TICK_BUFFER_WARN_THRESHOLD = 0.8
 _TICK_BUFFER_MAXLEN = 100_000
+# Keep candle fan-out well below the shared Redis pool limit (50).  The tick
+# loop and other components use the same pool, so publishing an entire
+# symbol/timeframe matrix at once can exhaust it.
+_CANDLE_PUBLISH_CONCURRENCY = 16
+_CANDLE_SIGNATURE_FIELDS = (
+    "open",
+    "high",
+    "low",
+    "close",
+    "tick_volume",
+    "real_volume",
+    "spread",
+)
+
+
+def _candle_signature(row: dict[str, Any]) -> tuple[Any, ...]:
+    """Return the persisted payload used to suppress no-op candle UPSERTs."""
+    return tuple(row[field] for field in _CANDLE_SIGNATURE_FIELDS)
 
 
 class Collector:
@@ -76,6 +94,13 @@ class Collector:
         # Active symbols — starts with config, updated dynamically
         self._active_symbols: list[str] = list(self._settings.symbols)
 
+        # Last successfully persisted payloads for the two MT5 bars fetched per
+        # symbol/timeframe.  This is an optimization only: after a restart the
+        # first cycle safely writes both bars again.
+        self._persisted_candle_signatures: dict[
+            tuple[str, str], dict[datetime, tuple[Any, ...]]
+        ] = {}
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -100,6 +125,11 @@ class Collector:
             logger.info("collector_symbols_added", added=sorted(added), total=len(symbols))
         removed = old - set(symbols)
         if removed:
+            self._persisted_candle_signatures = {
+                key: signatures
+                for key, signatures in self._persisted_candle_signatures.items()
+                if key[0] not in removed
+            }
             logger.info("collector_symbols_removed", removed=sorted(removed), total=len(symbols))
         return sorted(added)
 
@@ -174,38 +204,100 @@ class Collector:
     # Candle polling loop
     # ------------------------------------------------------------------
 
+    async def _run_candle_cycle(self, timeframes: list[Timeframe]) -> None:
+        """Fetch, atomically persist, and publish one realtime candle cycle."""
+
+        async def _fetch_one(
+            symbol: str,
+            timeframe: Timeframe,
+        ) -> tuple[str, str, list[dict[str, Any]]]:
+            bars = await run_in_mt5(
+                self._get_rates,
+                symbol,
+                timeframe.mt5_constant,
+                0,
+                2,
+            )
+            if bars is None or len(bars) == 0:
+                return symbol, timeframe.value, []
+            return symbol, timeframe.value, bars_to_dicts(bars, symbol, timeframe.value)
+
+        results = await asyncio.gather(
+            *(
+                _fetch_one(symbol, timeframe)
+                for symbol in self._active_symbols
+                for timeframe in timeframes
+            ),
+            return_exceptions=True,
+        )
+
+        candle_rows: list[dict[str, Any]] = []
+        sync_rows: list[dict[str, Any]] = []
+        publications: list[tuple[str, str, dict[str, Any]]] = []
+        successful_signatures: dict[
+            tuple[str, str], dict[datetime, tuple[Any, ...]]
+        ] = {}
+
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.exception("candle_poll_error", error=str(result), exc_info=result)
+                self._metrics.record_error("candle_poll")
+                continue
+
+            symbol, timeframe, rows = result
+            if not rows:
+                continue
+
+            pair = (symbol, timeframe)
+            previous = self._persisted_candle_signatures.get(pair, {})
+            current = {row["time"]: _candle_signature(row) for row in rows}
+            candle_rows.extend(
+                row
+                for row in rows
+                if previous.get(row["time"]) != current[row["time"]]
+            )
+            if rows[-1]["time"] not in previous:
+                sync_rows.append(
+                    {
+                        "symbol": symbol,
+                        "data_type": timeframe,
+                        "last_synced_at": rows[-1]["time"],
+                        "last_tick_msc": 0,
+                    }
+                )
+            publications.append((symbol, timeframe, rows[-1]))
+
+            merged = {**previous, **current}
+            latest_times = sorted(merged, reverse=True)[:2]
+            successful_signatures[pair] = {
+                timestamp: merged[timestamp]
+                for timestamp in latest_times
+            }
+
+        if not publications:
+            return
+
+        if candle_rows or sync_rows:
+            await repo.upsert_candles_and_sync(candle_rows, sync_rows)
+            self._metrics.record_candle_upsert(len(candle_rows))
+        self._persisted_candle_signatures.update(successful_signatures)
+
+        for offset in range(0, len(publications), _CANDLE_PUBLISH_CONCURRENCY):
+            batch = publications[offset:offset + _CANDLE_PUBLISH_CONCURRENCY]
+            await asyncio.gather(
+                *(
+                    self._pub.publish_candle(symbol, timeframe, row)
+                    for symbol, timeframe, row in batch
+                )
+            )
+
     async def _candle_loop(self) -> None:
         interval = self._settings.candle_poll_interval_sec
         timeframes = self._settings.timeframes
 
         while self._running:
             try:
-                # Collect all (symbol, tf) pairs then process concurrently
-                async def _poll_one(symbol: str, tf):
-                    bars = await run_in_mt5(
-                        self._get_rates, symbol, tf.mt5_constant, 0, 2
-                    )
-                    if bars is None or len(bars) == 0:
-                        return
-
-                    rows = bars_to_dicts(bars, symbol, tf.value)
-                    await repo.upsert_candles(rows)
-                    self._metrics.record_candle_upsert(len(rows))
-                    await self._pub.publish_candle(symbol, tf.value, rows[-1])
-                    last_time = rows[-1]["time"]
-                    await repo.update_sync_state(symbol, tf.value, last_time)
-
-                tasks = [
-                    _poll_one(symbol, tf)
-                    for symbol in self._active_symbols
-                    for tf in timeframes
-                ]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for r in results:
-                    if isinstance(r, Exception):
-                        logger.exception("candle_poll_error", error=str(r), exc_info=r)
-                        self._metrics.record_error("candle_poll")
-
+                await self._run_candle_cycle(timeframes)
                 await asyncio.sleep(interval)
 
             except asyncio.CancelledError:

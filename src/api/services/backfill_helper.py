@@ -36,6 +36,7 @@ _MARKET_HOURS_FACTOR = 1.5
 # Backfill cooldown — avoid re-triggering identical backfills.
 # -----------------------------------------------------------------------
 _BACKFILL_COOLDOWN_SEC = 300  # 5 minutes
+_AUTO_BACKFILL_REUSE_SEC = 21_600  # 6 hours after a successful MT5 fetch
 _recent_backfills: dict[str, float] = {}  # "SYMBOL:TF_OR_TYPE" → monotonic ts
 
 
@@ -49,6 +50,31 @@ def _backfill_on_cooldown(symbol: str, key: str) -> bool:
 
 def _record_backfill(symbol: str, key: str) -> None:
     _recent_backfills[f"{symbol}:{key}"] = _time.monotonic()
+
+
+def _automatic_reuse_scope(
+    symbol: str,
+    data_type: str,
+    timeframe: str | None,
+    requested_from: datetime | None,
+    requested_to: datetime | None,
+    limit: int,
+) -> str:
+    """Stable cross-worker scope without conflating different history ranges."""
+    tf = timeframe or "ticks"
+    if requested_from is not None:
+        start = requested_from.isoformat()
+        end = requested_to.isoformat() if requested_to is not None else "live"
+        return f"auto:{symbol}:{data_type}:{tf}:range:{start}:{end}"
+
+    # A live request's calculated from/to moves every call. Bucket it by UTC
+    # date and limit so all API workers share one successful availability
+    # probe, while a different limit or historical anchor remains independent.
+    anchor = (requested_to or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    return (
+        f"auto:{symbol}:{data_type}:{tf}:limit:{limit}:"
+        f"anchor:{anchor.date().isoformat()}"
+    )
 
 
 def _estimate_from_for_limit(
@@ -137,6 +163,12 @@ async def maybe_backfill_candles(
         dt_to=bf_to,
         timeframe=timeframe,
         timeout=60.0,
+        # Shared across API workers. One successful automatic fill suppresses
+        # duplicate work for this symbol/timeframe while callers re-query DB.
+        reuse_scope=_automatic_reuse_scope(
+            symbol, "candles", timeframe, dt_from, dt_to, limit,
+        ),
+        reuse_ttl=_AUTO_BACKFILL_REUSE_SEC,
     )
 
     # Record cooldown only after the attempt (so failures can be retried)
@@ -206,6 +238,10 @@ async def maybe_backfill_ticks(
         dt_from=bf_from,
         dt_to=bf_to,
         timeout=60.0,
+        reuse_scope=_automatic_reuse_scope(
+            symbol, "ticks", None, dt_from, dt_to, limit,
+        ),
+        reuse_ttl=_AUTO_BACKFILL_REUSE_SEC,
     )
 
     _record_backfill(symbol, "ticks")

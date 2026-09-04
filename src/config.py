@@ -248,6 +248,39 @@ class Settings(BaseSettings):
         ge=1,
         description="Deal-history lookback used by periodic trader deep resync.",
     )
+    trader_position_sync_interval_sec: float = Field(
+        default=1.0,
+        ge=0.2,
+        description=(
+            "Open-position observation interval. Position lifecycle events and "
+            "forced-exit detection use this cadence."
+        ),
+    )
+
+    # --- Close-only trading execution (safe defaults) ---
+    internal_api_token: str = Field(
+        default="",
+        description=(
+            "Bearer token required by all broker-event and trade-command APIs. "
+            "An empty token keeps those APIs unavailable."
+        ),
+    )
+    trading_execution_enabled: bool = Field(
+        default=False,
+        description="Hard Connector-side kill switch for MT5 write operations.",
+    )
+    trading_account_allowlist_csv: str = Field(
+        default="",
+        alias="TRADING_ACCOUNT_ALLOWLIST",
+        description="Comma-separated Connector account IDs allowed to execute closes.",
+    )
+    trader_command_poll_interval_ms: int = Field(default=250, ge=100, le=10_000)
+    trader_command_claim_timeout_sec: int = Field(default=120, ge=30)
+    trader_command_default_ttl_sec: int = Field(default=86_400, ge=60)
+    trader_close_retry_delay_sec: float = Field(default=5.0, ge=0.5)
+    trader_close_send_attempts: int = Field(default=3, ge=1, le=10)
+    trader_close_reconcile_timeout_sec: float = Field(default=5.0, ge=0.5, le=60)
+    trader_close_deviation_points: int = Field(default=100, ge=0, le=100_000)
 
     # --- Symbols (stored as raw CSV string to avoid pydantic-settings JSON parse) ---
     symbols_csv: str = Field(
@@ -274,6 +307,24 @@ class Settings(BaseSettings):
     )
     db_pool_min: int = Field(default=2)
     db_pool_max: int = Field(default=10)
+    db_command_timeout_sec: float = Field(
+        default=120.0,
+        ge=5.0,
+        le=900.0,
+        description="Client-side timeout for one PostgreSQL command.",
+    )
+    db_statement_timeout_ms: int = Field(
+        default=120_000,
+        ge=5_000,
+        le=900_000,
+        description="Server-side PostgreSQL statement timeout for Connector sessions.",
+    )
+    db_idle_in_transaction_timeout_ms: int = Field(
+        default=120_000,
+        ge=5_000,
+        le=900_000,
+        description="Server-side timeout for Connector sessions left idle in a transaction.",
+    )
 
     # --- Redis ---
     redis_host: str = Field(default="localhost")
@@ -352,6 +403,16 @@ class Settings(BaseSettings):
     def timeframes(self) -> list[Timeframe]:
         """Parsed list of Timeframe enums."""
         return [Timeframe(s.strip().upper()) for s in self.timeframes_csv.split(",") if s.strip()]
+
+    @property
+    def trading_account_allowlist(self) -> set[int]:
+        """Parsed Connector account IDs permitted to execute close commands."""
+        result: set[int] = set()
+        for raw in self.trading_account_allowlist_csv.split(","):
+            value = raw.strip()
+            if value:
+                result.add(int(value))
+        return result
 
     @property
     def dsn(self) -> str:

@@ -23,6 +23,7 @@ from fastapi.responses import PlainTextResponse
 from src.api.digits import load_symbol_digits
 from src.api.middleware.request_metrics import RequestMetricsMiddleware
 from src.api.routes import (
+    account_sessions,
     accounts,
     backfill,
     candles,
@@ -36,6 +37,7 @@ from src.api.routes import (
     symbol_management,
     symbols,
     ticks,
+    trade_commands,
     trading,
 )
 from src.api.websocket import streams
@@ -1102,7 +1104,9 @@ def create_app() -> FastAPI:
     app.include_router(coverage.router)
     app.include_router(stats.router)
     app.include_router(accounts.router)
+    app.include_router(account_sessions.router)
     app.include_router(trading.router)
+    app.include_router(trade_commands.router)
     app.include_router(poller.router)
     app.include_router(supervisor.router)
     app.include_router(backfill.router)

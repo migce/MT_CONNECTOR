@@ -33,9 +33,9 @@ Response payload::
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import uuid
 from datetime import UTC, datetime, timedelta
-from collections.abc import Callable
 from typing import Any
 
 import orjson
@@ -52,22 +52,61 @@ QUEUE_KEY = "backfill:queue"
 DONE_CHANNEL_PREFIX = "backfill:done:"
 # De-duplication key prefix — key alive while a request is in-flight
 INFLIGHT_PREFIX = "backfill:inflight:"
-INFLIGHT_TTL = 120  # seconds
+RESULT_PREFIX = "backfill:result:"
+RECENT_PREFIX = "backfill:recent:"
+# Keep the ownership marker beyond the ordinary API wait timeout so a caller
+# cannot enqueue the same expensive range while the poller is still working.
+INFLIGHT_TTL = 600  # seconds
+RESULT_TTL = 600  # seconds
+DEFAULT_REUSE_TTL = 300  # seconds
 
 
 class BackfillJobCancelledError(Exception):
     """Raised at a safe chunk boundary when an operator cancels a job."""
 
 
+def _scope_digest(scope: str) -> str:
+    return hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24]
+
+
+def _request_scope(
+    symbol: str,
+    data_type: str,
+    timeframe: str | None,
+    dt_from: datetime,
+    dt_to: datetime,
+    repair_from_ticks: bool = False,
+) -> str:
+    """Stable scope for an exact historical request."""
+    return "|".join(
+        (
+            symbol,
+            data_type,
+            timeframe or "tick",
+            dt_from.isoformat(),
+            dt_to.isoformat(),
+            "tick-repair" if repair_from_ticks else "native",
+        )
+    )
+
+
 def _inflight_key(
     symbol: str,
     data_type: str,
     timeframe: str | None,
-    repair_from_ticks: bool = False,
+    scope: str | None = None,
 ) -> str:
     tf_part = timeframe or "tick"
-    repair_part = ":tick-repair" if repair_from_ticks else ""
-    return f"{INFLIGHT_PREFIX}{symbol}:{data_type}:{tf_part}{repair_part}"
+    suffix = f":{_scope_digest(scope)}" if scope else ""
+    return f"{INFLIGHT_PREFIX}{symbol}:{data_type}:{tf_part}{suffix}"
+
+
+def _result_key(request_id: str) -> str:
+    return f"{RESULT_PREFIX}{request_id}"
+
+
+def _recent_key(scope: str) -> str:
+    return f"{RECENT_PREFIX}{_scope_digest(scope)}"
 
 
 # -----------------------------------------------------------------------
@@ -155,6 +194,8 @@ class BackfillRequester:
         dt_to: datetime,
         timeframe: str | None = None,
         timeout: float = 60.0,
+        reuse_scope: str | None = None,
+        reuse_ttl: int = DEFAULT_REUSE_TTL,
         repair_from_ticks: bool = False,
     ) -> dict[str, Any] | None:
         """
@@ -168,12 +209,25 @@ class BackfillRequester:
             logger.warning("backfill_requester_not_connected")
             return None
 
-        inflight = _inflight_key(
+        scope = reuse_scope or _request_scope(
             symbol,
             data_type,
             timeframe,
+            dt_from,
+            dt_to,
             repair_from_ticks,
         )
+        recent = await self._redis.get(_recent_key(scope))
+        if recent is not None:
+            logger.info(
+                "backfill_recent_result_reused",
+                symbol=symbol,
+                data_type=data_type,
+                timeframe=timeframe,
+            )
+            return orjson.loads(recent)
+
+        inflight = _inflight_key(symbol, data_type, timeframe, scope)
 
         # Check if an identical request is already in-flight
         existing_id = await self._redis.get(inflight)
@@ -192,6 +246,8 @@ class BackfillRequester:
             repair_from_ticks,
         )
         req_id = req["request_id"]
+        req["dedupe_scope"] = scope
+        req["reuse_ttl"] = max(0, int(reuse_ttl))
 
         # Mark in-flight (NX = only if not exists, race-safe)
         was_set = await self._redis.set(inflight, req_id, nx=True, ex=INFLIGHT_TTL)
@@ -226,10 +282,19 @@ class BackfillRequester:
     ) -> dict[str, Any] | None:
         """Subscribe to the done channel and wait."""
         assert self._redis is not None
+        cached = await self._redis.get(_result_key(request_id))
+        if cached is not None:
+            return orjson.loads(cached)
+
         channel = f"{DONE_CHANNEL_PREFIX}{request_id}"
         pubsub = self._redis.pubsub()
         try:
             await pubsub.subscribe(channel)
+            # Close the race where the Poller completed between the first
+            # cache lookup and the subscription becoming active.
+            cached = await self._redis.get(_result_key(request_id))
+            if cached is not None:
+                return orjson.loads(cached)
             deadline = asyncio.get_running_loop().time() + timeout
             while True:
                 remaining = deadline - asyncio.get_running_loop().time()
@@ -270,13 +335,11 @@ class BackfillListener:
         self,
         backfiller: Any,  # src.mt5.backfill.Backfiller (avoid circular import)
         settings: Settings | None = None,
-        fatal_history_timeout: Callable[[], None] | None = None,
     ) -> None:
         self._backfiller = backfiller
         self._settings = settings or get_settings()
         self._redis: aioredis.Redis | None = None
         self._metrics = PollerMetrics()
-        self._fatal_history_timeout = fatal_history_timeout
 
     async def connect(self) -> None:
         self._redis = get_redis_pool(self._settings)
@@ -324,9 +387,15 @@ class BackfillListener:
         repair_from_ticks = bool(req.get("repair_from_ticks", False))
         dt_from = datetime.fromisoformat(req["from"])
         dt_to = datetime.fromisoformat(req["to"])
-        work_from = dt_from
-        recovered_covered_to: datetime | None = None
-        recovered_rows_read = 0
+        scope = req.get("dedupe_scope") or _request_scope(
+            symbol,
+            data_type,
+            timeframe,
+            dt_from,
+            dt_to,
+            repair_from_ticks,
+        )
+        reuse_ttl = max(0, int(req.get("reuse_ttl", DEFAULT_REUSE_TTL)))
 
         if job_id:
             from src.db import symbol_management as sm
@@ -336,19 +405,11 @@ class BackfillListener:
             # The single listener accepts only a job that is still queued.
             if job is None or job["status"] != "queued":
                 return
-            recovered_covered_to = job.get("covered_to")
-            recovered_rows_read = max(int(job.get("rows_read") or 0), 0)
-            if (
-                req.get("mode") != "refresh"
-                and recovered_covered_to is not None
-                and dt_from <= recovered_covered_to < dt_to
-            ):
-                work_from = recovered_covered_to + timedelta(milliseconds=1)
             await sm.update_job(
                 job_id,
                 status="running",
                 started_at=datetime.now(UTC),
-                progress=max(float(job.get("progress") or 0), 0),
+                progress=0,
                 error=None,
             )
 
@@ -364,9 +425,9 @@ class BackfillListener:
 
         response: dict[str, Any] = {"request_id": request_id, "status": "ok", "rows": 0, "error": None}
         _t0 = _time.monotonic()
-        last_covered_to: datetime | None = recovered_covered_to
+        last_covered_to: datetime | None = None
         last_processed_to: datetime | None = None
-        last_rows_read = recovered_rows_read
+        last_rows_read = 0
 
         async def _job_progress(covered_to: datetime, rows: int) -> None:
             nonlocal last_covered_to, last_rows_read
@@ -406,88 +467,110 @@ class BackfillListener:
                 rows_read=last_rows_read,
             )
 
-        fatal_history_timeout = False
+        inflight = _inflight_key(symbol, data_type, timeframe, scope)
+        cancelled = False
         try:
-            if data_type == "candles" and timeframe:
-                candle_options: dict[str, Any] = {
-                    "repair_from_ticks": repair_from_ticks,
-                }
-                if job_id:
-                    candle_options.update({
-                        "preserve_existing": req.get("mode") != "refresh",
-                        "progress_callback": _job_progress,
-                    })
-                rows = await self._backfiller.on_demand_candles(
-                    symbol, timeframe, work_from, dt_to, **candle_options
-                )
-            elif data_type == "ticks":
-                tick_options: dict[str, Any] = {}
-                if job_id:
-                    tick_options.update({
-                        "refresh_existing": req.get("mode") == "refresh",
-                        "progress_callback": _job_progress,
-                        "scan_progress_callback": _job_scan_progress,
-                    })
-                rows = await self._backfiller.on_demand_ticks(
-                    symbol, work_from, dt_to, **tick_options
-                )
-            else:
-                raise ValueError(f"Unknown data_type={data_type}")
-            response["rows"] = rows
-            if job_id and req.get("target_type") == "custom":
-                from src.config import parse_custom_timeframe
-                from src.db import symbol_management as sm
-                target = str(req.get("target_timeframe") or "")
-                parsed = parse_custom_timeframe(target)
-                bindings = await sm.symbol_bindings(symbol)
-                binding = next((item for item in bindings if item["timeframe"] == target), None)
-                if binding and binding["enabled"] and binding["mode"] == "materialized":
-                    if parsed.is_tick_bar:
-                        raise ValueError("Tick bars are virtual-only")
-                    materialized = await sm.materialize_timeframe(
-                        symbol=symbol,
-                        timeframe=target,
-                        bucket_seconds=parsed.seconds,
-                        source_timeframe=str(req.get("timeframe") or "M1"),
-                        dt_from=dt_from,
-                        dt_to=dt_to,
-                        refresh=req.get("mode") == "refresh",
+            async with asyncio.timeout(self._settings.backfill_job_timeout_sec):
+                if data_type == "candles" and timeframe:
+                    candle_options: dict[str, Any] = {
+                        "repair_from_ticks": repair_from_ticks,
+                    }
+                    if job_id:
+                        candle_options.update({
+                            "preserve_existing": req.get("mode") != "refresh",
+                            "progress_callback": _job_progress,
+                        })
+                    rows = await self._backfiller.on_demand_candles(
+                        symbol, timeframe, dt_from, dt_to, **candle_options
                     )
-                    response["rows"] += materialized
+                elif data_type == "ticks":
+                    tick_options: dict[str, Any] = {}
+                    if job_id:
+                        tick_options.update({
+                            "refresh_existing": req.get("mode") == "refresh",
+                            "progress_callback": _job_progress,
+                            "scan_progress_callback": _job_scan_progress,
+                        })
+                    rows = await self._backfiller.on_demand_ticks(
+                        symbol, dt_from, dt_to, **tick_options
+                    )
+                else:
+                    raise ValueError(f"Unknown data_type={data_type}")
+                response["rows"] = rows
+                if job_id and req.get("target_type") == "custom":
+                    from src.config import parse_custom_timeframe
+                    from src.db import symbol_management as sm
+                    target = str(req.get("target_timeframe") or "")
+                    parsed = parse_custom_timeframe(target)
+                    bindings = await sm.symbol_bindings(symbol)
+                    binding = next(
+                        (item for item in bindings if item["timeframe"] == target),
+                        None,
+                    )
+                    if binding and binding["enabled"] and binding["mode"] == "materialized":
+                        if parsed.is_tick_bar:
+                            raise ValueError("Tick bars are virtual-only")
+                        materialized = await sm.materialize_timeframe(
+                            symbol=symbol,
+                            timeframe=target,
+                            bucket_seconds=parsed.seconds,
+                            source_timeframe=str(req.get("timeframe") or "M1"),
+                            dt_from=dt_from,
+                            dt_to=dt_to,
+                            refresh=req.get("mode") == "refresh",
+                        )
+                        response["rows"] += materialized
+                if job_id:
+                    from src.db import symbol_management as sm
+                    tolerance_seconds = 5.0
+                    if data_type == "candles" and timeframe:
+                        from src.config import Timeframe
+                        tolerance_seconds = Timeframe(timeframe).seconds
+                    covered = bool(
+                        last_covered_to
+                        and last_covered_to >= dt_to - timedelta(seconds=tolerance_seconds)
+                    )
+                    terminal_status = "succeeded" if covered else "partial"
+                    await sm.update_job(
+                        job_id,
+                        status=terminal_status,
+                        progress=1 if covered else (
+                            min(
+                                max(
+                                    (
+                                        (last_covered_to - dt_from).total_seconds()
+                                        if last_covered_to else 0
+                                    ) / max((dt_to - dt_from).total_seconds(), 1),
+                                    0,
+                                ),
+                                0.99,
+                            )
+                        ),
+                        covered_to=last_covered_to,
+                        rows_read=max(last_rows_read, response["rows"], 0),
+                        rows_written=max(response["rows"], 0),
+                        error=None if covered else (
+                            "Broker returned only part of the requested range"
+                            if last_covered_to else
+                            "Broker returned no data for the requested range"
+                        ),
+                        finished_at=datetime.now(UTC),
+                    )
+        except TimeoutError:
+            logger.exception(
+                "backfill_on_demand_timeout",
+                request_id=request_id,
+                timeout_sec=self._settings.backfill_job_timeout_sec,
+            )
+            response["status"] = "error"
+            response["error"] = "backfill job timed out"
+            self._metrics.record_error("backfill")
             if job_id:
                 from src.db import symbol_management as sm
-                tolerance_seconds = 5.0
-                if data_type == "candles" and timeframe:
-                    from src.config import Timeframe
-                    tolerance_seconds = Timeframe(timeframe).seconds
-                covered = bool(
-                    last_covered_to
-                    and last_covered_to >= dt_to - timedelta(seconds=tolerance_seconds)
-                )
-                terminal_status = "succeeded" if covered else "partial"
                 await sm.update_job(
                     job_id,
-                    status=terminal_status,
-                    progress=1 if covered else (
-                        min(
-                            max(
-                                (
-                                    (last_covered_to - dt_from).total_seconds()
-                                    if last_covered_to else 0
-                                ) / max((dt_to - dt_from).total_seconds(), 1),
-                                0,
-                            ),
-                            0.99,
-                        )
-                    ),
-                    covered_to=last_covered_to,
-                    rows_read=max(last_rows_read, response["rows"], 0),
-                    rows_written=max(response["rows"], 0),
-                    error=None if covered else (
-                        "Broker returned only part of the requested range"
-                        if last_covered_to else
-                        "Broker returned no data for the requested range"
-                    ),
+                    status="failed",
+                    error=response["error"],
                     finished_at=datetime.now(UTC),
                 )
         except BackfillJobCancelledError:
@@ -500,12 +583,9 @@ class BackfillListener:
                     finished_at=datetime.now(UTC),
                 )
         except Exception as exc:
-            from src.mt5.backfill import MT5HistoryCallTimeoutError
-
             logger.exception("backfill_on_demand_error", request_id=request_id)
             response["status"] = "error"
             response["error"] = str(exc)
-            fatal_history_timeout = isinstance(exc, MT5HistoryCallTimeoutError)
             self._metrics.record_error("backfill")
             if job_id:
                 from src.db import symbol_management as sm
@@ -515,35 +595,39 @@ class BackfillListener:
                     error=str(exc),
                     finished_at=datetime.now(UTC),
                 )
+        except asyncio.CancelledError:
+            cancelled = True
+            response["status"] = "cancelled"
+            response["error"] = "backfill listener cancelled"
+            raise
+        finally:
+            _elapsed = _time.monotonic() - _t0
+            self._metrics.record_on_demand(
+                symbol=symbol,
+                data_type=data_type,
+                timeframe=timeframe,
+                rows=response["rows"],
+                status=response["status"],
+                elapsed_sec=_elapsed,
+            )
+            self._metrics.set_backfill_phase("")
+            if cancelled:
+                # Cancellation has no completion payload, but it must never
+                # leave a stale lock that blocks a later bounded retry.
+                await self._redis.delete(inflight)
 
-        _elapsed = _time.monotonic() - _t0
-        self._metrics.record_on_demand(
-            symbol=symbol,
-            data_type=data_type,
-            timeframe=timeframe,
-            rows=response["rows"],
-            status=response["status"],
-            elapsed_sec=_elapsed,
-        )
-        self._metrics.set_backfill_phase("")
-
-        # Clear in-flight marker
-        inflight = _inflight_key(
-            symbol,
-            data_type,
-            timeframe,
-            repair_from_ticks,
-        )
-        await self._redis.delete(inflight)
-
-        # Publish done
+        # Persist the result before publishing it. A caller that subscribes
+        # after Pub/Sub delivery can still recover the completed response.
         channel = f"{DONE_CHANNEL_PREFIX}{request_id}"
-        await self._redis.publish(channel, orjson.dumps(response))
+        payload = orjson.dumps(response)
+        await self._redis.set(_result_key(request_id), payload, ex=RESULT_TTL)
+        if response["status"] == "ok" and reuse_ttl > 0:
+            await self._redis.set(_recent_key(scope), payload, ex=reuse_ttl)
+        await self._redis.delete(inflight)
+        await self._redis.publish(channel, payload)
         logger.info(
             "backfill_on_demand_done",
             request_id=request_id,
             status=response["status"],
             rows=response["rows"],
         )
-        if fatal_history_timeout and self._fatal_history_timeout is not None:
-            self._fatal_history_timeout()
