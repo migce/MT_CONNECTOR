@@ -23,6 +23,7 @@ from tenacity import (
 
 from src.config import Timeframe
 from src.db.engine import get_session_factory
+from src.db.heavy_reads import heavy_read_session, validate_source_budget
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -385,6 +386,7 @@ async def query_ticks(
     limit: int = 5000,
 ) -> list[dict[str, Any]]:
     """Retrieve raw ticks for a given symbol."""
+    validate_source_budget(limit)
     clauses = ["symbol = :symbol"]
     params: dict[str, Any] = {"symbol": symbol, "limit": limit}
 
@@ -410,8 +412,7 @@ async def query_ticks(
             f") sub ORDER BY time_msc ASC"
         )
 
-    factory = get_session_factory()
-    async with factory() as session:
+    async with heavy_read_session() as session:
         result = await session.execute(sql, params)
         return [dict(r._mapping) for r in result.all()]
 
@@ -459,6 +460,7 @@ async def query_spread_from_ticks(
     limit: int = 5000,
 ) -> list[dict[str, Any]]:
     """Return computed spread (ask − bid) from raw ticks."""
+    validate_source_budget(limit)
     clauses = ["symbol = :symbol", "ask IS NOT NULL", "bid IS NOT NULL"]
     params: dict[str, Any] = {"symbol": symbol, "limit": limit}
 
@@ -475,8 +477,7 @@ async def query_spread_from_ticks(
         f"FROM ticks WHERE {where} ORDER BY time_msc ASC LIMIT :limit"
     )
 
-    factory = get_session_factory()
-    async with factory() as session:
+    async with heavy_read_session() as session:
         result = await session.execute(sql, params)
         return [dict(r._mapping) for r in result.all()]
 
@@ -751,6 +752,7 @@ async def query_tick_bars(
         if max_source_rows is not None
         else requested_source_rows
     )
+    validate_source_budget(source_limit)
     params: dict[str, Any] = {
         "symbol": symbol,
         "tick_count": tick_count,
@@ -858,8 +860,7 @@ async def query_tick_bars(
             SELECT * FROM bars ORDER BY time ASC
         """)
 
-    factory = get_session_factory()
-    async with factory() as session:
+    async with heavy_read_session() as session:
         if work_mem_mb is not None:
             bounded_work_mem = max(1, min(256, int(work_mem_mb)))
             await session.execute(
@@ -889,6 +890,7 @@ async def query_information_bar_ticks(
     then returned ascending for deterministic causal replay.  ``dt_to`` acts as
     the latest-window anchor in both cases.
     """
+    validate_source_budget(source_limit)
     clauses = ["t.symbol = :symbol"]
     params: dict[str, Any] = {
         "symbol": symbol,
@@ -923,8 +925,7 @@ async def query_information_bar_ticks(
             ORDER BY time_msc ASC
         """)
 
-    factory = get_session_factory()
-    async with factory() as session:
+    async with heavy_read_session() as session:
         if work_mem_mb is not None:
             bounded_work_mem = max(1, min(256, int(work_mem_mb)))
             await session.execute(
@@ -1044,8 +1045,7 @@ async def query_tick_bounds() -> list[dict[str, Any]]:
         WHERE s.data_type = 'tick'
         ORDER BY s.symbol
     """)
-    factory = get_session_factory()
-    async with factory() as session:
+    async with heavy_read_session() as session:
         result = await session.execute(sql)
         return [dict(r._mapping) for r in result.all()]
 

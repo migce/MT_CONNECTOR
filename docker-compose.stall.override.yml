@@ -1,0 +1,3 @@
+services:
+  api:
+    image: mt_connector-api:stall-protection-20260904

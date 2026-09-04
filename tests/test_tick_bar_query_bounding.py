@@ -58,7 +58,7 @@ async def test_tick_bar_query_bounds_source_before_windowing(
     number_order: str,
 ) -> None:
     session = _Session()
-    with patch.object(repository, "get_session_factory", return_value=_Factory(session)):
+    with patch.object(repository, "heavy_read_session", return_value=session):
         rows = await repository.query_tick_bars(
             symbol="EURUSD",
             tick_count=4_000,
@@ -91,7 +91,7 @@ async def test_tick_bar_query_keeps_price_and_incomplete_contract(
     include_incomplete: bool,
 ) -> None:
     session = _Session()
-    with patch.object(repository, "get_session_factory", return_value=_Factory(session)):
+    with patch.object(repository, "heavy_read_session", return_value=session):
         await repository.query_tick_bars(
             symbol="XAUUSD",
             tick_count=500,

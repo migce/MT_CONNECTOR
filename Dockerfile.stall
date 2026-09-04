@@ -1,0 +1,7 @@
+FROM mt_connector-api:rollback-before-stall-20260904
+# Exact deployed image; replace only the reviewed modules, preserving runtime dependencies.
+COPY src/config.py /app/src/config.py
+COPY src/db/heavy_reads.py src/db/repository.py /app/src/db/
+COPY src/api/app.py src/api/schemas.py /app/src/api/
+COPY src/api/routes/custom_candles.py /app/src/api/routes/custom_candles.py
+COPY src/api/middleware/history_disconnect.py /app/src/api/middleware/history_disconnect.py

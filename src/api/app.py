@@ -18,10 +18,11 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from src.api.digits import load_symbol_digits
 from src.api.middleware.request_metrics import RequestMetricsMiddleware
+from src.api.middleware.history_disconnect import HistoryDisconnectMiddleware
 from src.api.routes import (
     account_sessions,
     accounts,
@@ -43,6 +44,7 @@ from src.api.routes import (
 from src.api.websocket import streams
 from src.config import get_settings
 from src.db.engine import dispose_engine, get_engine
+from src.db.heavy_reads import HeavyReadUnavailable, dispose_heavy_engine
 from src.db.init_timescale import init_timescaledb
 from src.logging_config import setup_logging
 from src.redis_bus.backfill_manager import BackfillRequester
@@ -204,6 +206,7 @@ async def _lifespan(app: FastAPI):
         await requester.close()
         app.state.backfill_requester = None
     await close_redis_pool()
+    await dispose_heavy_engine()
     await dispose_engine()
     _app_ref = None
     logger.info("api_stopped")
@@ -1068,6 +1071,14 @@ def create_app() -> FastAPI:
         lifespan=_lifespan,
     )
 
+    @app.exception_handler(HeavyReadUnavailable)
+    async def history_unavailable(_request: Request, exc: HeavyReadUnavailable):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"code": exc.code, "detail": str(exc)},
+            headers={"Retry-After": "5"} if exc.status_code == 503 else {},
+        )
+
     # ---- CORS ----
     # When CORS_ORIGINS env var is set, restrict to those origins;
     # otherwise allow all (development mode, no credentials).
@@ -1093,6 +1104,7 @@ def create_app() -> FastAPI:
 
     # ---- Request metrics middleware ----
     app.add_middleware(RequestMetricsMiddleware)
+    app.add_middleware(HistoryDisconnectMiddleware)
 
     # ---- REST routes ----
     app.include_router(custom_candles.router)  # must precede candles (path overlap)

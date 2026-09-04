@@ -32,10 +32,12 @@ from src.api.services.validation import validate_symbol
 from src.config import (
     Timeframe,
     custom_timeframe_source,
+    get_settings,
     is_standard_timeframe,
     parse_custom_timeframe,
 )
 from src.db import repository as repo
+from src.db.heavy_reads import validate_source_budget
 
 router = APIRouter(prefix="/api/v1", tags=["custom-candles"])
 
@@ -140,6 +142,12 @@ async def get_custom_candles(
                 status_code=400,
                 detail="Tick bar count must be >= 2.",
             )
+        # Reject excessive work before any backfill or DB connection is taken.
+        cap = get_settings().history_max_source_rows
+        extra_bar = 0 if use_latest_n else 1
+        validate_source_budget(ctf.tick_count * (1 + extra_bar))
+        page_limit = min(effective_limit, cap // ctf.tick_count - extra_bar)
+        page_fetch_limit = page_limit + extra_bar
         # Ensure source ticks are available
         await maybe_backfill_ticks(
             symbol=symbol,
@@ -153,11 +161,20 @@ async def get_custom_candles(
             tf_label=ctf.raw,
             dt_from=from_dt,
             dt_to=to_dt,
-            limit=fetch_limit,
+            limit=page_fetch_limit,
             price_field=price,
             include_incomplete=include_incomplete,
+            max_source_rows=cap,
+            work_mem_mb=32,
         )
-        return _paginate_candles(rows, effective_limit, latest_n=use_latest_n)
+        result = _paginate_candles(rows, page_limit, latest_n=use_latest_n)
+        result.meta = {
+            "source_truncated": page_limit < effective_limit and len(rows) >= page_fetch_limit,
+            "source_cap": cap,
+            "requested_bars": effective_limit,
+            "returned_bars": result.count,
+        }
+        return result
 
     # ------ Time-based custom TF ------
     if ctf.seconds < 60:
