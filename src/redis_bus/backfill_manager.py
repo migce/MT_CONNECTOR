@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -334,11 +335,13 @@ class BackfillListener:
         self,
         backfiller: Any,  # src.mt5.backfill.Backfiller (avoid circular import)
         settings: Settings | None = None,
+        fatal_history_timeout: Callable[[], None] | None = None,
     ) -> None:
         self._backfiller = backfiller
         self._settings = settings or get_settings()
         self._redis: aioredis.Redis | None = None
         self._metrics = PollerMetrics()
+        self._fatal_history_timeout = fatal_history_timeout
 
     async def connect(self) -> None:
         self._redis = get_redis_pool(self._settings)
@@ -470,6 +473,7 @@ class BackfillListener:
 
         inflight = _inflight_key(symbol, data_type, timeframe, scope)
         cancelled = False
+        fatal_history_timeout = False
         try:
             async with asyncio.timeout(self._settings.backfill_job_timeout_sec):
                 if data_type == "candles" and timeframe:
@@ -557,7 +561,7 @@ class BackfillListener:
                         ),
                         finished_at=datetime.now(UTC),
                     )
-        except TimeoutError:
+        except TimeoutError as exc:
             logger.exception(
                 "backfill_on_demand_timeout",
                 request_id=request_id,
@@ -565,6 +569,11 @@ class BackfillListener:
             )
             response["status"] = "error"
             response["error"] = "backfill job timed out"
+            # Preserve the native Windows Poller's existing recycling hook.
+            # Its backfill module can be newer than the API dependency image.
+            from src.mt5 import backfill as native_backfill
+            fatal_type = getattr(native_backfill, "MT5HistoryCallTimeoutError", ())
+            fatal_history_timeout = isinstance(exc, fatal_type)
             self._metrics.record_error("backfill")
             if job_id:
                 from src.db import symbol_management as sm
@@ -632,3 +641,5 @@ class BackfillListener:
             status=response["status"],
             rows=response["rows"],
         )
+        if fatal_history_timeout and self._fatal_history_timeout is not None:
+            self._fatal_history_timeout()

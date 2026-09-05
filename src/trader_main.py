@@ -1192,7 +1192,7 @@ async def _main() -> None:
         stop.set()
 
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    for sig in (signal.SIGINT, signal.SIGTERM, *([signal.SIGBREAK] if os.name == "nt" else [])):
         try:
             loop.add_signal_handler(sig, _signal_handler)
         except NotImplementedError:

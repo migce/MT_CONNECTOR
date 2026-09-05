@@ -34,6 +34,22 @@ _MAX_TICKS_PER_CALL = 100_000
 _TICK_PROGRESS_CHUNK = timedelta(hours=4)
 
 
+class MT5HistoryCallTimeoutError(TimeoutError):
+    """The MT5 IPC call did not return and its worker must be recycled."""
+
+
+async def _await_history_call(awaitable: Awaitable[Any], timeout: float) -> Any:
+    """Bound a history IPC call without waiting for a stuck executor thread."""
+    task = asyncio.ensure_future(awaitable)
+    done, _pending = await asyncio.wait({task}, timeout=timeout)
+    if task not in done:
+        task.cancel()
+        raise MT5HistoryCallTimeoutError(
+            f"MT5 tick history chunk timed out after {timeout:g} seconds"
+        )
+    return task.result()
+
+
 def is_forex_market_open(dt: datetime) -> bool:
     """Return True if *dt* falls within forex market hours.
 
@@ -85,6 +101,27 @@ class Backfiller:
             batch = rows[offset : offset + batch_rows]
             affected += await repo.upsert_candles(batch)
             # Give task cancellation a deterministic checkpoint between commits.
+            await asyncio.sleep(0)
+        return affected
+
+    async def _persist_tick_batches(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        refresh_existing: bool = False,
+        progress_callback: Callable[[list[dict[str, Any]], int], Awaitable[None]] | None = None,
+    ) -> int:
+        """Commit broker ticks in bounded, independently retryable batches."""
+        batch_rows = self._settings.backfill_tick_batch_rows
+        affected = 0
+        processed = 0
+        persist = repo.upsert_ticks if refresh_existing else repo.insert_ticks
+        for offset in range(0, len(rows), batch_rows):
+            batch = rows[offset : offset + batch_rows]
+            affected += await persist(batch)
+            processed += len(batch)
+            if progress_callback is not None:
+                await progress_callback(batch, processed)
             await asyncio.sleep(0)
         return affected
 
@@ -415,27 +452,44 @@ class Backfiller:
         cursor = dt_from
         while cursor < dt_to:
             chunk_to = min(cursor + _TICK_PROGRESS_CHUNK, dt_to)
-            try:
-                ticks = await asyncio.wait_for(
-                    run_in_mt5(self._copy_ticks_range, symbol, cursor, chunk_to),
-                    timeout=self._TICKS_IPC_TIMEOUT,
-                )
-            except TimeoutError as exc:
-                raise TimeoutError(
-                    f"MT5 tick history chunk timed out after "
-                    f"{self._TICKS_IPC_TIMEOUT} seconds"
-                ) from exc
+            ticks = await _await_history_call(
+                run_in_mt5(self._copy_ticks_range, symbol, cursor, chunk_to),
+                timeout=self._TICKS_IPC_TIMEOUT,
+            )
             if ticks is None or len(ticks) == 0:
                 cursor = chunk_to
                 if scan_progress_callback is not None:
                     await scan_progress_callback(cursor, rows_read)
                 continue
             rows = ticks_to_dicts(ticks, symbol)
-            rows_read += len(rows)
-            inserted = (
-                await repo.upsert_ticks(rows)
-                if refresh_existing else await repo.insert_ticks(rows)
+            rows_before_chunk = rows_read
+
+            async def _batch_progress(
+                batch: list[dict[str, Any]],
+                processed: int,
+            ) -> None:
+                if progress_callback is None:
+                    return
+                batch_time = batch[-1]["time_msc"]
+                batch_to = (
+                    batch_time
+                    if isinstance(batch_time, datetime)
+                    else datetime.fromtimestamp(
+                        int(batch_time) / 1000.0,
+                        tz=timezone.utc,
+                    )
+                ) + timedelta(milliseconds=1)
+                await progress_callback(
+                    min(batch_to, dt_to),
+                    rows_before_chunk + processed,
+                )
+
+            inserted = await self._persist_tick_batches(
+                rows,
+                refresh_existing=refresh_existing,
+                progress_callback=_batch_progress,
             )
+            rows_read += len(rows)
             total += inserted
             last_msc = int(ticks[-1]["time_msc"])
             next_cursor = datetime.fromtimestamp(
@@ -444,8 +498,6 @@ class Backfiller:
             ) + timedelta(milliseconds=1)
             if next_cursor <= cursor:
                 next_cursor = cursor + timedelta(milliseconds=1)
-            if progress_callback is not None:
-                await progress_callback(min(next_cursor, dt_to), rows_read)
             cursor = (
                 chunk_to
                 if len(ticks) < _MAX_TICKS_PER_CALL
@@ -584,7 +636,7 @@ class Backfiller:
                 break
 
             rows = ticks_to_dicts(ticks, symbol)
-            inserted = await repo.insert_ticks(rows)
+            inserted = await self._persist_tick_batches(rows)
             total_inserted += inserted
 
             # Advance cursor past last tick

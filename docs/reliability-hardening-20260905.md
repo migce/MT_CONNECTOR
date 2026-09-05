@@ -25,6 +25,8 @@ Candidate Dockerfile.reliability overlays reviewed sources onto the exact inspec
 
 ## Deployment gate
 
+07:10MSK cutover reconciliation found native-only startup settlement, bounded tick batches and fatal-history callback missing from the API baseline. Preserved native backfill.py/poller_main.py in this candidate, retained the callback contract, and added SIGBREAK handling for the Supervisor's Windows stop signal. Native heavy_reads.py is also required by the new repository import. This correction must be built/retested before installation; the earlier 15-file parity check was insufficient for the native transitive dependency surface.
+
 A coordinated native Poller/Trader replacement is necessary, potentially interrupting trading sessions. Require an explicit window, fresh command/intent/account state, preserved rollback sources/images/configuration, and no unresolved broker outcome. Never clear commands/spool or send real orders to test recovery.
 
 Connector/native atomic snapshot must be active before the new Monitor consumer. Publish a lease-aware embedded Monitor controller before enabling its standalone replacement. Preserve policy/allowlist/MT5 build, secrets and trading semantics. Production fault injection is not authorized.

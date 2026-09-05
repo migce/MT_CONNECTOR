@@ -8,4 +8,5 @@ COPY src/api/routes/trading.py src/api/routes/trade_commands.py /app/src/api/rou
 COPY src/api/services/position_snapshot.py /app/src/api/services/position_snapshot.py
 COPY src/redis_bus/backfill_manager.py /app/src/redis_bus/backfill_manager.py
 COPY src/mt5/collector.py src/mt5/connection.py src/mt5/native_budget.py src/mt5/tick_spool.py src/mt5/trading.py /app/src/mt5/
-COPY src/trader_main.py /app/src/trader_main.py
+COPY src/mt5/backfill.py /app/src/mt5/backfill.py
+COPY src/poller_main.py src/trader_main.py /app/src/

@@ -629,7 +629,7 @@ async def main(dashboard: bool = False) -> None:
             stop_event.set()
 
         loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
+        for sig in (signal.SIGINT, signal.SIGTERM, *([signal.SIGBREAK] if os.name == "nt" else [])):
             try:
                 loop.add_signal_handler(sig, _signal_handler)
             except NotImplementedError:
@@ -740,9 +740,26 @@ async def main(dashboard: bool = False) -> None:
     backfiller = Backfiller(connection, settings)
     backfiller.update_symbols(initial_symbols)
 
+    await backfiller.run_initial_backfill()
+
+    # --- Collector ---
+    collector = Collector(connection, publisher, settings)
+    collector.update_symbols(initial_symbols)
+    await collector.start()
+
     # --- On-demand backfill listener (API → Poller via Redis) ---
-    # Start BEFORE initial backfill so API requests are served during startup
-    backfill_listener = BackfillListener(backfiller, settings)
+    # Finish startup settlement before accepting long operator jobs.  Both
+    # paths share the single MT5 executor, so queueing them together makes a
+    # per-chunk IPC timeout measure contention instead of broker response time.
+    def _recycle_after_history_timeout() -> None:
+        logger.critical("mt5_history_worker_stuck_recycling_poller")
+        os._exit(70)
+
+    backfill_listener = BackfillListener(
+        backfiller,
+        settings,
+        fatal_history_timeout=_recycle_after_history_timeout,
+    )
     await backfill_listener.connect()
     backfill_listener_task = asyncio.create_task(
         backfill_listener.run_forever(),
@@ -755,13 +772,6 @@ async def main(dashboard: bool = False) -> None:
     for recovered_job in await queued_jobs():
         await recovery_requester.enqueue_job(recovered_job)
     await recovery_requester.close()
-
-    await backfiller.run_initial_backfill()
-
-    # --- Collector ---
-    collector = Collector(connection, publisher, settings)
-    collector.update_symbols(initial_symbols)
-    await collector.start()
 
     # --- Background tasks ---
     heartbeat_task = asyncio.create_task(
@@ -856,7 +866,7 @@ async def main(dashboard: bool = False) -> None:
         stop_event.set()
 
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    for sig in (signal.SIGINT, signal.SIGTERM, *([signal.SIGBREAK] if os.name == "nt" else [])):
         try:
             loop.add_signal_handler(sig, _signal_handler)
         except NotImplementedError:
