@@ -1,6 +1,6 @@
-# Connector reliability candidate — 2026-09-05
+# Connector reliability release — 2026-09-05
 
-Status: implemented/tested in branch `codex/reliability-hardening-20260905` from deployed baseline `d2b1baa`; **not deployed**. Do not mix candidate native parent/child with the old IPC protocol.
+Status: installed and running with explicit user authorization; final runtime source `6986f1d` in branch `codex/reliability-hardening-20260905`, based on deployed baseline `d2b1baa`. See the installed-release update below and the joint production report for final images/tests and residual risks. Do not mix this native parent/child with the old IPC protocol.
 
 ## Safety changes
 
@@ -38,3 +38,6 @@ Still open: killable native live/history process separation, physical command-st
 ## Reproduce tests safely
 
 Use a dedicated local PostgreSQL fixture named database `reliability_test`, bound to127.0.0.1 on a non5432 port. Set RELIABILITY_TEST_DSN to that fixture and run the full pytest suite. Never point it at mt5_data/production. Leave CONNECTOR_ENABLE_LIVE_FIXTURE_TESTS unset unless an explicitly approved isolated API/MT5 fixture exists.
+# Installed release update — 2026-09-05 07:42 MSK
+
+Пакет установлен с разрешения пользователя. Runtime source `6986f1d`, image `213719dc...`, 18 native files verified; Poller29204/Trader32168, required3/active3/standby3, 12 positions still open. Tests200passed/4skipped. Final validation:60 snapshots without errors, current Poller errors0 (6705 previous_session preserved), spool drains. Candle matrix now respects native admission; snapshot future skew bounded2s, stale30s and commandTTL unchanged. No DB/Redis/WSL restart, trade command, policy change or journal/spool deletion. Joint report: `/Users/migce/pyProjects/mt5-monitor/.codex/releases/reliability-20260905/production-result.md`. The original candidate qualification below is historical; remaining physical isolation/restore risks are still open.
