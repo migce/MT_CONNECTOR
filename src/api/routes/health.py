@@ -19,8 +19,8 @@ from sqlalchemy import text
 
 from src.api.schemas import HealthResponse, ServiceUptimeEntry, UptimeResponse
 from src.config import get_settings
-from src.db.engine import get_engine
-from src.redis_bus.pool import get_redis_pool
+from src.db.engine import get_engine, get_trading_engine
+from src.redis_bus.pool import get_redis_pool, get_cache_redis_pool
 
 router = APIRouter(prefix="/api/v1", tags=["health"])
 
@@ -98,33 +98,35 @@ def _trader_health_from_payload(data: object) -> tuple[bool, int, int, list[int]
         "- **mt5_connected** — `true` if the Windows poller is running and "
         "connected to the MT5 terminal (status relayed via Redis with 30 s TTL)\n"
         "- **db_connected** — TimescaleDB reachable\n"
-        "- **redis_connected** — Redis reachable\n"
-        "- **status** — `ok` when DB is up, `degraded` otherwise\n\n"
+        "- **redis_connected** — control Redis reachable\n"
+        "- **control_db_connected** — trading store reachable\n"
+        "- **cache_redis_connected** — market PubSub Redis reachable\n"
+        "- **status** — `ok` when storage probes pass, `degraded` otherwise\n\n"
         "Use this endpoint for liveness probes and monitoring dashboards."
     ),
 )
 async def health_check() -> HealthResponse:
     settings = get_settings()
 
-    # DB check
-    db_ok = False
-    try:
-        engine = get_engine()
+    async def database_probe(engine):
         async with engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
-        db_ok = True
-    except Exception:
-        pass
 
-    # Redis check (reuses shared pool)
-    redis_ok = False
-    r = None
-    try:
-        r = get_redis_pool()
-        await r.ping()
-        redis_ok = True
-    except Exception:
-        pass
+    async def bounded(probe):
+        try:
+            async with asyncio.timeout(1.5):
+                await probe()
+            return True
+        except Exception:
+            return False
+
+    db_ok, control_db_ok, redis_ok, cache_ok = await asyncio.gather(
+        bounded(lambda: database_probe(get_engine())),
+        bounded(lambda: database_probe(get_trading_engine())),
+        bounded(lambda: get_redis_pool().ping()),
+        bounded(lambda: get_cache_redis_pool().ping()),
+    )
+    r = get_redis_pool() if redis_ok else None
 
     # MT5 status from poller (via Redis key with 30s TTL)
     mt5_ok = False
@@ -134,14 +136,14 @@ async def health_check() -> HealthResponse:
     trader_degraded_account_ids: list[int] = []
     if redis_ok and r is not None:
         try:
-            raw = await r.get("poller:status")
+            raw = await asyncio.wait_for(r.get("poller:status"), timeout=0.5)
             if raw is not None:
                 poller_data = orjson.loads(raw)
                 mt5_ok = bool(poller_data.get("mt5_connected", False))
         except Exception:
             pass
         try:
-            raw_t = await r.get("trader:status")
+            raw_t = await asyncio.wait_for(r.get("trader:status"), timeout=0.5)
             if raw_t is not None:
                 trader_data = orjson.loads(raw_t)
                 (
@@ -161,7 +163,7 @@ async def health_check() -> HealthResponse:
         history_connected=bool(history.get("connected")),
         history_phase=str(history.get("phase", "unavailable" if settings.history_worker_enabled else "disabled")),
         history_terminal_path=settings.history_mt5_path if settings.history_worker_enabled else None,
-        status="ok" if db_ok else "degraded",
+        status="ok" if db_ok and control_db_ok and redis_ok and cache_ok else "degraded",
         mt5_connected=mt5_ok,
         trader_connected=trader_ok,
         trader_accounts_total=trader_accounts_total,
@@ -169,6 +171,10 @@ async def health_check() -> HealthResponse:
         trader_degraded_account_ids=trader_degraded_account_ids,
         db_connected=db_ok,
         redis_connected=redis_ok,
+        control_db_connected=control_db_ok,
+        control_db_isolated=bool(settings.control_db_url),
+        control_redis_isolated=bool(settings.control_redis_url),
+        cache_redis_connected=cache_ok,
         uptime_sec=round(time.time() - _start_time, 1),
         symbols_active=len(settings.symbols),
     )

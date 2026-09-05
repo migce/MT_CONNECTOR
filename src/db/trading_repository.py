@@ -21,7 +21,7 @@ from tenacity import (
     wait_exponential,
 )
 
-from src.db.engine import get_command_session_factory, get_session_factory
+from src.db.engine import get_command_session_factory, get_trading_session_factory as get_session_factory
 
 logger = structlog.get_logger(__name__)
 

@@ -998,19 +998,12 @@ async def run_dashboard_monitor() -> None:
     already running as a separate process.
     """
     import orjson
-    import redis.asyncio as aioredis
+    from src.redis_bus.pool import new_control_redis
 
     from src.config import get_settings
 
     settings = get_settings()
-    r = aioredis.Redis(
-        host=settings.redis_host,
-        port=settings.redis_port,
-        password=settings.redis_password or None,
-        db=settings.redis_db,
-        decode_responses=False,
-        single_connection_client=True,
-    )
+    r = new_control_redis(settings, single_connection_client=True)
 
     snap = MetricsSnapshot()
     console = Console()

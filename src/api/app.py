@@ -43,7 +43,7 @@ from src.api.routes import (
 )
 from src.api.websocket import streams
 from src.config import get_settings
-from src.db.engine import dispose_engine, get_engine
+from src.db.engine import dispose_engine, get_engine, verify_control_store
 from src.db.heavy_reads import HeavyReadUnavailable, dispose_heavy_engine
 from src.db.init_timescale import init_timescaledb
 from src.logging_config import setup_logging
@@ -146,15 +146,20 @@ async def _lifespan(app: FastAPI):
     # Warm up the DB connection pool
     get_engine(settings)
 
-    # Ensure TimescaleDB schema exists
-    try:
-        await init_timescaledb()
-    except Exception:
-        logger.warning("timescaledb_init_skipped", exc_info=True)
+    # A deployed control store is migrated explicitly, never via history DDL.
+    # Market-storage failure must not hold trading ingress at startup.
+    if settings.control_db_url:
+        await verify_control_store()
+    else:
+        try:
+            await init_timescaledb()
+        except Exception:
+            logger.warning("timescaledb_init_skipped", exc_info=True)
 
     from src.db.symbol_management import ensure_schema as ensure_symbol_management_schema
 
-    await ensure_symbol_management_schema(settings.symbols)
+    if not settings.control_db_url:
+        await ensure_symbol_management_schema(settings.symbols)
 
     # Load symbol digits cache from Redis (written by poller)
     await load_symbol_digits()

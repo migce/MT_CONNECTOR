@@ -308,6 +308,9 @@ class Settings(BaseSettings):
     )
     db_pool_min: int = Field(default=2)
     db_pool_max: int = Field(default=10)
+    # Explicit control-store routing. Once configured, never fall back to history.
+    control_db_url: str | None = Field(default=None, repr=False)
+    control_db_ca_file: str | None = None
     history_max_source_rows: int = Field(default=300_000, ge=1_000, le=1_000_000)
     history_statement_timeout_sec: int = Field(default=15, ge=1, le=60)
     db_command_timeout_sec: float = Field(
@@ -334,6 +337,8 @@ class Settings(BaseSettings):
     redis_port: int = Field(default=6379)
     redis_password: Optional[str] = Field(default=None)
     redis_db: int = Field(default=0)
+    control_redis_url: str | None = Field(default=None, repr=False)
+    control_redis_ca_file: str | None = None
 
     # --- Poller ---
     history_worker_enabled: bool = False

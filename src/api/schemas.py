@@ -129,6 +129,10 @@ class HealthResponse(BaseModel):
     trader_degraded_account_ids: list[int] = Field(default_factory=list)
     db_connected: bool = False
     redis_connected: bool = False
+    control_db_connected: bool = False
+    control_db_isolated: bool = False
+    control_redis_isolated: bool = False
+    cache_redis_connected: bool = False
     uptime_sec: float = 0.0
     symbols_active: int = 0
     version: str = "1.0.0"

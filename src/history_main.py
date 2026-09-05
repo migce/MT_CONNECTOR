@@ -153,8 +153,9 @@ class HistoryService:
                         await lease.commit()
                     await asyncio.sleep(1)
 
-            tasks = [asyncio.create_task(self.work()), asyncio.create_task(lease_guard()),
-                     asyncio.create_task(self.publish_health())]
+            tasks = [asyncio.create_task(self.work(), name="history_work"),
+                     asyncio.create_task(lease_guard(), name="history_lease_guard"),
+                     asyncio.create_task(self.publish_health(), name="history_health")]
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             # Hard exit is deliberate: cancelling cannot stop a running MT5 DLL
             # call. No other Python process or terminal is killed here.
@@ -162,7 +163,16 @@ class HistoryService:
             self.phase = "failed"
             for task in done:
                 if not task.cancelled() and task.exception():
-                    logger.error("history_generation_failed", error_type=type(task.exception()).__name__)
+                    # Fixed reason codes, not raw exception/log text containing
+                    # broker credentials or query parameters.
+                    reasons = {
+                        "Live Poller has not relinquished history ownership": "live_history_ownership_unconfirmed",
+                        "History lease connection changed": "history_lease_changed",
+                        "History connection proof lost": "broker_readonly_proof_lost",
+                    }
+                    reason = reasons.get(str(task.exception()), "other_exception")
+                    logger.error("history_generation_failed", error_type=type(task.exception()).__name__,
+                                 task=task.get_name(), reason=reason)
             self.exit_process(70)
 
 

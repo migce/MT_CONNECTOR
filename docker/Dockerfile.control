@@ -1,0 +1,14 @@
+FROM mt-connector-api:history-isolated-20260905
+COPY src/config.py /app/src/config.py
+COPY src/db/engine.py /app/src/db/engine.py
+COPY src/db/trading_repository.py /app/src/db/trading_repository.py
+COPY src/redis_bus/pool.py /app/src/redis_bus/pool.py
+COPY src/redis_bus/publisher.py /app/src/redis_bus/publisher.py
+COPY src/redis_bus/subscriber.py /app/src/redis_bus/subscriber.py
+COPY src/trader_main.py /app/src/trader_main.py
+COPY src/history_main.py /app/src/history_main.py
+COPY src/dashboard.py /app/src/dashboard.py
+COPY src/api/app.py /app/src/api/app.py
+COPY src/api/routes/health.py /app/src/api/routes/health.py
+COPY src/api/schemas.py /app/src/api/schemas.py
+COPY src/api/websocket/streams.py /app/src/api/websocket/streams.py

@@ -782,15 +782,8 @@ async def _poller_status_sender(
 
     try:
         # Dedicated single connection — not from the shared pool
-        conn = aioredis.Redis(
-            host=_settings.redis_host,
-            port=_settings.redis_port,
-            password=_settings.redis_password,
-            db=_settings.redis_db,
-            decode_responses=False,
-            single_connection_client=True,
-            socket_connect_timeout=5,
-        )
+        from src.redis_bus.pool import new_control_redis
+        conn = new_control_redis(_settings, single_connection_client=True)
 
         while True:
             try:

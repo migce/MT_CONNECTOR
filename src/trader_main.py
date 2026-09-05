@@ -30,7 +30,7 @@ import structlog
 
 from src.config import get_settings
 from src.db import trading_repository as repo
-from src.db.engine import dispose_engine, get_engine
+from src.db.engine import dispose_engine, get_trading_engine as get_engine, verify_control_store
 from src.db.init_timescale import init_timescaledb
 from src.logging_config import setup_logging
 from src.mt5.portable import ensure_portable_terminal
@@ -993,10 +993,13 @@ async def _main() -> None:
 
     # Init DB
     get_engine(settings)
-    try:
-        await init_timescaledb()
-    except Exception:
-        logger.warning("timescaledb_init_skipped", exc_info=True)
+    if settings.control_db_url:
+        await verify_control_store()
+    else:
+        try:
+            await init_timescaledb()
+        except Exception:
+            logger.warning("timescaledb_init_skipped", exc_info=True)
 
     # ------------------------------------------------------------------
     # Mutable state: running sessions & tasks, keyed by account_id

@@ -18,7 +18,7 @@ import redis.asyncio as aioredis
 import structlog
 
 from src.config import Settings, get_settings
-from src.redis_bus.pool import get_redis_pool
+from src.redis_bus.pool import get_cache_redis_pool as get_redis_pool
 
 logger = structlog.get_logger(__name__)
 
