@@ -321,6 +321,17 @@ def test_complete_empty_snapshot_is_valid_data_not_trade_confirmation():
     assert validate_position_snapshot(snapshot(), 68)["positions"] == []
 
 
+@pytest.mark.parametrize("offset,accepted", [(0.5, True), (3, False), (-31, False)])
+def test_snapshot_clock_skew_is_bounded_without_extending_stale_limit(offset, accepted):
+    stamp = (datetime.now(UTC) + timedelta(seconds=offset)).isoformat()
+    payload = {**snapshot(), "started_at": stamp, "last_success_at": stamp}
+    if accepted:
+        assert validate_position_snapshot(payload, 68) == payload
+    else:
+        with pytest.raises(ValueError):
+            validate_position_snapshot(payload, 68)
+
+
 @pytest.mark.parametrize("retcode", [None, 10008, 10011, 10012, 10023, 10028, 10031, 10039])
 def test_partial_effect_after_ambiguous_reply_never_authorizes_second_send(retcode):
     mt5 = FakeMT5()

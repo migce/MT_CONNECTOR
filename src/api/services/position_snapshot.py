@@ -5,6 +5,11 @@ import math
 from datetime import UTC, datetime
 from typing import Any
 
+# Producer Windows and consumer Docker clocks are independent. This tolerance
+# is only for small future skew, never an extension of the 30-second stale limit
+# or of a trading command deadline. Larger skew remains fail-closed.
+_MAX_FUTURE_SKEW_SECONDS = 2.0
+
 
 def validate_position_snapshot(payload: Any, account_id: int, *, max_age: float = 30) -> dict:
     if not isinstance(payload, dict):
@@ -18,8 +23,8 @@ def validate_position_snapshot(payload: Any, account_id: int, *, max_age: float 
         completed = datetime.fromisoformat(payload["last_success_at"].replace("Z", "+00:00"))
         now = datetime.now(UTC)
         if (started.tzinfo is None or completed.tzinfo is None or completed < started
-                or not 0 <= (now - started).total_seconds() <= max_age
-                or completed > now):
+                or not -_MAX_FUTURE_SKEW_SECONDS <= (now - started).total_seconds() <= max_age
+                or (completed - now).total_seconds() > _MAX_FUTURE_SKEW_SECONDS):
             raise ValueError("Stale position snapshot")
         rows = payload["positions"]
         if (not isinstance(rows, list) or type(payload["position_count"]) is not int
