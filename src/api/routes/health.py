@@ -11,6 +11,7 @@ Windows poller refreshes every 10 s with a 30 s TTL.
 from __future__ import annotations
 
 import time
+import asyncio
 
 import orjson
 from fastapi import APIRouter
@@ -25,6 +26,52 @@ router = APIRouter(prefix="/api/v1", tags=["health"])
 
 # Set once when the module is first imported (≈ app startup).
 _start_time: float = time.time()
+_history_cache: dict = {}
+
+
+def _fresh_history(data: object) -> bool:
+    if not isinstance(data, dict):
+        return False
+    try:
+        # Same bounded cross-host clock tolerance as position snapshots.
+        return -2 <= time.time() - float(data.get("observed_at", 0)) < 30
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+async def _read_history_status() -> dict:
+    global _history_cache
+    try:
+        async with asyncio.timeout(1):
+            for attempt in range(3):
+                raw = await get_redis_pool().get("history:status")
+                data = orjson.loads(raw) if raw else {}
+                if _fresh_history(data):
+                    if (not _fresh_history(_history_cache) or
+                            float(data["observed_at"]) >= float(_history_cache["observed_at"])):
+                        _history_cache = data
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(0.05)
+    except Exception:
+        pass
+    # Do not turn a recently verified proof into an outage merely because an
+    # allkeys-lru cache evicted it between two GETs. Never extend its 30s age.
+    return dict(_history_cache) if _fresh_history(_history_cache) else {}
+
+
+@router.get("/history/status", summary="Isolated history generation and progress")
+async def history_status() -> dict:
+    from fastapi import HTTPException
+    if not get_settings().history_worker_enabled:
+        return {"enabled": False, "phase": "disabled"}
+    try:
+        data = await _read_history_status()
+        if not data:
+            raise ValueError("stale")
+        return data
+    except Exception:
+        raise HTTPException(503, "Isolated history status unavailable") from None
 
 
 def _trader_health_from_payload(data: object) -> tuple[bool, int, int, list[int]]:
@@ -106,7 +153,14 @@ async def health_check() -> HealthResponse:
         except Exception:
             pass
 
+    history = {}
+    if settings.history_worker_enabled and redis_ok and r is not None:
+        history = await _read_history_status()
     return HealthResponse(
+        history_enabled=settings.history_worker_enabled,
+        history_connected=bool(history.get("connected")),
+        history_phase=str(history.get("phase", "unavailable" if settings.history_worker_enabled else "disabled")),
+        history_terminal_path=settings.history_mt5_path if settings.history_worker_enabled else None,
         status="ok" if db_ok else "degraded",
         mt5_connected=mt5_ok,
         trader_connected=trader_ok,

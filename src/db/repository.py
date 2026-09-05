@@ -277,8 +277,8 @@ _UPSERT_SYNC_SQL = text("""
     VALUES (:symbol, :data_type, :last_synced_at, :last_tick_msc, NOW())
     ON CONFLICT (symbol, data_type)
     DO UPDATE SET
-        last_synced_at = EXCLUDED.last_synced_at,
-        last_tick_msc  = EXCLUDED.last_tick_msc,
+        last_synced_at = GREATEST(sync_state.last_synced_at, EXCLUDED.last_synced_at),
+        last_tick_msc  = GREATEST(sync_state.last_tick_msc, EXCLUDED.last_tick_msc),
         updated_at     = NOW()
 """)
 

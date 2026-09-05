@@ -60,7 +60,7 @@ async def _heartbeat_loop(
             await asyncio.sleep(interval_sec)
             gap_occurred = await connection.ensure_connected()
             now = time.time()
-            if gap_occurred:
+            if gap_occurred or getattr(backfiller, "pending_reconnect", False):
                 gap_sec = now - last_seen
                 logger.warning(
                     "mt5_reconnected_gap_backfill",
@@ -68,6 +68,8 @@ async def _heartbeat_loop(
                 )
                 # Backfill ALL ticks + candles from sync_state to now
                 await backfiller.run_reconnect_backfill()
+            if hasattr(backfiller, "mark_live"):
+                backfiller.mark_live(now)
             last_seen = now
         except asyncio.CancelledError:
             break
@@ -368,7 +370,7 @@ async def _health_checker_loop(api_port: int) -> None:
                     }
                     await pool.set(
                         "poller:status",
-                        _orjson.dumps(_status),
+                        _orjson.dumps({**_status, "history_isolated": get_settings().history_worker_enabled}),
                         ex=10,
                     )
                 except Exception:
@@ -674,7 +676,8 @@ async def main(dashboard: bool = False) -> None:
     from src.db.symbol_management import ensure_schema as ensure_symbol_management_schema
     from src.db.symbol_management import recover_interrupted_jobs
     await ensure_symbol_management_schema(settings.symbols)
-    await recover_interrupted_jobs()
+    if not settings.history_worker_enabled:
+        await recover_interrupted_jobs()
 
     # --- Restore today's baseline counters from DB ---
     try:
@@ -737,7 +740,11 @@ async def main(dashboard: bool = False) -> None:
     await publish_mt5_symbols(connection)
 
     # --- Backfill ---
-    backfiller = Backfiller(connection, settings)
+    if settings.history_worker_enabled:
+        from src.mt5.history_queue import RemoteHistory
+        backfiller = RemoteHistory(settings)
+    else:
+        backfiller = Backfiller(connection, settings)
     backfiller.update_symbols(initial_symbols)
 
     await backfiller.run_initial_backfill()
@@ -755,12 +762,16 @@ async def main(dashboard: bool = False) -> None:
         logger.critical("mt5_history_worker_stuck_recycling_poller")
         os._exit(70)
 
-    backfill_listener = BackfillListener(
-        backfiller,
-        settings,
-        fatal_history_timeout=_recycle_after_history_timeout,
-    )
-    await backfill_listener.connect()
+    if settings.history_worker_enabled:
+        from src.mt5.history_queue import RemoteHistoryListener
+        backfill_listener = RemoteHistoryListener()
+    else:
+        backfill_listener = BackfillListener(
+            backfiller,
+            settings,
+            fatal_history_timeout=_recycle_after_history_timeout,
+        )
+        await backfill_listener.connect()
     backfill_listener_task = asyncio.create_task(
         backfill_listener.run_forever(),
         name="backfill_listener",

@@ -377,11 +377,20 @@ class Backfiller:
         total = 0
         cursor = dt_from
         while cursor < dt_to:
+            bounded = getattr(self._settings, "history_worker_enabled", False) is True
+            chunk_to = min(cursor + timedelta(seconds=tf.seconds * 1000), dt_to) if bounded else dt_to
             bars = await run_in_mt5(
-                self._copy_rates_range, symbol, tf.mt5_constant, cursor, dt_to,
+                self._copy_rates_range, symbol, tf.mt5_constant, cursor, chunk_to,
             )
+            if bounded and bars is None:
+                raise RuntimeError("History candle read failed; coverage not confirmed")
             if bars is None or len(bars) == 0:
+                if bounded and chunk_to < dt_to:
+                    cursor = chunk_to
+                    continue
                 break
+            if bounded and (len(bars) > 100_000 or getattr(bars, "nbytes", 0) > 16 * 1024 * 1024):
+                raise RuntimeError("History candle response exceeds safety budget")
             rows = bars_to_dicts(bars, symbol, tf.value)
             affected = (
                 await self._persist_missing_candle_batches(rows)
@@ -392,7 +401,11 @@ class Backfiller:
             if progress_callback is not None:
                 await progress_callback(min(cursor, dt_to), total)
             if len(bars) < _MAX_BARS_PER_CALL:
-                break
+                if not bounded or chunk_to == dt_to:
+                    break
+                cursor = max(cursor, chunk_to)
+            if bounded:
+                await asyncio.sleep(0.02)
 
         tick_repair_rows = 0
         if repair_from_ticks:
@@ -451,16 +464,22 @@ class Backfiller:
         rows_read = 0
         cursor = dt_from
         while cursor < dt_to:
-            chunk_to = min(cursor + _TICK_PROGRESS_CHUNK, dt_to)
+            bounded = getattr(self._settings, "history_worker_enabled", False) is True
+            chunk = timedelta(minutes=1) if bounded else _TICK_PROGRESS_CHUNK
+            chunk_to = min(cursor + chunk, dt_to)
             ticks = await _await_history_call(
                 run_in_mt5(self._copy_ticks_range, symbol, cursor, chunk_to),
                 timeout=self._TICKS_IPC_TIMEOUT,
             )
+            if bounded and ticks is None:
+                raise RuntimeError("History tick read failed; coverage not confirmed")
             if ticks is None or len(ticks) == 0:
                 cursor = chunk_to
                 if scan_progress_callback is not None:
                     await scan_progress_callback(cursor, rows_read)
                 continue
+            if bounded and (len(ticks) > 100_000 or getattr(ticks, "nbytes", 0) > 16 * 1024 * 1024):
+                raise RuntimeError("History tick response exceeds safety budget")
             rows = ticks_to_dicts(ticks, symbol)
             rows_before_chunk = rows_read
 
@@ -505,6 +524,9 @@ class Backfiller:
             )
             if scan_progress_callback is not None:
                 await scan_progress_callback(cursor, rows_read)
+
+            if bounded:
+                await asyncio.sleep(0.02)
 
         logger.info(
             "on_demand_ticks_done",

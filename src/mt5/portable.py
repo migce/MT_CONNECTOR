@@ -214,7 +214,7 @@ def stop_terminal_process(mt5_path: str) -> None:
             logger.warning("terminal_process_stop_failed", path=mt5_path, pid=pid, exc_info=True)
 
 
-def start_terminal_protected(mt5_path: str, *, portable: bool) -> bool:
+def start_terminal_protected(mt5_path: str, *, portable: bool, config_path: str | None = None) -> bool:
     """Ensure the exact MT5 terminal is protected and starts minimized.
 
     Returns ``True`` when a new protected process was launched. An existing
@@ -232,6 +232,8 @@ def start_terminal_protected(mt5_path: str, *, portable: bool) -> bool:
     if portable:
         args.append("/portable")
     args.append("/skipupdate")
+    if config_path:
+        args.append(f"/config:{config_path}")
     startupinfo = None
     if os.name == "nt":
         startupinfo = subprocess.STARTUPINFO()

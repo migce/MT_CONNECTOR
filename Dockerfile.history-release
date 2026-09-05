@@ -1,0 +1,4 @@
+FROM mt-connector-api:reliability-final-20260905
+USER root
+COPY --chown=appuser:appuser src/ /app/src/
+USER appuser

@@ -118,6 +118,10 @@ class SymbolInfo(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str = "ok"
+    history_enabled: bool = False
+    history_connected: bool = False
+    history_phase: str = "disabled"
+    history_terminal_path: str | None = None
     mt5_connected: bool = False
     trader_connected: bool = False
     trader_accounts_total: int = 0

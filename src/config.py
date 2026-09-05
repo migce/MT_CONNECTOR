@@ -336,6 +336,8 @@ class Settings(BaseSettings):
     redis_db: int = Field(default=0)
 
     # --- Poller ---
+    history_worker_enabled: bool = False
+    history_mt5_path: str = r"C:\MT5_History\terminal64.exe"
     tick_poll_interval_ms: int = Field(default=50)
     tick_spool_enabled: bool = True
     tick_spool_path: str = str(Path(__file__).resolve().parents[1] / ".runtime" / "ticks-spool.sqlite3")
