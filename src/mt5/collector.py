@@ -246,14 +246,19 @@ class Collector:
                 return symbol, timeframe.value, []
             return symbol, timeframe.value, bars_to_dicts(bars, symbol, timeframe.value)
 
-        results = await asyncio.gather(
-            *(
-                _fetch_one(symbol, timeframe)
-                for symbol in self._active_symbols
-                for timeframe in timeframes
-            ),
-            return_exceptions=True,
-        )
+        # MT5 already uses one native thread. Submitting the entire matrix at
+        # once cannot parallelize it; it only fills the bounded native queue and
+        # rejects routine candles (and competes with ticks/heartbeat). Admit one
+        # candle at a time, preserving room for the other polling loops.
+        results = []
+        for symbol in tuple(self._active_symbols):
+            for timeframe in timeframes:
+                try:
+                    results.append(await _fetch_one(symbol, timeframe))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    results.append(exc)
 
         candle_rows: list[dict[str, Any]] = []
         sync_rows: list[dict[str, Any]] = []
