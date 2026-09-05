@@ -45,6 +45,7 @@ import structlog
 
 from src.config import Settings, get_settings
 from src.metrics import PollerMetrics
+from src.history_status import HistoryWorkerUnavailable, fresh_history_status
 from src.redis_bus.pool import get_redis_pool
 
 logger = structlog.get_logger(__name__)
@@ -174,6 +175,21 @@ class BackfillRequester:
         # Pool lifecycle is managed centrally.
         self._redis = None
 
+    async def _require_history_worker(self) -> None:
+        if self._settings.history_worker_enabled is not True:
+            return
+        assert self._redis is not None
+        try:
+            async with asyncio.timeout(1):
+                raw = await self._redis.get("history:status")
+            data = orjson.loads(raw) if raw else {}
+        except Exception:
+            raise HistoryWorkerUnavailable() from None
+        if not fresh_history_status(data):
+            raise HistoryWorkerUnavailable()
+        if data.get("connected") is not True:
+            raise HistoryWorkerUnavailable(data.get("phase", "unavailable"))
+
     async def enqueue_job(self, job: dict[str, Any]) -> str:
         """Queue a durable Symbol Management job without waiting for it."""
         if self._redis is None:
@@ -226,6 +242,10 @@ class BackfillRequester:
                 timeframe=timeframe,
             )
             return orjson.loads(recent)
+
+        # Stored/reused data remains readable. Only requests needing new broker
+        # work require a live consumer; never wait a minute on an absent worker.
+        await self._require_history_worker()
 
         inflight = _inflight_key(symbol, data_type, timeframe, scope)
 
@@ -301,6 +321,7 @@ class BackfillRequester:
                 if remaining <= 0:
                     logger.warning("backfill_wait_timeout", request_id=request_id)
                     return None
+                await self._require_history_worker()
                 msg = await pubsub.get_message(
                     ignore_subscribe_messages=True,
                     timeout=min(remaining, 1.0),
@@ -312,6 +333,8 @@ class BackfillRequester:
                     data = orjson.loads(msg["data"])
                     logger.info("backfill_response_received", request_id=request_id, status=data.get("status"))
                     return data
+        except HistoryWorkerUnavailable:
+            raise
         except Exception:
             logger.exception("backfill_wait_error", request_id=request_id)
             return None

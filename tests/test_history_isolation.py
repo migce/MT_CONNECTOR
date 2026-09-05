@@ -33,7 +33,7 @@ def test_default_is_opt_in_and_path_separate():
     assert validate_history_path(s) == r"c:\mt5_history\terminal64.exe"
 
 
-@pytest.mark.parametrize("bad", ["account", "path", "trading", "python", "offline"])
+@pytest.mark.parametrize("bad", ["account", "path", "trading", "python"])
 def test_native_identity_fail_closed(monkeypatch, bad):
     terminal = SimpleNamespace(data_path=r"C:\MT5_History", connected=True,
                                trade_allowed=False, tradeapi_disabled=True)

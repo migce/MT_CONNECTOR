@@ -25,6 +25,20 @@ class HistoryConnection(MT5Connection):
         validate_history_path(settings)
         super().__init__(settings)
 
+    def connection_proof(self) -> bool:
+        """A network outage is retryable; identity or permission drift is not."""
+        import MetaTrader5 as mt5
+
+        terminal, account = mt5.terminal_info(), mt5.account_info()
+        path = validate_history_path(self._settings)
+        if terminal is not None:
+            if (ntpath.normcase(ntpath.abspath(terminal.data_path)) != ntpath.dirname(path)
+                    or terminal.trade_allowed or not terminal.tradeapi_disabled):
+                raise RuntimeError("History terminal identity or trading-disable proof failed")
+        if account is not None and account.login != self._settings.mt5_login:
+            raise RuntimeError("History terminal identity or trading-disable proof failed")
+        return bool(terminal and account and terminal.connected)
+
     def _try_connect(self) -> bool:
         import MetaTrader5 as mt5
         from src.mt5.portable import start_terminal_protected
@@ -47,10 +61,8 @@ class HistoryConnection(MT5Connection):
                                trade_allowed=bool(terminal and terminal.trade_allowed),
                                tradeapi_disabled=bool(terminal and terminal.tradeapi_disabled))
         # Fail closed on IPC attachment to another installation or account.
-        if (terminal is None or account is None
-                or ntpath.normcase(ntpath.abspath(terminal.data_path)) != ntpath.dirname(path)
-                or account.login != s.mt5_login or not terminal.connected
-                or terminal.trade_allowed or not terminal.tradeapi_disabled):
+        try:
+            return self.connection_proof()
+        except RuntimeError:
             mt5.shutdown()
-            raise RuntimeError("History terminal identity or trading-disable proof failed")
-        return True
+            raise

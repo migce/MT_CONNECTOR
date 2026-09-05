@@ -47,6 +47,8 @@ class HistoryService:
         self.last_success = None
         self.job_id = None
         self.last_scan = time.monotonic()
+        self.reconnect_attempts = 0
+        self.retry_delay = 0.0
 
     async def publish_health(self):
         while True:
@@ -55,6 +57,8 @@ class HistoryService:
                            phase=self.phase, connected=self.connected and not native["overdue"],
                            observed_at=time.time(), last_success=self.last_success,
                            job_id=self.job_id, native=native,
+                           reconnect_attempts=self.reconnect_attempts,
+                           retry_after_seconds=self.retry_delay,
                            terminal_path=self.settings.history_mt5_path)
             try:
                 async with asyncio.timeout(2):
@@ -68,17 +72,22 @@ class HistoryService:
             await asyncio.sleep(2)
 
     async def verify_connection(self):
-        # Serialized with history reads, never inserted behind a long native call.
-        def proof():
-            import MetaTrader5 as mt5
-            terminal, account = mt5.terminal_info(), mt5.account_info()
-            return bool(terminal and account and terminal.connected
-                        and account.login == self.settings.mt5_login
-                        and not terminal.trade_allowed and terminal.tradeapi_disabled)
-        self.connected = await run_in_mt5(proof)
-        if not self.connected:
-            # Do not silently reinitialize an unexpected IPC/login generation.
-            raise RuntimeError("History connection proof lost")
+        # Keep the same IPC generation while the terminal reconnects to its
+        # broker. Every probe is bounded by the native-call watchdog; no work
+        # is dequeued while disconnected. Safety drift still fails closed.
+        while not await run_in_mt5(self.connection.connection_proof):
+            self.connected = False
+            self.phase = "reconnecting"
+            self.reconnect_attempts += 1
+            self.retry_delay = min(2 ** min(self.reconnect_attempts, 5), 30)
+            logger.warning("history_broker_reconnecting", attempt=self.reconnect_attempts,
+                           retry_after_seconds=self.retry_delay)
+            await asyncio.sleep(self.retry_delay)
+        if self.reconnect_attempts:
+            logger.info("history_broker_reconnected", attempts=self.reconnect_attempts)
+        self.reconnect_attempts = 0
+        self.retry_delay = 0.0
+        self.connected = True
         self.last_success = time.time()
 
     async def work(self):
@@ -98,6 +107,8 @@ class HistoryService:
                 if item:
                     request = orjson.loads(item[1])
             if request:
+                # The queue wait may have outlived the broker connection.
+                await self.verify_connection()
                 # Keep requester correlation unchanged. Owner is tracked by the
                 # exclusive service lease; interrupted ranges remain in the DB.
                 self.phase = "backfill"
@@ -168,7 +179,7 @@ class HistoryService:
                     reasons = {
                         "Live Poller has not relinquished history ownership": "live_history_ownership_unconfirmed",
                         "History lease connection changed": "history_lease_changed",
-                        "History connection proof lost": "broker_readonly_proof_lost",
+                        "History terminal identity or trading-disable proof failed": "broker_readonly_proof_lost",
                     }
                     reason = reasons.get(str(task.exception()), "other_exception")
                     logger.error("history_generation_failed", error_type=type(task.exception()).__name__,

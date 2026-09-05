@@ -48,6 +48,7 @@ from src.db.heavy_reads import HeavyReadUnavailable, dispose_heavy_engine
 from src.db.init_timescale import init_timescaledb
 from src.logging_config import setup_logging
 from src.redis_bus.backfill_manager import BackfillRequester
+from src.history_status import HistoryWorkerUnavailable
 from src.redis_bus.pool import close_redis_pool
 
 logger = structlog.get_logger(__name__)
@@ -1075,6 +1076,15 @@ def create_app() -> FastAPI:
         openapi_tags=_OPENAPI_TAGS,
         lifespan=_lifespan,
     )
+
+    @app.exception_handler(HistoryWorkerUnavailable)
+    async def history_worker_unavailable(_request: Request, exc: HistoryWorkerUnavailable):
+        return JSONResponse(
+            status_code=503,
+            content={"code": "history_worker_unavailable", "detail": str(exc),
+                     "history_phase": exc.phase, "retry_after_seconds": 15},
+            headers={"Retry-After": "15"},
+        )
 
     @app.exception_handler(HeavyReadUnavailable)
     async def history_unavailable(_request: Request, exc: HeavyReadUnavailable):
