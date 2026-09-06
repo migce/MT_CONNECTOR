@@ -288,6 +288,10 @@ async def start_chart_history(body: ChartHistoryStart):
     # Explicit repair never queues into a known absent/unready native worker.
     await requester._require_history_worker()
     plan = await chart_history_plan(body.model_copy(update={"symbol": normalized}))
+    if plan.get('availability', {}).get('status') == 'no_additional_history':
+        # Repeat clicks (including after reload/on another chart) cannot keep
+        # queueing the same recently unproductive range. No job is created.
+        raise HTTPException(409, detail={'code': 'history_no_additional_data', 'plan': plan})
     job = await _create_job(BackfillJobCreate(**{
         key: plan[key] for key in ("symbol", "timeframe", "target_type", "mode", "from", "to")
     }, requested_by=body.requested_by), recovery=True)

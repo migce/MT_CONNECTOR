@@ -15,6 +15,42 @@ from src.config import Timeframe, custom_timeframe_source, parse_custom_timefram
 from src.db.heavy_reads import HeavyReadTimeout, heavy_read_session
 from src.db.symbol_management import get_retention_days
 
+# Negative evidence expires: a broker/terminal can make older data available
+# later. This is a repeat guard, never an authoritative contract inception date.
+AVAILABILITY_RECHECK_HOURS = 6
+
+
+async def recent_history_attempts(symbol: str, now: datetime) -> list[dict]:
+    async with asyncio.timeout(2), heavy_read_session() as session:
+        await session.execute(text("SET LOCAL statement_timeout='1s'"))
+        result = await session.execute(text("""
+            SELECT source_type, source_timeframe, mode, status, range_from, range_to,
+                   covered_to, rows_written, started_at, finished_at
+            FROM backfill_jobs WHERE symbol=:symbol AND created_at >= :cutoff
+            ORDER BY created_at DESC LIMIT 20
+        """), {"symbol": symbol, "cutoff": now - timedelta(hours=AVAILABILITY_RECHECK_HOURS)})
+        return [dict(row._mapping) for row in result]
+
+
+def no_extension_attempt(attempts: list[dict], source_tf: str, first: datetime,
+                         start: datetime, now: datetime) -> dict | None:
+    period = timedelta(seconds=Timeframe(source_tf).seconds)
+    for attempt in attempts:
+        if attempt['source_type'] != 'candles' or attempt['source_timeframe'] != source_tf:
+            continue
+        # A newer successful extension invalidates an earlier empty result.
+        if attempt['status'] in ('succeeded', 'partial') and attempt['rows_written'] > 0:
+            return None
+        finished = attempt['finished_at']
+        if (attempt['mode'] == 'fill_missing' and attempt['status'] in ('succeeded', 'partial')
+                and attempt['rows_written'] == 0 and attempt['started_at'] and finished
+                and now - timedelta(hours=AVAILABILITY_RECHECK_HOURS) < finished <= now
+                and attempt['range_from'] <= start and attempt['range_from'] < first - period
+                and attempt['range_to'] >= first + period
+                and attempt['covered_to'] and attempt['covered_to'] >= first + period):
+            return attempt
+    return None
+
 
 class ChartHistoryRequest(BaseModel):
     symbol: str = Field(min_length=1, max_length=64)
@@ -96,6 +132,22 @@ async def chart_history_plan(body: ChartHistoryRequest) -> dict:
     if window is None:
         raise HTTPException(409, detail={"code": "history_retention_limit"})
     start, end, limited = window
+    availability = {
+        'status': 'unknown', 'first_source_at': first.isoformat() if first else None,
+        'contract_start_confirmed': False, 'checked_at': now.isoformat(),
+        'last_attempt_at': None, 'retry_after': None,
+    }
+    if source == 'candles' and first and body.loaded_bars < body.required_bars:
+        try:
+            attempt = no_extension_attempt(await recent_history_attempts(body.symbol, now), source_tf, first, start, now)
+        except TimeoutError as exc:
+            raise HeavyReadTimeout('History availability check timed out') from exc
+        if attempt:
+            availability.update({
+                'status': 'no_additional_history',
+                'last_attempt_at': attempt['finished_at'].isoformat(),
+                'retry_after': (attempt['finished_at'] + timedelta(hours=AVAILABILITY_RECHECK_HOURS)).isoformat(),
+            })
     return {
         "symbol": body.symbol, "timeframe": body.timeframe,
         "target_type": "candles" if body.timeframe in {tf.value for tf in Timeframe} else "custom",
@@ -104,4 +156,5 @@ async def chart_history_plan(body: ChartHistoryRequest) -> dict:
         "from": start.isoformat(), "to": end.isoformat(), "mode": "fill_missing",
         "bounded": True, "limited": limited, "estimated": True,
         "max_window_days": 7 if parsed.is_tick_bar else 365,
+        "availability": availability,
     }
