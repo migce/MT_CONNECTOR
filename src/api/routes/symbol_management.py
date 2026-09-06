@@ -12,6 +12,7 @@ from src.api.services.validation import validate_symbol
 from src.api.symbol_registry import get_all_mt5_symbols
 from src.config import Timeframe, custom_timeframe_source, parse_custom_timeframe
 from src.db import symbol_management as sm
+from src.api.services.history_plan import ChartHistoryRequest, chart_history_plan
 
 router = APIRouter(prefix="/api/v1/symbol-management", tags=["symbol-management"])
 
@@ -178,6 +179,10 @@ async def get_job(job_id: str):
 
 @router.post("/jobs", status_code=202)
 async def create_job(body: BackfillJobCreate):
+    return await _create_job(body)
+
+
+async def _create_job(body: BackfillJobCreate, *, recovery: bool = False):
     symbol, _description = _available_symbol(body.symbol)
     dt_from, dt_to = _utc(body.from_dt), _utc(body.to_dt)
     if dt_from >= dt_to:
@@ -206,6 +211,7 @@ async def create_job(body: BackfillJobCreate):
             source_timeframe = custom_timeframe_source(parsed)
     else:
         timeframe = None
+    if source_type == "ticks":
         retention = await sm.get_retention_days()
         cutoff = datetime.now(UTC).timestamp() - retention * 86400
         if dt_from.timestamp() < cutoff:
@@ -222,7 +228,12 @@ async def create_job(body: BackfillJobCreate):
         "range_to": dt_to,
         "requested_by": body.requested_by,
     }
-    job, created = await sm.create_job(values)
+    if recovery:
+        values["_chart_recovery"] = True
+    try:
+        job, created = await sm.create_job(values)
+    except sm.HistoryJobCapacityError as exc:
+        raise HTTPException(429, detail={"code": "history_queue_busy"}, headers={"Retry-After": "120"}) from exc
     if created:
         from src.api.app import get_backfill_requester
         requester = get_backfill_requester()
@@ -248,6 +259,39 @@ async def create_job(body: BackfillJobCreate):
                 detail="Unable to enqueue the backfill job",
             ) from exc
     return {**job, "deduplicated": not created}
+
+
+@router.get("/history-plan")
+async def history_plan(symbol: str, timeframe: str, required_bars: int = Query(ge=1, le=15000),
+                       loaded_bars: int = Query(default=0, ge=0, le=15000), anchor: datetime | None = None):
+    normalized, _ = _available_symbol(symbol)
+    try:
+        body = ChartHistoryRequest(symbol=normalized, timeframe=timeframe, required_bars=required_bars,
+                                   loaded_bars=loaded_bars, anchor=anchor)
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "history_plan_invalid"}) from exc
+    return await chart_history_plan(body)
+
+
+class ChartHistoryStart(ChartHistoryRequest):
+    requested_by: str | None = None
+
+
+@router.post("/history-recovery", status_code=202)
+async def start_chart_history(body: ChartHistoryStart):
+    from src.api.app import get_backfill_requester
+    from src.history_status import HistoryWorkerUnavailable
+    normalized, _ = _available_symbol(body.symbol)
+    requester = get_backfill_requester()
+    if requester is None:
+        raise HistoryWorkerUnavailable()
+    # Explicit repair never queues into a known absent/unready native worker.
+    await requester._require_history_worker()
+    plan = await chart_history_plan(body.model_copy(update={"symbol": normalized}))
+    job = await _create_job(BackfillJobCreate(**{
+        key: plan[key] for key in ("symbol", "timeframe", "target_type", "mode", "from", "to")
+    }, requested_by=body.requested_by), recovery=True)
+    return {"job": job, "plan": plan}
 
 
 @router.post("/jobs/{job_id}/cancel")

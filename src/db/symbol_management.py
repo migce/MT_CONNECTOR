@@ -20,6 +20,10 @@ TERMINAL_JOB_STATUSES = ("succeeded", "partial", "failed", "cancelled")
 ACTIVE_JOB_STATUSES = ("queued", "running", "cancelling")
 
 
+class HistoryJobCapacityError(Exception):
+    pass
+
+
 async def ensure_schema(configured_symbols: list[str] | None = None) -> None:
     statements = (
         """
@@ -219,6 +223,23 @@ async def materialized_bindings() -> list[dict[str, Any]]:
 async def create_job(values: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     factory = get_session_factory()
     async with factory() as session, session.begin():
+        # Serialize the check/insert across API processes. Released on rollback,
+        # cancellation and connection loss; no schema migration or Redis lease.
+        await session.execute(text("SET LOCAL statement_timeout='3s'"))
+        acquired = await session.scalar(text("SELECT pg_try_advisory_xact_lock(788601100091)"))
+        if not acquired:
+            raise HistoryJobCapacityError("History submission is busy")
+        if values.get("_chart_recovery"):
+            active = await session.execute(text("""
+                SELECT * FROM backfill_jobs WHERE symbol=:symbol
+                  AND source_type=:source_type
+                  AND COALESCE(source_timeframe,'')=COALESCE(:source_timeframe,'')
+                  AND mode='fill_missing' AND status IN ('queued','running')
+                ORDER BY created_at LIMIT 1
+            """), values)
+            row = active.first()
+            if row:
+                return dict(row._mapping), False
         existing = await session.execute(text("""
             SELECT * FROM backfill_jobs
             WHERE symbol=:symbol AND target_type=:target_type
@@ -230,6 +251,24 @@ async def create_job(values: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         row = existing.first()
         if row:
             return dict(row._mapping), False
+        capacity = (await session.execute(text("""
+            SELECT COUNT(*) FILTER (WHERE status IN ('queued','running','cancelling')) active,
+              COUNT(*) FILTER (WHERE requested_by IS NOT DISTINCT FROM :requested_by
+                AND created_at > NOW()-INTERVAL '1 hour') recent
+            FROM backfill_jobs
+            WHERE status IN ('queued','running','cancelling') OR created_at > NOW()-INTERVAL '1 hour'
+        """), values)).one()
+        if capacity.active >= 8 or capacity.recent >= 12:
+            raise HistoryJobCapacityError("History queue or hourly submission limit reached")
+        if values.get("_chart_recovery"):
+            recent = await session.scalar(text("""
+                SELECT COUNT(*) FROM backfill_jobs WHERE symbol=:symbol
+                  AND source_type=:source_type
+                  AND COALESCE(source_timeframe,'')=COALESCE(:source_timeframe,'')
+                  AND created_at > NOW()-INTERVAL '2 minutes'
+            """), values)
+            if recent:
+                raise HistoryJobCapacityError("Wait before requesting another history window")
         job_id = uuid4().hex
         params = {**values, "id": job_id}
         result = await session.execute(text("""
