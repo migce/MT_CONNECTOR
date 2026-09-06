@@ -18,11 +18,10 @@ from typing import Any
 import orjson
 import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from starlette.websockets import WebSocketState
 
 from src.api.websocket.aggregator import CandleAggregator, TickBarAggregator
 from src.api.websocket.manager import ws_manager
-from src.config import Timeframe, get_settings, is_standard_timeframe, parse_custom_timeframe
+from src.config import get_settings, is_standard_timeframe, parse_custom_timeframe
 from src.redis_bus.subscriber import RedisSubscriber
 
 logger = structlog.get_logger(__name__)
@@ -91,29 +90,34 @@ async def _shared_redis_pump(channel: str) -> None:
 
     while True:
         sub = RedisSubscriber()
+        connected_at = None
         try:
             await sub.connect()
             await sub.subscribe(channel)
-            retry_delay = 1.0  # reset on successful connect
+            connected_at = asyncio.get_running_loop().time()
 
             async for _ch_name, payload in sub.listen_raw():
                 await ws_manager.broadcast_raw(channel, payload)
 
         except asyncio.CancelledError:
             break
-        except Exception:
+        except Exception as exc:
+            if connected_at is not None and asyncio.get_running_loop().time() - connected_at >= 30:
+                retry_delay = 1.0
             _logger.warning(
                 "redis_pump_reconnect",
+                reason=type(exc).__name__,
                 channel=channel,
                 retry_in=retry_delay,
             )
-            await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, max_retry_delay)
         finally:
             try:
                 await sub.close()
             except Exception:
                 pass
+
+        await asyncio.sleep(retry_delay)
+        retry_delay = min(retry_delay * 2, max_retry_delay)
 
 
 async def _ensure_pump(channel: str) -> None:
@@ -236,10 +240,11 @@ async def _aggregated_candle_pump(
 
     while True:
         sub = RedisSubscriber()
+        connected_at = None
         try:
             await sub.connect()
             await sub.subscribe(source_channel)
-            retry_delay = 1.0
+            connected_at = asyncio.get_running_loop().time()
 
             async for _ch, data in sub.listen():
                 completed, current = aggregator.update(data)
@@ -251,19 +256,23 @@ async def _aggregated_candle_pump(
             break
         except WebSocketDisconnect:
             break
-        except Exception:
+        except Exception as exc:
+            if connected_at is not None and asyncio.get_running_loop().time() - connected_at >= 30:
+                retry_delay = 1.0
             _logger.warning(
                 "agg_candle_pump_reconnect",
+                reason=type(exc).__name__,
                 channel=source_channel,
                 retry_in=retry_delay,
             )
-            await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, max_retry_delay)
         finally:
             try:
                 await sub.close()
             except Exception:
                 pass
+
+        await asyncio.sleep(retry_delay)
+        retry_delay = min(retry_delay * 2, max_retry_delay)
 
 
 async def _aggregated_tick_bar_pump(
@@ -279,10 +288,11 @@ async def _aggregated_tick_bar_pump(
 
     while True:
         sub = RedisSubscriber()
+        connected_at = None
         try:
             await sub.connect()
             await sub.subscribe(tick_channel)
-            retry_delay = 1.0
+            connected_at = asyncio.get_running_loop().time()
 
             async for _ch, data in sub.listen():
                 completed, current = aggregator.update(data)
@@ -294,18 +304,22 @@ async def _aggregated_tick_bar_pump(
             break
         except WebSocketDisconnect:
             break
-        except Exception:
+        except Exception as exc:
+            if connected_at is not None and asyncio.get_running_loop().time() - connected_at >= 30:
+                retry_delay = 1.0
             _logger.warning(
                 "agg_tick_pump_reconnect",
+                reason=type(exc).__name__,
                 retry_in=retry_delay,
             )
-            await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, max_retry_delay)
         finally:
             try:
                 await sub.close()
             except Exception:
                 pass
+
+        await asyncio.sleep(retry_delay)
+        retry_delay = min(retry_delay * 2, max_retry_delay)
 
 
 @router.websocket("/ws/candles/{symbol}/{timeframe}")
@@ -773,6 +787,7 @@ async def _poller_status_sender(
     the shared pub/sub pool for connections.
     """
     import redis.asyncio as aioredis
+
     from src.config import get_settings as _gs
 
     _logger = structlog.get_logger("ws.poller.status")

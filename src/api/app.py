@@ -21,8 +21,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from src.api.digits import load_symbol_digits
-from src.api.middleware.request_metrics import RequestMetricsMiddleware
 from src.api.middleware.history_disconnect import HistoryDisconnectMiddleware
+from src.api.middleware.request_metrics import RequestMetricsMiddleware
 from src.api.routes import (
     account_sessions,
     accounts,
@@ -46,9 +46,10 @@ from src.config import get_settings
 from src.db.engine import dispose_engine, get_engine, verify_control_store
 from src.db.heavy_reads import HeavyReadUnavailable, dispose_heavy_engine
 from src.db.init_timescale import init_timescaledb
+from src.db.quote_reads import dispose_quote_engine
+from src.history_status import HistoryWorkerUnavailable
 from src.logging_config import setup_logging
 from src.redis_bus.backfill_manager import BackfillRequester
-from src.history_status import HistoryWorkerUnavailable
 from src.redis_bus.pool import close_redis_pool
 
 logger = structlog.get_logger(__name__)
@@ -213,6 +214,7 @@ async def _lifespan(app: FastAPI):
         app.state.backfill_requester = None
     await close_redis_pool()
     await dispose_heavy_engine()
+    await dispose_quote_engine()
     await dispose_engine()
     _app_ref = None
     logger.info("api_stopped")
@@ -1088,6 +1090,7 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(HeavyReadUnavailable)
     async def history_unavailable(_request: Request, exc: HeavyReadUnavailable):
+        logger.warning("market_read_rejected", code=exc.code, status=exc.status_code)
         return JSONResponse(
             status_code=exc.status_code,
             content={"code": exc.code, "detail": str(exc)},

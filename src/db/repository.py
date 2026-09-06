@@ -25,6 +25,7 @@ from tenacity import (
 from src.config import Timeframe
 from src.db.engine import get_session_factory
 from src.db.heavy_reads import heavy_read_session, validate_source_budget
+from src.db.quote_reads import quote_read_session
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -429,7 +430,10 @@ async def query_ticks(
             f") sub ORDER BY time_msc ASC"
         )
 
-    async with heavy_read_session() as session:
+    # Only the exact latest-one lookup is light. Ranges and bulk tick reads
+    # retain the cross-worker heavy-query gate and source budget.
+    read_session = quote_read_session if limit == 1 and dt_from is None and dt_to is None else heavy_read_session
+    async with read_session() as session:
         result = await session.execute(sql, params)
         return [dict(r._mapping) for r in result.all()]
 

@@ -16,11 +16,14 @@ from typing import Any, AsyncIterator
 import orjson
 import redis.asyncio as aioredis
 import structlog
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from src.config import Settings, get_settings
 from src.redis_bus.pool import get_cache_redis_pool as get_redis_pool
 
 logger = structlog.get_logger(__name__)
+IDLE_PING_SECONDS = 15.0
+PONG_TIMEOUT_SECONDS = 10.0
 
 
 class RedisSubscriber:
@@ -61,17 +64,42 @@ class RedisSubscriber:
         if self._pubsub is not None:
             await self._pubsub.unsubscribe(*channels)
 
+    async def _messages(self) -> AsyncIterator[dict[str, Any]]:
+        """Poll bounded reads; channel silence is not a socket failure.
+
+        PING/PONG on this very subscription detects black holes even during a
+        closed market. Command/control pool deadlines remain unchanged.
+        """
+        if self._pubsub is None:
+            raise RuntimeError("Call connect() first")
+        loop = asyncio.get_running_loop()
+        next_ping = loop.time() + IDLE_PING_SECONDS
+        pong_deadline = None
+        while True:
+            message = await self._pubsub.get_message(timeout=1.0)
+            now = loop.time()
+            if message and message["type"] == "pong":
+                pong_deadline = None
+                next_ping = now + IDLE_PING_SECONDS
+            if pong_deadline is not None and now >= pong_deadline:
+                raise RedisTimeoutError("pubsub_pong_timeout")
+            if pong_deadline is None and now >= next_ping:
+                await self._pubsub.ping()
+                pong_deadline = loop.time() + PONG_TIMEOUT_SECONDS
+            if message and message["type"] == "message":
+                yield message
+
     async def listen(self) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         """
         Async generator that yields ``(channel_name, parsed_message)``
         tuples indefinitely.
 
-        Uses native Redis async iteration for minimal latency.
+        Uses bounded Redis reads with idle-safe subscription health checks.
         """
         if self._pubsub is None:
             raise RuntimeError("Call connect() first")
 
-        async for message in self._pubsub.listen():
+        async for message in self._messages():
             if message["type"] != "message":
                 continue
 
@@ -82,8 +110,8 @@ class RedisSubscriber:
             )
             try:
                 data = orjson.loads(message["data"])
-            except Exception:
-                logger.warning("redis_subscriber_parse_error", exc_info=True)
+            except Exception as exc:
+                logger.warning("redis_subscriber_parse_error", reason=type(exc).__name__)
                 continue
             yield channel, data
 
@@ -97,7 +125,7 @@ class RedisSubscriber:
         if self._pubsub is None:
             raise RuntimeError("Call connect() first")
 
-        async for message in self._pubsub.listen():
+        async for message in self._messages():
             if message["type"] != "message":
                 continue
 
@@ -112,7 +140,7 @@ class RedisSubscriber:
 
     async def close(self) -> None:
         if self._pubsub is not None:
-            await self._pubsub.close()
+            await self._pubsub.aclose()
             self._pubsub = None
         # Pool lifecycle is managed centrally; just drop the reference.
         self._redis = None

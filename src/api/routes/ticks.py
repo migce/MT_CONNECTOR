@@ -17,6 +17,7 @@ from fastapi import APIRouter, Query
 from src.api.schemas import PaginatedResponse, TickResponse
 from src.api.services.backfill_helper import maybe_backfill_ticks
 from src.api.services.validation import validate_symbol
+from src.db.repository import query_ticks
 
 router = APIRouter(prefix="/api/v1", tags=["ticks"])
 
@@ -61,7 +62,10 @@ async def get_ticks(
     no_range = not from_dt and not to_dt
     fetch_limit = limit if no_range else limit + 1
 
-    rows = await maybe_backfill_ticks(
+    # A latest-quote probe must not turn an empty symbol into a 60-second
+    # broker history job. Empty is explicit; range/bulk requests still backfill.
+    fetch = query_ticks if no_range and limit == 1 else maybe_backfill_ticks
+    rows = await fetch(
         symbol=symbol,
         dt_from=from_dt,
         dt_to=to_dt,
