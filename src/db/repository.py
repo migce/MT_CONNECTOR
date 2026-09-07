@@ -638,6 +638,10 @@ async def query_custom_tf_candles(
         Source timeframe to aggregate from.  Defaults to "M1".
         For large buckets (>= 1h) you can pass "H1" for speed.
     """
+    if dt_from is None:
+        from src.db.time_history import latest_time_bars
+        return await latest_time_bars(symbol, source_tf, bucket_seconds, tf_label, limit, dt_to)
+
     clauses = ["c.symbol = :symbol", "c.timeframe = :source_tf"]
     params: dict[str, Any] = {
         "symbol": symbol,
@@ -687,33 +691,6 @@ async def query_custom_tf_candles(
 
     factory = get_session_factory()
     async with factory() as session:
-        if not dt_from:
-            anchor = dt_to or datetime.now(UTC)
-            estimated = timedelta(
-                seconds=bucket_seconds * max(1, limit) * _LATEST_CANDLE_GAP_FACTOR,
-            )
-            params["recent_from"] = anchor - max(
-                estimated,
-                _LATEST_CANDLE_MIN_LOOKBACK,
-            )
-            recent_where = (
-                f"{where} AND c.time >= "
-                "time_bucket("
-                "make_interval(secs => CAST(:bucket_seconds AS double precision)), "
-                "CAST(:recent_from AS timestamptz)"
-                ")"
-            )
-            recent_inner = build_inner(recent_where)
-            recent_sql = text(
-                f"SELECT * FROM ({recent_inner} ORDER BY time DESC LIMIT :limit) "
-                "sub ORDER BY time ASC"
-            )
-            recent_result = await session.execute(recent_sql, params)
-            recent_rows = [dict(row._mapping) for row in recent_result.all()]
-            if len(recent_rows) >= limit:
-                return recent_rows
-
-            params.pop("recent_from", None)
         result = await session.execute(sql, params)
         return [dict(r._mapping) for r in result.all()]
 

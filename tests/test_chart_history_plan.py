@@ -13,6 +13,52 @@ from src.history_status import HistoryWorkerUnavailable
 NOW = datetime(2026, 9, 6, 8, tzinfo=UTC)
 
 
+@pytest.fixture(autouse=True)
+def stored_tail():
+    with patch('src.api.services.history_plan.latest_time_bars', AsyncMock(return_value=[])) as tail:
+        yield tail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('loaded', [0, 540, 1500])
+async def test_existing_depth_is_authoritative_not_browser_count(stored_tail, loaded):
+    stored_tail.return_value = [{'time': NOW-timedelta(minutes=3*i)} for i in reversed(range(1500))]
+    with patch('src.api.services.history_plan.first_source_time', AsyncMock()) as edge, \
+         patch('src.api.services.history_plan.recent_history_attempts', AsyncMock()) as attempts:
+        plan = await chart_history_plan(ChartHistoryRequest(symbol='EURUSD', timeframe='M3', required_bars=1500, loaded_bars=loaded))
+    assert plan['availability']['status'] == 'already_available'
+    assert plan['availability']['stored_bars'] == 1500
+    assert plan['availability']['first_source_at'] is None
+    edge.assert_not_awaited(); attempts.assert_not_awaited()
+    assert stored_tail.call_args.args[-1] is None
+
+
+@pytest.mark.asyncio
+async def test_historical_proof_uses_exact_anchor_and_server_shortage(stored_tail):
+    anchor = NOW-timedelta(days=80)
+    stored_tail.return_value = [{'time': anchor-timedelta(hours=6*i)} for i in reversed(range(242))]
+    first = stored_tail.return_value[0]['time']
+    with patch('src.api.services.history_plan.first_source_time', AsyncMock(return_value=first)), \
+         patch('src.api.services.history_plan.recent_history_attempts', AsyncMock(return_value=[])):
+        plan = await chart_history_plan(ChartHistoryRequest(symbol='ES500.U6', timeframe='H6', required_bars=268, loaded_bars=0, anchor=anchor))
+    assert stored_tail.call_args.args[-1] == anchor
+    assert plan['availability']['stored_bars'] == 242
+    assert datetime.fromisoformat(plan['from']) < first
+    assert datetime.fromisoformat(plan['to']) <= first+timedelta(hours=6)
+    assert datetime.fromisoformat(plan['to'])-datetime.fromisoformat(plan['from']) < timedelta(days=30)
+
+
+@pytest.mark.asyncio
+async def test_existing_history_rejects_before_job_write():
+    with patch('src.api.routes.symbol_management._available_symbol', return_value=('EURUSD', '')), \
+         patch('src.api.app.get_backfill_requester', return_value=AsyncMock()), \
+         patch('src.api.routes.symbol_management.chart_history_plan', AsyncMock(return_value={'availability': {'status':'already_available'}})), \
+         patch('src.api.routes.symbol_management._create_job', AsyncMock()) as create, pytest.raises(HTTPException) as exc:
+        await start_chart_history(ChartHistoryStart(symbol='EURUSD', timeframe='M3', required_bars=1500))
+    assert exc.value.detail['code'] == 'history_already_available'
+    create.assert_not_awaited()
+
+
 @pytest.mark.parametrize('timeframe,source,source_tf,target', [
     ('T16000', 'ticks', None, 'custom'), ('H2', 'candles', 'H1', 'custom'),
     ('M10', 'candles', 'M5', 'custom'), ('H1', 'candles', 'H1', 'candles'),

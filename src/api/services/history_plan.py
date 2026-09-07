@@ -14,6 +14,7 @@ from sqlalchemy import text
 from src.config import Timeframe, custom_timeframe_source, parse_custom_timeframe
 from src.db.heavy_reads import HeavyReadTimeout, heavy_read_session
 from src.db.symbol_management import get_retention_days
+from src.db.time_history import latest_time_bars
 
 # Negative evidence expires: a broker/terminal can make older data available
 # later. This is a repeat guard, never an authoritative contract inception date.
@@ -105,9 +106,12 @@ def bounded_window(body: ChartHistoryRequest, first: datetime | None, now: datet
         # Clamp numeric offsets BEFORE datetime arithmetic (untrusted large
         # custom periods must never overflow timedelta or datetime).
         cap = 365 * 86400
-        seconds = (body.required_bars + 2) * parsed.seconds * 2
+        seconds = (body.required_bars + 2) * parsed.seconds * 2 + 7 * 86400
         if first and first < end:
-            seconds = max(seconds, (end - first).total_seconds() + missing * parsed.seconds * 2)
+            # Extend the actual available edge, not years of already stored
+            # history. Include an overlap and slack for market closures.
+            end = min(end, first + timedelta(seconds=min(parsed.seconds, cap)))
+            seconds = missing * parsed.seconds * 2 + 7 * 86400
         limited = seconds > cap
         start = end - timedelta(seconds=min(seconds, cap))
     if start >= end:
@@ -127,8 +131,25 @@ async def chart_history_plan(body: ChartHistoryRequest) -> dict:
     if anchor and anchor.tzinfo is None:
         anchor = anchor.replace(tzinfo=UTC)
     end = min(anchor or now, now)
-    first = await first_source_time(body.symbol, source, source_tf, end)
-    window = bounded_window(body, first, now, await get_retention_days() if parsed.is_tick_bar else 365)
+    stored = None
+    if source == 'candles':
+        # An unanchored chart means latest N, even when broker-clock rows are
+        # ahead of UTC. Explicit anchors already use the proxy's market clock.
+        rows = await latest_time_bars(body.symbol, source_tf, parsed.seconds,
+                                     body.timeframe, body.required_bars, anchor)
+        stored = len(rows)
+        first = rows[0]['time'] if rows else None
+        if stored < body.required_bars:
+            first = await first_source_time(body.symbol, source, source_tf, anchor or datetime.max.replace(tzinfo=UTC))
+        # Use the latest stored bar as the same live anchor used by the chart.
+        # Do not move an explicit historical anchor or convert its zone twice.
+        end = anchor or (rows[-1]['time'] + timedelta(seconds=min(parsed.seconds, 86400)) if rows else now)
+        planning_body = body.model_copy(update={'loaded_bars': stored, 'anchor': end})
+        planning_now = max(now, end)
+    else:
+        first = await first_source_time(body.symbol, source, source_tf, end)
+        planning_body, planning_now = body, now
+    window = bounded_window(planning_body, first, planning_now, await get_retention_days() if parsed.is_tick_bar else 365)
     if window is None:
         raise HTTPException(409, detail={"code": "history_retention_limit"})
     start, end, limited = window
@@ -136,8 +157,13 @@ async def chart_history_plan(body: ChartHistoryRequest) -> dict:
         'status': 'unknown', 'first_source_at': first.isoformat() if first else None,
         'contract_start_confirmed': False, 'checked_at': now.isoformat(),
         'last_attempt_at': None, 'retry_after': None,
+        'stored_bars': stored, 'depth_only': True,
     }
-    if source == 'candles' and first and body.loaded_bars < body.required_bars:
+    if stored is not None and stored >= body.required_bars:
+        availability['status'] = 'already_available'
+        # This is the oldest bar in the bounded tail, NOT global inception.
+        availability['first_source_at'] = None
+    elif source == 'candles' and first:
         try:
             attempt = no_extension_attempt(await recent_history_attempts(body.symbol, now), source_tf, first, start, now)
         except TimeoutError as exc:
@@ -153,6 +179,7 @@ async def chart_history_plan(body: ChartHistoryRequest) -> dict:
         "target_type": "candles" if body.timeframe in {tf.value for tf in Timeframe} else "custom",
         "source_type": source, "source_timeframe": source_tf,
         "required_bars": body.required_bars, "loaded_bars": body.loaded_bars,
+        "anchor": body.anchor.isoformat() if body.anchor else None,
         "from": start.isoformat(), "to": end.isoformat(), "mode": "fill_missing",
         "bounded": True, "limited": limited, "estimated": True,
         "max_window_days": 7 if parsed.is_tick_bar else 365,

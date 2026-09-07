@@ -131,43 +131,28 @@ async def test_explicit_range_keeps_single_forward_query() -> None:
 
 
 @pytest.mark.asyncio
-async def test_latest_custom_candles_use_recent_source_window() -> None:
-    expected = [_row(1), _row(2), _row(3)]
+@pytest.mark.parametrize('end', [None, datetime(2026, 8, 22, tzinfo=UTC)])
+@pytest.mark.parametrize('count', [0, 1, 3])
+async def test_latest_custom_uses_only_bounded_tail_without_calendar_fallback(end, count):
+    from src.db import time_history
+    expected = [_row(i) for i in range(count)]
     session = _Session([expected])
-
-    with patch.object(repository, "get_session_factory", return_value=_Factory(session)):
+    with patch.object(time_history, "heavy_read_session", return_value=session):
         rows = await repository.query_custom_tf_candles(
-            "EURUSD",
-            bucket_seconds=21_600,
-            tf_label="H6",
-            limit=3,
-            source_tf="H1",
-        )
-
-    assert rows == expected
-    assert len(session.calls) == 1
+            "EURUSD", bucket_seconds=21_600, tf_label="H6", limit=3, source_tf="H1", dt_to=end)
+    assert rows == expected and len(session.calls) == 1
     sql, params = session.calls[0]
-    assert "c.time >= time_bucket" in sql
-    assert params["recent_from"] <= datetime.now(UTC)
+    assert "AS MATERIALIZED" in sql
+    assert "ORDER BY time DESC LIMIT :source_limit" in sql
+    assert params["source_limit"] == 24
+    assert params["end"] == end
+    assert ("AND time <= :end" in sql) == (end is not None)
 
 
 @pytest.mark.asyncio
-async def test_latest_custom_candles_fall_back_when_recent_window_is_sparse() -> None:
-    recent = [_row(3)]
-    expected = [_row(1), _row(2), _row(3)]
-    session = _Session([recent, expected])
-
-    with patch.object(repository, "get_session_factory", return_value=_Factory(session)):
-        rows = await repository.query_custom_tf_candles(
-            "EURUSD",
-            bucket_seconds=21_600,
-            tf_label="H6",
-            limit=3,
-            source_tf="H1",
-        )
-
-    assert rows == expected
-    assert len(session.calls) == 2
-    assert "c.time >= time_bucket" in session.calls[0][0]
-    assert "c.time >= time_bucket" not in session.calls[1][0]
-    assert "recent_from" not in session.calls[1][1]
+async def test_excessive_custom_source_budget_rejected_before_connection():
+    from src.db import time_history
+    from src.db.heavy_reads import HistoryBudgetExceeded
+    with patch.object(time_history, "heavy_read_session") as session, pytest.raises(HistoryBudgetExceeded):
+        await time_history.latest_time_bars("EURUSD", "M1", 60*999999, "M999999", 15000)
+    session.assert_not_called()

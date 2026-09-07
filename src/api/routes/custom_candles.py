@@ -189,6 +189,8 @@ async def get_custom_candles(
     source_tf = custom_timeframe_source(ctf)
     if source_tf is None:  # Defensive: the tick branch returns above.
         raise HTTPException(status_code=400, detail="Tick bars require raw tick history")
+    if use_latest_n:
+        validate_source_budget((fetch_limit + 1) * (ctf.seconds // Timeframe(source_tf).seconds))
 
     # Ensure the exact-divisor source candles are available for the range.
     await maybe_backfill_candles(
