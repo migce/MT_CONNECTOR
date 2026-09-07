@@ -1,6 +1,7 @@
 import asyncio
 import json
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -8,7 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from src.history_authority import HistoryAuthority, HistoryAuthorityConflict
-from src.history_supervisor import HistorySupervisor
+from src.history_supervisor import HistorySupervisor, spawn_owned_python
 from src.mt5.native_budget import NativeCallBudget
 
 
@@ -106,6 +107,36 @@ async def test_live_budget_has_no_history_dependency():
         native = NativeCallBudget(executor)
         assert native.before_run is None
         assert await native.run(lambda: "live") == "live"
+
+
+def test_real_owned_interpreter_pid_venv_and_dependencies(tmp_path):
+    code = "import os,sys,json,redis;print(json.dumps(dict(pid=os.getpid(),prefix=sys.prefix)))"
+    child = spawn_owned_python(["-c", code], cwd=tmp_path, stdout=subprocess.PIPE)
+    try:
+        output, _ = child.communicate(timeout=8)
+        assert child.returncode == 0
+        actual = json.loads(output)
+        assert actual["pid"] == child.pid
+        assert actual["prefix"] == sys.prefix
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+
+
+def test_real_owned_interpreter_termination_leaves_no_redirected_child(tmp_path):
+    code = "import os,time;print(os.getpid(),flush=True);time.sleep(60)"
+    child = spawn_owned_python(["-c", code], cwd=tmp_path, stdout=subprocess.PIPE)
+    supervisor = HistorySupervisor(tmp_path)
+    supervisor.child = child
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            child.communicate(timeout=1)
+    finally:
+        supervisor.stop_owned_child()
+    output, _ = child.communicate(timeout=5)
+    assert int(output) == child.pid
+    assert child.poll() is not None and child.returncode != 0
 
 
 class Child:

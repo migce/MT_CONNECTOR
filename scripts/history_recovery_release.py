@@ -178,6 +178,8 @@ def verify():
 m=json.loads((STAGE/'manifest.json').read_text());b=json.loads((STAGE/'baseline.json').read_text())
 now=snapshot();proof=stores();task=task_state()
 supervisor=json.loads((ROOT/'.runtime/history-supervisor.json').read_text())
+health=json.loads((ROOT/'.runtime/history-worker-health.json').read_text())
+assert supervisor['child_pid']==health['pid']==proof['history']['pid'],'owned_interpreter_pid_mismatch_use_attempt2_verifier'
 assert all(digest(ROOT/n)==h for n,h in m['expected'].items()),'published_source_drift'
 assert protected(now)==b['protected'],'protected_identity_changed'
 assert all(r['responding'] for r in now),'unresponsive_process'

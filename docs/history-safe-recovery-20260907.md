@@ -34,6 +34,10 @@ failure or MT5 native hang.
   identity and broker account/permission checks follow it. If the terminal is
   absent or duplicated, fail closed and request operator review.
 - The scheduler starts history_supervisor, which owns only its Popen child.
+  Windows venv redirectors are bypassed using CPython's base-interpreter launch
+  convention and __PYVENV_LAUNCHER__ to preserve the venv. The owned process
+  handle PID must equal the actual worker heartbeat PID. Real Windows process
+  tests prove PID equality, venv dependency imports, and owned-child termination.
   Missing worker progress kills only that handle, never a terminal or a process
   tree. Three retries use 10/30/60-second backoff. Ten minutes of connected
   progress resets the budget. Conflict/exhaustion opens a persistent circuit;
@@ -55,6 +59,22 @@ then updates its action and starts it. No Monitor, Poller, Trader, terminal,
 DB/Redis/WSL restart or bulk history request is part of this driver.
 
 Windows backups and verification: `.codex/releases/history-recovery-20260907/`.
+The first rollout connected but exposed a Windows venv launcher/actual PID
+mismatch that the initial mocked Popen tests missed. Its launcher-only
+verification was invalid and is superseded. Only the history task was stopped;
+both actual and launcher processes were confirmed absent. No terminal or live
+trading process was stopped.
+
+`scripts/history_recovery_attempt2.py` is the separate, reviewed one-shot
+correction: it retains the original artifacts, qualifies real-process tests,
+backs up and replaces only history_supervisor.py, and archives the reviewed
+first-attempt retry state (backoff/failures1) without discarding jobs. It checks
+all versioned Python executable names, both live owner processes and their venv
+launchers, three Trader children, and all five terminals. Final verification
+requires the actual history heartbeat/Redis/Popen PID to match, parent identity
+to be the actual supervisor, and no extra history child. Observe beyond the
+original sixty-second false-timeout threshold before declaring success.
+
 `baseline.json` is a one-shot guard: do not rerun deploy after an attempt.
 If interrupted before start, inspect actual state before enabling the task.
 Rollback needs explicit history-role authority: stop only the verified owned

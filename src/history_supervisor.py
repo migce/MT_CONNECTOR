@@ -17,6 +17,24 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
+def spawn_owned_python(arguments, *, cwd, stdout=subprocess.DEVNULL):
+    """Own the interpreter handle, not Windows' intermediate venv redirector.
+
+    This follows CPython multiprocessing's Windows venv launch convention.
+    __PYVENV_LAUNCHER__ preserves the venv prefix and installed dependencies.
+    """
+    executable = sys.executable
+    env = None
+    if os.name == "nt" and sys.prefix != sys.base_prefix:
+        executable = sys._base_executable
+        env = os.environ.copy()
+        env["__PYVENV_LAUNCHER__"] = sys.executable
+    return subprocess.Popen(
+        [executable, *arguments], cwd=cwd, env=env,
+        stdin=subprocess.DEVNULL, stdout=stdout, stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
 class HistorySupervisor:
     def __init__(self, root, *, spawn=None, clock=time.time, sleep=time.sleep,
                  startup_grace=60, heartbeat_deadline=30, stable_seconds=600):
@@ -33,10 +51,7 @@ class HistorySupervisor:
         self.log = logging.getLogger("history_supervisor")
 
     def _spawn(self):
-        return subprocess.Popen(
-            [sys.executable, "-m", "src.history_main"], cwd=self.root,
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return spawn_owned_python(["-m", "src.history_main"], cwd=self.root)
 
     def record(self, state, **fields):
         data = dict(state=state, observed_at=self.clock(), supervisor_pid=os.getpid(),
