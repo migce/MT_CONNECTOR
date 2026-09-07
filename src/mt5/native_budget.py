@@ -23,6 +23,9 @@ class NativeCallBudget:
         self._pending: set[Future] = set()
         self._overdue: set[Future] = set()
         self._last_completed = 0.0
+        # Set only by the isolated history process. Live and Trader keep the
+        # default None and never acquire a history admission dependency.
+        self.before_run = None
 
     def status(self) -> dict:
         with self._lock:
@@ -30,6 +33,8 @@ class NativeCallBudget:
                     "last_completed_monotonic": self._last_completed}
 
     async def run(self, function, *args, **kwargs):
+        if self.before_run is not None:
+            await self.before_run()
         deadline = time.monotonic() + self.timeout
 
         def invoke():

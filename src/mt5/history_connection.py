@@ -2,8 +2,33 @@
 from __future__ import annotations
 
 import ntpath
+import json
+import subprocess
 
 from src.mt5.connection import MT5Connection
+from src.history_authority import HistoryAuthorityConflict
+
+
+def existing_history_terminal(path):
+    """Bounded, exact-path read. Never use the protected-launch/replacement API."""
+    try:
+        output = subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command",
+             "$ErrorActionPreference='Stop'; Get-CimInstance Win32_Process -Filter \"Name='terminal64.exe'\" | "
+             "Select-Object ProcessId,ExecutablePath | ConvertTo-Json -Compress"],
+            text=True, stderr=subprocess.DEVNULL, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        rows = json.loads(output) if output.strip() else []
+        if isinstance(rows, dict):
+            rows = [rows]
+        matches = [int(row["ProcessId"]) for row in rows
+            if ntpath.normcase(ntpath.normpath(str(row.get("ExecutablePath") or "").strip())) == path
+            and str(row.get("ProcessId", "")).isdigit()]
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        matches = []
+    if len(matches) != 1:
+        raise HistoryAuthorityConflict("history_terminal_presence_unconfirmed")
+    return matches[0]
 
 
 def validate_history_path(settings) -> str:
@@ -21,9 +46,10 @@ def validate_history_path(settings) -> str:
 class HistoryConnection(MT5Connection):
     """Only connection/catalogue reads; no trading module or order protocol."""
 
-    def __init__(self, settings):
+    def __init__(self, settings, *, attach_only=False):
         validate_history_path(settings)
         super().__init__(settings)
+        self.attach_only = attach_only
 
     def connection_proof(self) -> bool:
         """A network outage is retryable; identity or permission drift is not."""
@@ -45,12 +71,20 @@ class HistoryConnection(MT5Connection):
 
         s = self._settings
         path = validate_history_path(s)
-        start_terminal_protected(s.history_mt5_path, portable=True,
-                                 config_path=ntpath.join(ntpath.dirname(s.history_mt5_path), "history.ini"))
-        if not mt5.initialize(path=s.history_mt5_path, portable=True,
-                              login=s.mt5_login, password=s.mt5_password,
-                              server=s.mt5_server, timeout=s.mt5_timeout):
+        existing_pid = None
+        if self.attach_only:
+            existing_pid = existing_history_terminal(path)
+        else:
+            start_terminal_protected(s.history_mt5_path, portable=True,
+                                     config_path=ntpath.join(ntpath.dirname(s.history_mt5_path), "history.ini"))
+        options = dict(path=s.history_mt5_path, portable=True, timeout=s.mt5_timeout)
+        if not self.attach_only:
+            options.update(login=s.mt5_login, password=s.mt5_password, server=s.mt5_server)
+        if not mt5.initialize(**options):
             return False
+        if existing_pid is not None and existing_history_terminal(path) != existing_pid:
+            mt5.shutdown()
+            raise HistoryAuthorityConflict("history_terminal_identity_changed_during_attach")
         terminal = mt5.terminal_info()
         account = mt5.account_info()
         self.last_proof = dict(terminal_present=terminal is not None,
